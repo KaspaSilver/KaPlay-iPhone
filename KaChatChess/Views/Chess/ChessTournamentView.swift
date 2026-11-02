@@ -30,10 +30,12 @@ struct ChessTournamentView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .fixedScreenTitle(Text(tournament?.name ?? "Tournament"))
+        .background(Color(.systemGroupedBackground))
         .navigationTitle(tournament?.name ?? "Tournament")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .principal) { ScreenTitleToolbarLabel(title: Text(tournament?.name ?? "Tournament")) }
+            ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
         }
         .navigationDestination(isPresented: Binding(
             get: { openGameId != nil },

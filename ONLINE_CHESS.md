@@ -26,14 +26,14 @@ tournament id (a lowercase UUID chosen by the creator).
 
 | `a` | Fields | Meaning |
 |---|---|---|
-| `create` | `t`, `name` (≤ 40 chars), `p` (2 or 8), `k` (8 only) | Opens a private 1v1 or tournament (§2.1). The creator is player 1. |
+| `create` | `t`, `name` (≤ 40 chars), `p` (2 or 8), `k` (8 only) | Opens a private 1v1 or tournament (§2.1). The creator is player 1. KaPlay sends a fixed `name` and shows its own, never the one in the message. |
 | `join` | `t` | Takes a seat (and opens a public room, §2.1). The first eight distinct addresses are the players; later joins are ignored. |
 | `leave` | `t` | Gives a seat back while the room is still waiting (open). Ignored once it has started. |
 | `cancel` | `t` | Private only, creator only, before the eighth join: the tournament is withdrawn. |
 | `move` | `t`, `g`, `n`, `from`, `to`, `promo`? | A move in game `g` (`"<round>-<index>"`, e.g. `"1-3"`), `n` = the ply number (1 = white's first move), squares in algebraic (`e2`), `promo` in `q r b n`. |
 | `resign` | `t`, `g` | The sender resigns game `g`. |
 | `claim` | `t`, `g` | The sender claims game `g` on time: the opponent's clock had run out (§4). |
-| `chat` | `t`, `g`, `text` (≤ 280) | A line under the board of game `g`. |
+| `chat` | `t`, `g`, `text` (≤ 280) | A line under the board of game `g`. KaPlay neither sends nor shows these. |
 
 Example: `{"type":"chess_t","v":1,"t":"7c1e…","a":"move","g":"1-0","n":1,"from":"e2","to":"e4"}`
 

@@ -30,10 +30,11 @@ enum ChessTournamentEngine {
             let capacity = message.p == 2 ? 2 : ChessTournamentCodec.playerCount
             guard tournaments[message.t] == nil, !ChessTournamentCodec.isPublic(message.t),
                   capacity == 2 || ChessTournamentCodec.isValidCreateKey(message.k, id: message.t) else { return }
-            let cleanName = (message.name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             var tournament = ChessTournament(
                 id: message.t,
-                name: cleanName.isEmpty ? (capacity == 2 ? "1v1" : "Tournament") : String(cleanName.prefix(ChessTournamentCodec.nameMaxLength)),
+                // Never the name in the message: other apps let players type one, and nothing a
+                // player types is shown here.
+                name: capacity == 2 ? ChessTournamentCodec.privateDuelName : ChessTournamentCodec.privateTournamentName,
                 creator: event.sender,
                 createdAt: event.blockTime,
                 createTxId: event.txId,
@@ -155,15 +156,8 @@ enum ChessTournamentEngine {
             tournament.games[gameId] = game
             advance(&tournament, after: game)
             tournaments[message.t] = tournament
-        case "chat":
-            guard var tournament = tournaments[message.t],
-                  let text = message.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return }
-            tournament.chat.append(ChessTournamentChatLine(
-                id: event.txId, sender: event.sender, text: String(text.prefix(ChessTournamentCodec.chatMaxLength)),
-                blockTime: event.blockTime, game: message.g ?? ""
-            ))
-            tournaments[message.t] = tournament
         default:
+            // Includes `chat`, which other apps still send: KaPlay shows no chat.
             return
         }
     }

@@ -1,12 +1,9 @@
 import SwiftUI
 
-/// A square on the Leaderboard tab, in place of tabs: it switches the board under the squares, or
-/// opens a screen of its own (`opensScreen`, marked with a chevron).
+/// A square on the Leaderboard tab, in place of tabs: it opens that board's own page.
 struct ChessLeaderboardSquare: View {
     let title: String
     let icon: String
-    let selected: Bool
-    var opensScreen = false
     let action: () -> Void
 
     var body: some View {
@@ -25,22 +22,16 @@ struct ChessLeaderboardSquare: View {
             .padding(.horizontal, 6)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .aspectRatio(1, contentMode: .fit)
-            .foregroundColor(selected ? .accentColor : .primary)
+            .foregroundColor(.primary)
             .background(
                 RoundedRectangle(cornerRadius: 16)
-                    .fill(selected ? Color.accentColor.opacity(0.16) : Color(.secondarySystemGroupedBackground))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 16)
-                    .stroke(selected ? Color.accentColor : Color.clear, lineWidth: 1.5)
+                    .fill(Color(.secondarySystemGroupedBackground))
             )
             .overlay(alignment: .topTrailing) {
-                if opensScreen {
-                    Image(systemName: "chevron.right")
-                        .font(.caption2.weight(.bold))
-                        .foregroundColor(.secondary)
-                        .padding(10)
-                }
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.bold))
+                    .foregroundColor(.secondary)
+                    .padding(10)
             }
             .contentShape(RoundedRectangle(cornerRadius: 16))
         }
@@ -79,10 +70,12 @@ struct ChessBotLeaderboardsView: View {
         .listStyle(.insetGrouped)
         .refreshable { service.refresh(force: true) }
         .onAppear { service.refresh() }
+        .fixedScreenTitle(Text("Bots"))
+        .background(Color(.systemGroupedBackground))
         .navigationTitle("Bots")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .principal) { ScreenTitleToolbarLabel(title: Text("Bots")) }
+            ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
         }
     }
 
@@ -155,10 +148,12 @@ struct ChessBotLeaderboardView: View {
         .listStyle(.insetGrouped)
         .refreshable { service.refresh(force: true) }
         .onAppear { service.refresh() }
+        .fixedScreenTitle(Text(bot.name))
+        .background(Color(.systemGroupedBackground))
         .navigationTitle(bot.name)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .principal) { ScreenTitleToolbarLabel(title: Text(bot.name)) }
+            ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
         }
         .sheet(isPresented: Binding(
             get: { profileContact != nil },

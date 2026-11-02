@@ -11,10 +11,10 @@ struct ChessTournamentMessage: Codable, Equatable {
     var v: Int = 1
     /// Tournament id: a lowercase UUID chosen by the creator.
     let t: String
-    /// Action: create, join, cancel, move, resign, claim, chat.
+    /// Action: create, join, cancel, move, resign, claim.
     let a: String
     var name: String? = nil
-    /// Game id "<round>-<index>", e.g. "1-0"; "" (or absent) for tournament-level chat.
+    /// Game id "<round>-<index>", e.g. "1-0".
     var g: String? = nil
     /// Ply number of a move (1 = white's first move).
     var n: Int? = nil
@@ -22,7 +22,6 @@ struct ChessTournamentMessage: Codable, Equatable {
     var to: String? = nil
     /// Promotion piece letter: q r b n.
     var promo: String? = nil
-    var text: String? = nil
     /// Private tournaments only: proof the creator holds the creator code (§2.1).
     var k: String? = nil
     /// `create` only: how many players - 2 (a 1v1) or 8 (a tournament). Absent = 8.
@@ -67,7 +66,8 @@ enum ChessTournamentCodec {
     /// expires and the player is out of the queue - with the app closed, on a walk, whatever.
     static let seatTTLMs: Int64 = 5 * 60 * 1000
     static let nameMaxLength = 40
-    static let chatMaxLength = 280
+    static let privateDuelName = "Private 1v1"
+    static let privateTournamentName = "Private tournament"
 
     // MARK: Public rooms and private tournaments (ONLINE_CHESS.md §2.1)
 
@@ -141,9 +141,6 @@ enum ChessTournamentCodec {
     }
     static func resign(id: String, game: String) -> ChessTournamentMessage { ChessTournamentMessage(t: id, a: "resign", g: game) }
     static func claim(id: String, game: String) -> ChessTournamentMessage { ChessTournamentMessage(t: id, a: "claim", g: game) }
-    static func chat(id: String, game: String?, text: String) -> ChessTournamentMessage {
-        ChessTournamentMessage(t: id, a: "chat", g: game ?? "", text: String(text.prefix(chatMaxLength)))
-    }
 }
 
 // MARK: - Derived state (what every phone computes from the arena, ONLINE_CHESS.md §3-4)
@@ -154,25 +151,6 @@ struct ChessArenaEvent: Equatable {
     let sender: String
     let blockTime: Int64
     let message: ChessTournamentMessage
-}
-
-struct ChessTournamentChatLine: Identifiable, Equatable {
-    let id: String
-    let sender: String
-    let text: String
-    let blockTime: Int64
-    /// "" for the tournament lobby.
-    let game: String
-}
-
-/// A chat line of this phone's that is still on its way (or failed): shown under the board with
-/// a clock (or a red mark) until the chain returns it, when it becomes a `ChessTournamentChatLine`
-/// with the green check - the same three states a 1:1 chat bubble has.
-struct ChessPendingChatLine: Identifiable, Equatable {
-    let id: String
-    let tournament: String
-    let line: ChessTournamentChatLine
-    let failed: Bool
 }
 
 struct ChessTournamentGame: Identifiable, Equatable {
@@ -293,7 +271,6 @@ struct ChessTournament: Identifiable, Equatable {
     var startedAt: Int64?
     var cancelled = false
     var games: [String: ChessTournamentGame] = [:]
-    var chat: [ChessTournamentChatLine] = []
     /// White games per player so far, for colour assignment after round 1.
     var whiteCount: [String: Int] = [:]
 

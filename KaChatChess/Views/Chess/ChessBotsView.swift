@@ -44,11 +44,12 @@ struct ChessBotsView: View {
             }
             .padding(.bottom, 24)
         }
+        .fixedScreenTitle(Text("Bots"))
         .background(Color(.systemGroupedBackground))
         .navigationTitle("Bots")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .principal) { ScreenTitleToolbarLabel(title: Text("Bots")) }
+            ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
         }
     }
 
@@ -181,8 +182,13 @@ struct ChessBotDetailView: View {
             .padding(.vertical, 8)
             .background(.bar)
         }
+        .fixedScreenTitle(Text(bot.name))
+        .background(Color(.systemGroupedBackground))
         .navigationTitle(bot.name)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
+        }
         .navigationDestination(isPresented: $playing) {
             ChessBotGameView(bot: bot, side: side)
         }

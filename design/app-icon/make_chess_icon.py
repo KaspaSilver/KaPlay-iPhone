@@ -69,6 +69,54 @@ def svg(variant):
 </svg>'''
 
 
+def round_plus(cx, cy, arm, half, r):
+    # d_pad as one outline: for each arm (up, right, down, left) out along its near side, around
+    # its two rounded corners, back along its far side
+    d = ""
+    for ux, uy in ((0, -1), (1, 0), (0, 1), (-1, 0)):
+        vx, vy = -uy, ux  # across the arm, clockwise
+        h = r * 0.55  # a curve's handle, for a quarter circle
+        inner = (cx + ux * arm - vx * arm, cy + uy * arm - vy * arm)  # where it meets the last arm
+        a = (cx + ux * (half - r) - vx * arm, cy + uy * (half - r) - vy * arm)
+        b = (cx + ux * half - vx * (arm - r), cy + uy * half - vy * (arm - r))
+        e = (cx + ux * half + vx * (arm - r), cy + uy * half + vy * (arm - r))
+        f = (cx + ux * (half - r) + vx * arm, cy + uy * (half - r) + vy * arm)
+        d += ("L" if d else "M") + f"{inner[0]:g} {inner[1]:g} L{a[0]:g} {a[1]:g} "
+        d += f"C{a[0] + ux * h:g} {a[1] + uy * h:g} {b[0] - vx * h:g} {b[1] - vy * h:g} {b[0]:g} {b[1]:g} "
+        d += f"L{e[0]:g} {e[1]:g} "
+        d += f"C{e[0] + vx * h:g} {e[1] + vy * h:g} {f[0] + ux * h:g} {f[1] + uy * h:g} {f[0]:g} {f[1]:g} "
+    return d + "Z "
+
+
+def circle(cx, cy, r):
+    h = r * 0.5523
+    return (f"M{cx} {cy - r} "
+            f"C{cx + h:g} {cy - r} {cx + r} {cy - h:g} {cx + r} {cy} "
+            f"C{cx + r} {cy + h:g} {cx + h:g} {cy + r} {cx} {cy + r} "
+            f"C{cx - h:g} {cy + r} {cx - r} {cy + h:g} {cx - r} {cy} "
+            f"C{cx - r} {cy - h:g} {cx - h:g} {cy - r} {cx} {cy - r} Z ")
+
+
+def k_outline(cx, cy, height):
+    # k_mark's chevron and bar as one outline, where the chevron's arms meet the bar
+    s = height / 434
+    points = ((45, -206), (123, -217), (153, 0), (123, 217), (45, 206), (68.3, 45.9),
+              (-103.2, 177.9), (-150.8, 116.1), (0, 0), (-150.8, -116.1), (-103.2, -177.9), (68.3, -45.9))
+    return "M" + " L".join(f"{cx + x * s:.1f} {cy + y * s:.1f}" for x, y in points) + " Z "
+
+
+def tab_icon():
+    # The dock's Play icon: the controller with the same D-pad, buttons and K as holes through one
+    # path, for the tab bar to tint. Tab bars don't scale images, so width and height are its size
+    # in the dock.
+    gap, r = 48, 23
+    holes = round_plus(262, 470, 22, 66, 12) + k_outline(512, 470, 200) + "".join(
+        circle(762 + dx, 470 + dy, r) for dx, dy in ((0, -gap), (gap, 0), (0, gap), (-gap, 0)))
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" width="32" height="20" viewBox="96 293 832 520">
+  <path fill-rule="evenodd" fill="#000000" d="{CONTROLLER} {holes.strip()}"/>
+</svg>'''
+
+
 if __name__ == "__main__":
-    for variant in (sys.argv[1:] or PALETTES):
-        open(f"kachat-chess-{variant}.svg", "w").write(svg(variant))
+    for variant in (sys.argv[1:] or [*PALETTES, "tab"]):
+        open(f"kachat-chess-{variant}.svg", "w").write(tab_icon() if variant == "tab" else svg(variant))

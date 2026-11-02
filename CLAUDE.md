@@ -10,20 +10,29 @@ transaction. What the app does and where it came from: [README.md](README.md). T
 [ONLINE_CHESS.md](ONLINE_CHESS.md).
 
 Tabs (`ChessMainTabView.Tab`): Play, Leaderboard, Wallet (`Views/Wallet/WalletViews.swift`),
-Settings.
+Settings. Play opens on `GamesView`, a card per game; Chess is the only one so far and opens
+`ChessHomeView`. A new game is one more card there.
 
-Every menu has its title fixed in the navigation bar. Where the bar also shows the balance, use
-`ScreenTitleToolbarLabel`: a principal toolbar item replaces `navigationTitle`, so the balance
-alone would leave the screen with no title.
+Every menu's title is the same as KaPosts': big and fixed above the content that scrolls
+(`fixedScreenTitle`), with the balance alone in the center of the bar (`BalanceToolbarLabel`). The
+game boards have no room for it, so `ScreenTitleToolbarLabel` puts their title over the balance in
+the bar.
 
 ## Bots and the Leaderboard tab
 
 Bot games are free while played and stamped on chain once, when they end (`ChessBotGame`,
 ONLINE_CHESS.md §7); online games stay on chain move by move. The Leaderboard tab has three squares
-(`ChessLeaderboardSquare`): 1v1 and Tournaments switch the board under them, Bots opens
-`ChessBotLeaderboardsView`, a board per played bot ranked by fewest moves to win
-(`ChessBotLeaderboardService`). A stamped win can be shared to KaPost, and the post's Challenge
+(`ChessLeaderboardSquare`), each opening its own page: 1v1 and Tournaments their board
+(`ChessLeaderboardPage`), Bots `ChessBotLeaderboardsView`, a board per played bot ranked by fewest
+moves to win (`ChessBotLeaderboardService`). A stamped win can be shared to KaPost, and the post's Challenge
 button opens KaPlay (`ChessBotLinks`, ONLINE_CHESS.md §7.2).
+
+## Nothing players type reaches other players
+
+So App Review has no typed content to moderate, KaPlay has no game chat and no typed room names:
+it ignores `chat` messages from other apps, and every private room is "Private 1v1" or "Private
+tournament" whatever its `create` message says (ONLINE_CHESS.md §2). Adding either back means
+adding Terms of Use, Report and Block too, as KaPost has them.
 
 ## Accounts
 
@@ -35,8 +44,8 @@ still takes 12 or 24 words.
 
 Creating never shows the seed phrase: an account made here is owed a backup
 (`AccountBackupStatus`), and until the backup steps (`AccountBackupView`) are finished the Wallet
-tab shows `AccountBackupCard` above Address Actions (red once the account holds funds), Receive
-shows a reminder and the Delete Account warning leads with Back Up Account; deleting is never
+tab shows `AccountBackupCard` above Address Actions (red once the account holds funds), its dock
+icon has a yellow dot (`ChessMainTabView.owesBackup`, Backup Hygiene too), Receive shows a reminder and the Delete Account warning leads with Back Up Account; deleting is never
 blocked. Imported and older accounts are never owed one. Finishing the steps starts a six-month
 timer; when it runs out the Wallet tab shows `BackupHygieneCard` in the same place, and
 `BackupHygieneView` asks for five random words, then the passphrase if there is one.

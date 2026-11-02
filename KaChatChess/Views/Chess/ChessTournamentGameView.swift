@@ -1,8 +1,7 @@
 import SwiftUI
 
-/// One tournament game: the board with both clocks, the controls, and the game's chat beneath
-/// it - laid out like a 1:1 chat with the board where the messages would be. Players tap to
-/// move; everyone else watches the same board live.
+/// One tournament game: the board with both clocks and the controls. Players tap to move;
+/// everyone else watches the same board live.
 struct ChessTournamentGameView: View {
     let tournamentId: String
     let gameId: String
@@ -18,7 +17,6 @@ struct ChessTournamentGameView: View {
     /// pops every level at once where SwiftUI's nested isPresented bindings would pop one.
     @State private var popRequest = 0
     @Environment(\.dismiss) private var dismiss
-    @State private var chatText = ""
     /// End-of-game flow: the overlay over the board, then the result screen (players only).
     @State private var showEndOverlay = false
     @State private var showResult = false
@@ -157,10 +155,8 @@ struct ChessTournamentGameView: View {
 
     @ViewBuilder
     private func content(_ tournament: ChessTournament, _ game: ChessTournamentGame) -> some View {
-        // The same arrangement as the 1:1 chat's board (ChessGameView): header, the other
-        // side's clock chip, the board as large as the screen allows (it wins the fight for
-        // height), our clock chip, then the chat taking what is left, the composer a bottom
-        // safe-area inset so it sits flush above the keyboard.
+        // Header, the other side's clock chip, the board as large as the screen allows, our
+        // clock chip.
         VStack(spacing: 10) {
             header(game)
             clockChip(game, color: flipped ? .white : .black)
@@ -170,32 +166,9 @@ struct ChessTournamentGameView: View {
                 .layoutPriority(1)
             clockChip(game, color: flipped ? .black : .white)
                 .padding(.horizontal)
-            Divider()
-            if game.isOver {
-                // The chat was live only - the players and whoever watched saw it as it
-                // happened; a finished board is just the board.
-                VStack(spacing: 6) {
-                    Image(systemName: "bubble.left.and.bubble.right")
-                        .font(.title3)
-                        .foregroundColor(.secondary)
-                    Text("Chat was live only.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(.top, 20)
-            } else {
-                chatSection(tournament, game)
-            }
+            Spacer(minLength: 0)
         }
         .padding(.top, 8)
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            // Watching is watching: only the two players get the composer - and only while
-            // the game is on.
-            if myColor != nil, !game.isOver {
-                composer(tournament, game)
-            }
-        }
         .sheet(isPresented: $showResignConfirm) {
             resignSheet(tournament, game, leaving: false)
                 .presentationDetents([.height(300)])
@@ -483,102 +456,11 @@ struct ChessTournamentGameView: View {
         }
         .presentationDetents([.height(180)])
     }
-
-    // MARK: - Chat under the board
-
-    /// One bubble's delivery state - the three a 1:1 chat bubble has.
-    private enum LineStatus { case sent, pending, failed }
-
-    /// The game's chat: lines the chain returned (green check on ours), then ours still on the
-    /// way (clock) or failed (red). Scrolls on its own and follows the newest line.
-    private func chatSection(_ tournament: ChessTournament, _ game: ChessTournamentGame) -> some View {
-        let sent = tournament.chat.filter { $0.game == game.id }.suffix(120).map { ($0, LineStatus.sent) }
-        let pending = service.pendingChat
-            .filter { $0.tournament == tournament.id && $0.line.game == game.id }
-            .map { ($0.line, $0.failed ? LineStatus.failed : .pending) }
-        let lines = sent + pending
-        return ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 8) {
-                    if lines.isEmpty {
-                        Text("No messages yet. Each message is one transaction.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .frame(maxWidth: .infinity)
-                            .padding(.top, 16)
-                    }
-                    ForEach(lines, id: \.0.id) { item in
-                        chatBubble(item.0, status: item.1)
-                            .id(item.0.id)
-                    }
-                }
-                .padding(.vertical, 6)
-            }
-            .scrollDismissesKeyboard(.immediately)
-            .frame(minHeight: 96)
-            .onAppear { if let last = lines.last { proxy.scrollTo(last.0.id, anchor: .bottom) } }
-            .onChange(of: lines.map(\.0.id)) { ids in
-                if let last = ids.last { withAnimation { proxy.scrollTo(last, anchor: .bottom) } }
-            }
-        }
-    }
-
-    private func chatBubble(_ line: ChessTournamentChatLine, status: LineStatus) -> some View {
-        let mine = line.sender == me
-        return HStack(alignment: .bottom) {
-            if mine { Spacer(minLength: 48) }
-            VStack(alignment: mine ? .trailing : .leading, spacing: 3) {
-                VStack(alignment: .leading, spacing: 2) {
-                    if !mine {
-                        Text(name(for: line.sender)).font(.caption2.weight(.semibold)).foregroundColor(.secondary)
-                    }
-                    Text(line.text).font(.body).foregroundColor(mine ? .white : .primary)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(mine ? OutgoingBubble.color : Color(.systemGray5))
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                if mine {
-                    // Under the bubble, as in a 1:1 chat: green check once the chain has it.
-                    switch status {
-                    case .sent: Image(systemName: "checkmark.circle.fill").font(.caption2).foregroundColor(.green)
-                    case .pending: Image(systemName: "clock").font(.caption2).foregroundColor(.secondary)
-                    case .failed: Image(systemName: "exclamationmark.circle.fill").font(.caption2).foregroundColor(.red)
-                    }
-                }
-            }
-            if !mine { Spacer(minLength: 48) }
-        }
-        .padding(.horizontal, 12)
-    }
-
-    private func composer(_ tournament: ChessTournament, _ game: ChessTournamentGame) -> some View {
-        HStack(spacing: 8) {
-            TextField("Message (one transaction)", text: $chatText)
-                .textFieldStyle(.roundedBorder)
-                .onSubmit { sendChat(tournament, game) }
-            Button {
-                sendChat(tournament, game)
-            } label: {
-                Image(systemName: "arrow.up.circle.fill").font(.title2)
-            }
-            .disabled(chatText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(.bar)
-    }
-
-    private func sendChat(_ tournament: ChessTournament, _ game: ChessTournamentGame) {
-        let text = chatText
-        chatText = ""
-        Task { await service.sendChat(text, tournament: tournament, game: game) }
-    }
 }
 
 
-/// Pops the navigation stack straight to the 1v1 / Tournaments screen (the second controller
-/// on the stack: Chess Online home, then the kind's screen) when `request` changes. The
+/// Pops the navigation stack straight to the 1v1 / Tournaments screen (the third controller
+/// on the stack: Games, Chess, then the kind's screen) when `request` changes. The
 /// SwiftUI route - clearing the parent's `isPresented` binding - popped one level when a
 /// grandchild was pushed, leaving the player on the bracket or the board; the navigation
 /// controller pops the whole way in one animation.
@@ -602,14 +484,14 @@ private struct ChessNavigationPopper: UIViewRepresentable {
             while let current = responder {
                 if let navigation = current as? UINavigationController {
                     let stack = navigation.viewControllers
-                    guard stack.count > 2 else { navigation.popToRootViewController(animated: true); return }
-                    navigation.popToViewController(stack[1], animated: true)
+                    guard stack.count > 3 else { navigation.popToRootViewController(animated: true); return }
+                    navigation.popToViewController(stack[2], animated: true)
                     return
                 }
                 if let controller = current as? UIViewController, let navigation = controller.navigationController {
                     let stack = navigation.viewControllers
-                    guard stack.count > 2 else { navigation.popToRootViewController(animated: true); return }
-                    navigation.popToViewController(stack[1], animated: true)
+                    guard stack.count > 3 else { navigation.popToRootViewController(animated: true); return }
+                    navigation.popToViewController(stack[2], animated: true)
                     return
                 }
                 responder = current.next

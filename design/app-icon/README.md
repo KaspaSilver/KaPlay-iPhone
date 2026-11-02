@@ -15,3 +15,7 @@ sips -s format jpeg kachat-chess-light.svg.png --out t.jpg && sips -s format png
 
 `KaChatChessLogo.imageset` (the sign-in screen's logo, next to "KaChat Chess", and the privacy
 screen's) is the light icon at 512 px, with the dark icon at 512 px as its dark-mode version.
+
+`ControllerTabIcon.imageset` (the dock's Play icon) is `kachat-chess-tab.svg`, the same controller as
+one path with the D-pad, buttons and K as holes, rendered as a template so the tab bar tints it.
+`python3 make_chess_icon.py tab` writes it; copy it in as `ControllerTabIcon.svg`.

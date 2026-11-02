@@ -24,7 +24,6 @@ struct ChessTournamentsView: View {
     @EnvironmentObject private var walletManager: WalletManager
     @State private var tab: Tab = .play
     @State private var showCreate = false
-    @State private var newName = ""
     @State private var creatorCode = ""
     @State private var isCreating = false
     @State private var showJoinPrivate = false
@@ -64,10 +63,12 @@ struct ChessTournamentsView: View {
             .listStyle(.insetGrouped)
             .gesture(tabSwipe())
         }
+        .fixedScreenTitle(Text(mode.rawValue))
+        .background(Color(.systemGroupedBackground))
         .navigationTitle(mode.rawValue)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .principal) { ScreenTitleToolbarLabel(title: Text(mode.rawValue)) }
+            ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
         }
         .navigationDestination(isPresented: Binding(
             get: { openTournamentId != nil },
@@ -128,7 +129,6 @@ struct ChessTournamentsView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { openTournamentId = request.id }
         }
         .alert(mode == .duel ? "Create a private 1v1" : "Create a private tournament", isPresented: $showCreate) {
-            TextField("Name", text: $newName)
             if mode == .tournament {
                 TextField("Creator code", text: $creatorCode)
             }
@@ -139,8 +139,8 @@ struct ChessTournamentsView: View {
                 let asDuel = mode == .duel
                 Task {
                     let id = asDuel
-                        ? await service.createPrivateDuel(named: newName)
-                        : await service.createPrivateTournament(named: newName, code: creatorCode)
+                        ? await service.createPrivateDuel()
+                        : await service.createPrivateTournament(code: creatorCode)
                     // The creator holds the first seat: straight into the waiting room.
                     if let id { waitingRoomId = id }
                     isCreating = false
@@ -264,7 +264,6 @@ struct ChessTournamentsView: View {
                 Label("Join with a code", systemImage: "key")
             }
             Button {
-                newName = ""
                 showCreate = true
             } label: {
                 Label("Create a private 1v1", systemImage: "plus.circle")
@@ -279,7 +278,7 @@ struct ChessTournamentsView: View {
     // MARK: - Finished
 
     /// Every public game of this kind that has ended, newest first - the result on the row,
-    /// the board (and its chat) a tap away.
+    /// the board a tap away.
     @ViewBuilder
     private var finishedSection: some View {
         let done = Array(service.finishedTournaments.filter { $0.isDuel == (mode == .duel) && $0.isPublic }.prefix(100))
@@ -366,7 +365,7 @@ struct ChessTournamentsView: View {
     // MARK: - Active games (watch only)
 
     /// Every public game of this kind being played right now, for anyone to watch - board and
-    /// clocks live, no chat, no moves (the game screen keeps its composer for the two players).
+    /// clocks live, no moves.
     /// 1v1: one row per game. Tournaments: a section per tournament, a row per game in play,
     /// and the bracket a tap away.
     @ViewBuilder
@@ -392,7 +391,7 @@ struct ChessTournamentsView: View {
             } header: {
                 Text("Live now")
             } footer: {
-                Text("Watching is free - nothing is sent. Only the two players can move or chat.")
+                Text("Watching is free - nothing is sent. Only the two players can move.")
             }
         } else {
             ForEach(live) { tournament in
@@ -476,7 +475,6 @@ struct ChessTournamentsView: View {
                 Label("Join with a code", systemImage: "key")
             }
             Button {
-                newName = ""
                 creatorCode = ""
                 showCreate = true
             } label: {

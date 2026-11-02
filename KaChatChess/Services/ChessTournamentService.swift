@@ -23,8 +23,6 @@ final class ChessTournamentService: ObservableObject {
     /// Moves sent and not yet seen back from the chain, so the board shows them at once and
     /// the player cannot double-send.
     @Published private(set) var pendingMoveGames: Set<String> = []
-    /// Chat of ours not yet returned by the chain (`ChessPendingChatLine`), oldest first.
-    @Published private(set) var pendingChat: [ChessPendingChatLine] = []
 
     private var cancellables = Set<AnyCancellable>()
     private var clockTask: Task<Void, Never>?
@@ -124,13 +122,6 @@ final class ChessTournamentService: ObservableObject {
         }
         let reduced = ChessTournamentEngine.reduce(events)
         tournaments = reduced
-        pendingChat = rows.compactMap { row in
-            guard row.deliveryStatus != .sent, row.senderAddress == myAddress,
-                  let message = ChessTournamentCodec.decode(row.content), message.a == "chat",
-                  let text = message.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
-            let line = ChessTournamentChatLine(id: row.id, sender: row.senderAddress, text: text, blockTime: row.blockTime, game: message.g ?? "")
-            return ChessPendingChatLine(id: row.id, tournament: message.t, line: line, failed: row.deliveryStatus == .failed)
-        }
         recomputeLocalBoards()
         resolveNames(for: Set(reduced.values.flatMap(\.players)))
         // Asked to join a public room that filled first: queue into the next one, once.
@@ -439,23 +430,21 @@ final class ChessTournamentService: ObservableObject {
     }
 
     /// A private 1v1 for a friend: no creator code, an eight-character code to share.
-    func createPrivateDuel(named name: String) async -> String? {
+    func createPrivateDuel() async -> String? {
         let id = ChessTournamentCodec.newPrivateId()
-        let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard await send(ChessTournamentCodec.createDuel(id: id, name: clean.isEmpty ? "1v1" : clean)) else { return nil }
+        guard await send(ChessTournamentCodec.createDuel(id: id, name: ChessTournamentCodec.privateDuelName)) else { return nil }
         return id
     }
 
     /// A private tournament for friends. Needs the creator code; returns nil (with a message)
     /// when it is wrong, without sending anything.
-    func createPrivateTournament(named name: String, code: String) async -> String? {
+    func createPrivateTournament(code: String) async -> String? {
         guard ChessTournamentCodec.isValidCreateKey(ChessTournamentCodec.createKey(code: code, id: "check"), id: "check") else {
             lastError = "That creator code is not right."
             return nil
         }
         let id = ChessTournamentCodec.newPrivateId()
-        let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard await send(ChessTournamentCodec.create(id: id, name: clean.isEmpty ? "Private tournament" : clean, code: code)) else { return nil }
+        guard await send(ChessTournamentCodec.create(id: id, name: ChessTournamentCodec.privateTournamentName, code: code)) else { return nil }
         return id
     }
 
@@ -512,12 +501,6 @@ final class ChessTournamentService: ObservableObject {
     func resign(_ tournament: ChessTournament, game: ChessTournamentGame) async {
         guard let me = myAddress, game.color(of: me) != nil, !game.isOver else { return }
         _ = await send(ChessTournamentCodec.resign(id: tournament.id, game: game.id))
-    }
-
-    func sendChat(_ text: String, tournament: ChessTournament, game: ChessTournamentGame?) async {
-        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty else { return }
-        _ = await send(ChessTournamentCodec.chat(id: tournament.id, game: game?.id, text: clean))
     }
 
     /// The opponent flagged in one of our games: post the claim (once). Runs on every tick.

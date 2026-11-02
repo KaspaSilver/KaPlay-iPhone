@@ -138,6 +138,7 @@ struct ChattingAddressManageView: View {
                 utxosList
             }
         }
+        .fixedScreenTitle(Text("Wallet"))
         .navigationTitle("Wallet")
         .navigationBarTitleDisplayMode(.inline)
         .sheet(isPresented: $showAddressActions) {

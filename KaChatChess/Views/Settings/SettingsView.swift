@@ -1255,9 +1255,27 @@ struct BalanceToolbarLabel: View {
     }
 }
 
-/// A screen's title with the balance under it, for the center of a navigation bar. A principal
-/// toolbar item takes the place of `navigationTitle`, so a bar with only the balance there shows
-/// no title at all. The bar doesn't scroll, so neither does the title.
+extension View {
+    /// A menu's title, the same as KaPosts': big, fixed above the content that scrolls, with the
+    /// balance alone in the center of the bar (a system large title would move with the scroll
+    /// view). Keep `navigationTitle` as well: the next screen's Back reads it.
+    func fixedScreenTitle(_ title: Text) -> some View {
+        VStack(spacing: 0) {
+            title
+                .font(.largeTitle.weight(.bold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 6)
+            self
+        }
+    }
+}
+
+/// A game's title with the balance under it, for the center of a navigation bar: a board has no
+/// room for `fixedScreenTitle`. A principal toolbar item takes the place of `navigationTitle`, so
+/// a bar with only the balance there shows no title at all.
 struct ScreenTitleToolbarLabel: View {
     let title: Text
 
@@ -2168,11 +2186,13 @@ struct SettingsView: View {
                     }
                 }
             }
+            .fixedScreenTitle(Text("Settings"))
+            .background(Color(.systemGroupedBackground))
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) { ConnectionStatusIndicator() }
-                ToolbarItem(placement: .principal) { ScreenTitleToolbarLabel(title: Text("Settings")) }
+                ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
             }
             .toast(message: toastMessage, style: .error)
             .sheet(isPresented: $showSeedPhrase) {
