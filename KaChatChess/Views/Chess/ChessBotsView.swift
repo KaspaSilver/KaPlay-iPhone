@@ -3,6 +3,8 @@ import SwiftUI
 /// Play > Bots: the five bots as a ladder, level 1 to 5. Each level opens when the one before
 /// it is beaten; a locked bot shows who to beat first.
 struct ChessBotsView: View {
+    /// A challenge from a KaPost that opened here because its bot is still locked.
+    var challenge: ChessBotChallenge? = nil
     @ObservedObject private var progress = ChessBotProgress.shared
 
     var body: some View {
@@ -14,7 +16,7 @@ struct ChessBotsView: View {
                         .foregroundColor(.accentColor)
                     Text("Climb the ladder")
                         .font(.title2.weight(.bold))
-                    Text("Five bots, level 1 to 5. Beat one to unlock the next. Every move, yours and the bot's, is a Kaspa transaction.")
+                    Text("Five bots, level 1 to 5. Beat one to unlock the next. Each game's result is stamped on Kaspa when it ends.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
@@ -22,6 +24,11 @@ struct ChessBotsView: View {
                 }
                 .padding(.top, 20)
                 .padding(.bottom, 8)
+
+                if let challenge {
+                    ChessBotChallengeBanner(challenge: challenge)
+                        .padding(.horizontal, 16)
+                }
 
                 ForEach(ChessBot.all) { bot in
                     let unlocked = progress.isUnlocked(bot)
@@ -41,7 +48,7 @@ struct ChessBotsView: View {
         .navigationTitle("Bots")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
+            ToolbarItem(placement: .principal) { ScreenTitleToolbarLabel(title: Text("Bots")) }
         }
     }
 
@@ -84,6 +91,8 @@ struct ChessBotsView: View {
 /// game costs on chain - then Play.
 struct ChessBotDetailView: View {
     let bot: ChessBot
+    /// The challenge from a KaPost that opened this screen.
+    var challenge: ChessBotChallenge? = nil
 
     @ObservedObject private var progress = ChessBotProgress.shared
     @State private var side: ChessBotSidePreference = .white
@@ -109,6 +118,11 @@ struct ChessBotDetailView: View {
                         .padding(.top, 4)
                 }
                 .padding(.top, 20)
+
+                if let challenge {
+                    ChessBotChallengeBanner(challenge: challenge)
+                        .padding(.horizontal, 16)
+                }
 
                 let record = progress.record(for: bot)
                 HStack {
@@ -175,8 +189,8 @@ struct ChessBotDetailView: View {
     }
 
     private var feeLine: String {
-        let each = ChessBotCodec.moveFeeText().map { "about \($0) each" } ?? "one small fee each"
-        return "Every move, yours and \(bot.name)'s, is a Kaspa transaction from your wallet, \(each). Starting and resigning are one transaction too."
+        let fee = ChessBotCodec.stampFeeText().map { "about \($0)" } ?? "one small fee"
+        return "The game itself is free. When it ends, win or lose, its result is stamped on Kaspa: one transaction from your wallet, \(fee)."
     }
 }
 

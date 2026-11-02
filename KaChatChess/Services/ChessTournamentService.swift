@@ -364,7 +364,7 @@ final class ChessTournamentService: ObservableObject {
     /// shortened address (`ContactsManager.displayName`) - and the domain part needs the
     /// profile in `KNSService.profileCache`. Fetched once per address per session; the cache
     /// answers after that, and `KNSService` publishes so rows re-render when it lands.
-    private func resolveNames(for addresses: Set<String>) {
+    func resolveNames(for addresses: Set<String>) {
         let fresh = addresses.subtracting(resolvedNames)
         guard !fresh.isEmpty else { return }
         resolvedNames.formUnion(fresh)

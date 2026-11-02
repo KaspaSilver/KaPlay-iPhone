@@ -51,7 +51,7 @@ struct ChessTournamentGameView: View {
         .navigationTitle(game.map { roundLabel($0) } ?? "Game")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
+            ToolbarItem(placement: .principal) { ScreenTitleToolbarLabel(title: Text(game.map { roundLabel($0) } ?? "Game")) }
             if isLockedIn {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button {

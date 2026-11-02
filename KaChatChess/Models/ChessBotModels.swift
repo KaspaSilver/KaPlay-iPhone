@@ -85,43 +85,42 @@ enum ChessBotSidePreference: String, CaseIterable, Identifiable {
 
 // MARK: - On chain (ONLINE_CHESS.md §7)
 
-/// A bot game message: plaintext broadcast JSON in `#chess-bots`, signed by the player's
-/// address - for the player's moves and the bot's replies alike, so the whole game is on chain.
+/// A finished bot game's stamp: plaintext broadcast JSON in `#chess-bots`, signed by the player's
+/// address, sent once when the game ends.
 struct ChessBotMessage: Codable, Equatable {
     var type: String = "chess_bot"
-    var v: Int = 1
+    var v: Int = 2
     /// Game id: a lowercase UUID chosen by the player's phone.
     let g: String
-    /// Action: start, move, resign.
-    let a: String
-    /// `start` only: the bot's level, 1...5.
-    var bot: Int? = nil
-    /// `start` only: the player's colour, "w" or "b".
-    var c: String? = nil
-    /// Ply number of a move (1 = white's first move).
-    var n: Int? = nil
-    var from: String? = nil
-    var to: String? = nil
-    /// Promotion piece letter: q r b n.
-    var promo: String? = nil
+    var a: String = "result"
+    /// The bot's level, 1...5.
+    let bot: Int
+    /// The player's colour, "w" or "b".
+    let c: String
+    /// How it ended for the player: won, lost, drawn.
+    let r: String
+    /// Why: checkmate, resignation, stalemate, insufficient material, the fifty-move rule,
+    /// threefold repetition.
+    let why: String
+    /// Every move of the game, both sides, space separated: "e2e4 e7e5", a promotion "e7e8q".
+    let m: String
 }
 
 enum ChessBotCodec {
     static let channel = "chess-bots"
 
-    static func start(id: String, bot: ChessBot, playerColor: ChessColor) -> ChessBotMessage {
-        ChessBotMessage(g: id, a: "start", bot: bot.level, c: playerColor == .white ? "w" : "b")
-    }
-
-    static func move(id: String, ply: Int, move: ChessMove) -> ChessBotMessage {
+    static func result(
+        id: String, bot: ChessBot, playerColor: ChessColor,
+        result: ChessBotProgress.Result, moves: [ChessMove]
+    ) -> ChessBotMessage {
         ChessBotMessage(
-            g: id, a: "move", n: ply, from: move.from.algebraic, to: move.to.algebraic,
-            promo: move.promotion?.promotionLetter
+            g: id, bot: bot.level, c: playerColor == .white ? "w" : "b", r: result.code, why: result.why,
+            m: moves.map(moveText).joined(separator: " ")
         )
     }
 
-    static func resign(id: String) -> ChessBotMessage {
-        ChessBotMessage(g: id, a: "resign")
+    private static func moveText(_ move: ChessMove) -> String {
+        move.from.algebraic + move.to.algebraic + (move.promotion?.promotionLetter ?? "")
     }
 
     static func encode(_ message: ChessBotMessage) -> String {
@@ -131,15 +130,17 @@ enum ChessBotCodec {
         return json
     }
 
-    /// One move's fee, for the "about 0.0017 KAS a move" line: the same estimate the arena's
-    /// Join button shows (one input, a fixed-size payload).
+    /// A stamp's fee, for the "about 0.0017 KAS" line: the same estimate the arena's Join button
+    /// shows (one input), on a game of 40 moves a side. A longer game's stamp costs a little more.
     @MainActor
-    static func moveFeeText() -> String? {
+    static func stampFeeText() -> String? {
         guard let wallet = WalletManager.shared.currentWallet,
               let senderScriptPubKey = KaspaAddress.scriptPublicKey(from: wallet.publicAddress) else { return nil }
-        let sample = move(id: UUID().uuidString.lowercased(), ply: 40, move: ChessMove(
-            from: ChessSquare(file: 4, rank: 1), to: ChessSquare(file: 4, rank: 3), promotion: nil
-        ))
+        let e4 = ChessMove(from: ChessSquare(file: 4, rank: 1), to: ChessSquare(file: 4, rank: 3), promotion: nil)
+        let sample = result(
+            id: UUID().uuidString.lowercased(), bot: ChessBot.all[0], playerColor: .white,
+            result: .won("checkmate"), moves: Array(repeating: e4, count: 80)
+        )
         let payload = KasiaTransactionBuilder.buildPublicChatPayload(channel: channel, content: encode(sample))
         let sompi = KasiaTransactionBuilder.estimatePublicChatFee(payload: payload, inputCount: 1, senderScriptPubKey: senderScriptPubKey)
         return String(format: "%.4f %@", Double(sompi) / 100_000_000, KaspaUnit.symbol)
@@ -164,12 +165,37 @@ final class ChessBotProgress: ObservableObject {
         case won(String)
         case lost(String)
         case drawn(String)
+
+        /// `r` in the stamp.
+        var code: String {
+            switch self {
+            case .won: return "won"
+            case .lost: return "lost"
+            case .drawn: return "drawn"
+            }
+        }
+
+        /// `why` in the stamp.
+        var why: String {
+            switch self {
+            case .won(let why), .lost(let why), .drawn(let why): return why
+            }
+        }
+    }
+
+    /// A win that went on chain: how many moves the player took, and when (ms).
+    struct StampedWin: Codable, Equatable {
+        let moves: Int
+        let at: Int64
     }
 
     /// Address -> level -> record.
     @Published private var records: [String: [Int: Record]]
+    /// Address -> level -> wins, so the player's own best shows before the indexer has it.
+    @Published private var stampedWins: [String: [Int: [StampedWin]]]
 
     private static let defaultsKey = "chessBotRecords"
+    private static let stampedWinsKey = "chessBotStampedWins"
 
     private init() {
         if let data = UserDefaults.standard.data(forKey: Self.defaultsKey),
@@ -177,6 +203,12 @@ final class ChessBotProgress: ObservableObject {
             records = saved
         } else {
             records = [:]
+        }
+        if let data = UserDefaults.standard.data(forKey: Self.stampedWinsKey),
+           let saved = try? JSONDecoder().decode([String: [Int: [StampedWin]]].self, from: data) {
+            stampedWins = saved
+        } else {
+            stampedWins = [:]
         }
     }
 
@@ -202,5 +234,20 @@ final class ChessBotProgress: ObservableObject {
         if let data = try? JSONEncoder().encode(records) {
             UserDefaults.standard.set(data, forKey: Self.defaultsKey)
         }
+    }
+
+    func addStampedWin(moves: Int, against bot: ChessBot) {
+        let win = StampedWin(moves: moves, at: Int64(Date().timeIntervalSince1970 * 1000))
+        stampedWins[address, default: [:]][bot.level, default: []].append(win)
+        if let data = try? JSONEncoder().encode(stampedWins) {
+            UserDefaults.standard.set(data, forKey: Self.stampedWinsKey)
+        }
+    }
+
+    /// The player's fewest moves against `bot` since `since` (ms), the earlier win on a tie.
+    func bestWin(against bot: ChessBot, since: Int64) -> StampedWin? {
+        (stampedWins[address]?[bot.level] ?? [])
+            .filter { $0.at >= since }
+            .min { ($0.moves, $0.at) < ($1.moves, $1.at) }
     }
 }

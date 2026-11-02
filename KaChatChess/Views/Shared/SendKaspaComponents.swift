@@ -674,7 +674,7 @@ struct SendStepScreen<Content: View>: View {
     }
 }
 
-/// "To alice.kas", "From Your Address": one line of what a step is about, as a glass chip
+/// "To alice.kas", "From Chatting Address": one line of what a step is about, as a glass chip
 /// above its content (the amount step).
 struct SendStepChip: View {
     let label: LocalizedStringKey
@@ -782,7 +782,7 @@ struct SendFeeEditorScreen: View {
     }
 }
 
-/// The amount step's From: the two pills of `SendFromSection` - Your Address and Choose an
+/// The amount step's From: the two pills of `SendFromSection` - Chatting Address and Choose an
 /// Address (any of your addresses; once picked, the pill shows its name) - without the address
 /// card under them, so the keypad has room. The balance it loads is the amount's Available.
 struct SendFromCompactRow: View {
@@ -803,7 +803,7 @@ struct SendFromCompactRow: View {
                 SelectablePill(title: LocalizedStringKey(sourceTitle), selected: true) {}
                     .allowsHitTesting(false)
             } else {
-                SelectablePill(title: "Your Address", selected: source == .chatting) {
+                SelectablePill(title: "Chatting Address", selected: source == .chatting) {
                     source = .chatting
                 }
                 SelectablePill(title: chooseTitle, selected: source != .chatting) {
@@ -833,7 +833,7 @@ struct SendFromCompactRow: View {
 
     private var sourceTitle: String {
         switch source {
-        case .chatting: return AppLocalization.string("Your Address")
+        case .chatting: return AppLocalization.string("Chatting Address")
         case .spending(_, _, let label): return label
         }
     }
@@ -1835,7 +1835,7 @@ struct SelectablePill: View {
 }
 
 /// The From section every send screen starts with, so it is always plain which address the
-/// Kaspa leaves from: Your Address (the default) or Choose an Address (any of your
+/// Kaspa leaves from: Chatting Address (the default) or Choose an Address (any of your
 /// addresses, each marked used or unused), and the chosen address with its balance.
 struct SendFromSection: View {
     @Binding var source: SendSource
@@ -1853,7 +1853,7 @@ struct SendFromSection: View {
                 .textCase(.uppercase)
             if !isLocked {
                 HStack(spacing: 10) {
-                    SelectablePill(title: "Your Address", selected: source == .chatting) {
+                    SelectablePill(title: "Chatting Address", selected: source == .chatting) {
                         source = .chatting
                     }
                     SelectablePill(title: "Choose an Address", selected: source != .chatting) {
@@ -1898,7 +1898,7 @@ struct SendFromSection: View {
 
     private var title: String {
         switch source {
-        case .chatting: return AppLocalization.string("Your Address")
+        case .chatting: return AppLocalization.string("Chatting Address")
         case .spending(_, _, let label): return label
         }
     }
@@ -1942,7 +1942,7 @@ struct OwnAddressPicker: View {
 }
 
 /// The address list itself, to sit on a screen (a send's From step) or in `OwnAddressPicker`'s
-/// sheet: your address, then the spending addresses,
+/// sheet: the chatting address, then the spending addresses,
 /// as tappable cards with Used / Unused and the balance; the picked one has a check.
 struct OwnAddressList: View {
     let selected: String?
@@ -1954,8 +1954,8 @@ struct OwnAddressList: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let chatting = WalletManager.shared.currentWallet {
-                sectionTitle("Your Address")
-                row(title: AppLocalization.string("Your Address"), address: chatting.publicAddress,
+                sectionTitle("Chatting Address")
+                row(title: AppLocalization.string("Chatting Address"), address: chatting.publicAddress,
                     balance: chatting.balanceSompi) { .chatting }
             }
             sectionTitle("Spending Addresses")

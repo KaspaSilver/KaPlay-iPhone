@@ -277,6 +277,10 @@ struct SeedPhraseView: View {
                     Text("Anyone with your seed phrase can access your account. Never share it with anyone.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
+
+                    Text("Best practice is to write your seed phrase down to back it up, and never store it online.")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
                 }
                 .padding()
                 .background(Color.orange.opacity(0.1))
@@ -365,7 +369,7 @@ struct SeedPhraseView: View {
                             isRevealed = true
                             let token = UUID()
                             revealToken = token
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 7) {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
                                 if revealToken == token {
                                     isRevealed = false
                                 }
@@ -1251,6 +1255,22 @@ struct BalanceToolbarLabel: View {
     }
 }
 
+/// A screen's title with the balance under it, for the center of a navigation bar. A principal
+/// toolbar item takes the place of `navigationTitle`, so a bar with only the balance there shows
+/// no title at all. The bar doesn't scroll, so neither does the title.
+struct ScreenTitleToolbarLabel: View {
+    let title: Text
+
+    var body: some View {
+        VStack(spacing: 0) {
+            title
+                .font(.headline)
+                .lineLimit(1)
+            BalanceToolbarLabel()
+        }
+    }
+}
+
 // MARK: - Connection Status Detail View
 
 struct ConnectionStatusDetailView: View {
@@ -2084,7 +2104,12 @@ struct SettingsView: View {
 
     @State private var showSeedPhrase = false
     @State private var showLogoutConfirmation = false
-    @State private var showDeleteConfirmation = false
+    @State private var showDeleteAccountConfirmation = false
+    /// The seed phrase over the Delete Account warning, which it closes back to.
+    @State private var showSeedPhraseOverDeleteWarning = false
+    /// The backup steps over the Delete Account warning, for an account that hasn't finished them.
+    @State private var showBackupOverDeleteWarning = false
+    @ObservedObject private var backupStatus = AccountBackupStatus.shared
     @State private var showOpenSourceLicenses = false
     @State private var toastMessage: String?
 
@@ -2112,27 +2137,21 @@ struct SettingsView: View {
                 Section("Account") {
                     // Straight into the seed phrase, behind the biometric gate when enabled.
                     Button {
-                        if settingsViewModel.settings.biometricSeedPhraseEnabled {
-                            DeviceAuth.authenticate(reason: "Unlock to view your seed phrase") {
-                                showSeedPhrase = true
-                            }
-                        } else {
-                            showSeedPhrase = true
-                        }
+                        unlockSeedPhrase { showSeedPhrase = true }
                     } label: {
                         Label("View Seed Phrase", systemImage: "key")
+                            .foregroundColor(.red)
+                    }
+                    Button {
+                        showDeleteAccountConfirmation = true
+                    } label: {
+                        Label("Delete Account", systemImage: "trash")
                             .foregroundColor(.red)
                     }
                     Button {
                         showLogoutConfirmation = true
                     } label: {
                         Label("Log Out", systemImage: "rectangle.portrait.and.arrow.right")
-                            .foregroundColor(.red)
-                    }
-                    Button {
-                        showDeleteConfirmation = true
-                    } label: {
-                        Label("Remove Account from This iPhone", systemImage: "trash")
                             .foregroundColor(.red)
                     }
                 }
@@ -2153,7 +2172,7 @@ struct SettingsView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) { ConnectionStatusIndicator() }
-                ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
+                ToolbarItem(placement: .principal) { ScreenTitleToolbarLabel(title: Text("Settings")) }
             }
             .toast(message: toastMessage, style: .error)
             .sheet(isPresented: $showSeedPhrase) {
@@ -2166,28 +2185,43 @@ struct SettingsView: View {
                 ConfirmActionSheet(
                     title: "Log Out",
                     confirmTitle: "Log Out",
-                    confirmSubtitle: "Signs out of this account. Its keys stay on this iPhone.",
+                    confirmSubtitle: "Signs out of this account. Its data stays on this device.",
                     confirmSystemImage: "rectangle.portrait.and.arrow.right"
                 ) {
                     Task { await walletManager.logout() }
                 }
             }
-            .sheet(isPresented: $showDeleteConfirmation) {
-                ConfirmActionSheet(
-                    title: "Remove Account",
-                    confirmTitle: "Remove Account",
-                    confirmSubtitle: "Deletes this account's keys from this iPhone. Without your seed phrase it cannot be recovered.",
-                    confirmSystemImage: "trash"
+            .sheet(isPresented: $showDeleteAccountConfirmation) {
+                DeleteAccountSheet(
+                    confirmSubtitle: "Removes this account and its data from this device.",
+                    onViewSeedPhrase: { unlockSeedPhrase { showSeedPhraseOverDeleteWarning = true } },
+                    notBackedUp: backupStatus.isPending(walletManager.currentWallet?.publicAddress),
+                    onBackUp: { AccountBackupView.unlock { showBackupOverDeleteWarning = true } }
                 ) {
                     Task {
                         do {
                             try await walletManager.deleteWallet()
                         } catch {
-                            toastMessage = "Couldn't remove the account: \(UserFacingError.message(for: error))"
+                            toastMessage = "Couldn't delete the account: \(UserFacingError.message(for: error))"
                         }
                     }
                 }
+                .sheet(isPresented: $showSeedPhraseOverDeleteWarning) {
+                    SeedPhraseView()
+                }
+                .sheet(isPresented: $showBackupOverDeleteWarning) {
+                    AccountBackupView()
+                }
             }
+        }
+    }
+
+    /// The seed phrase, behind the biometric gate when enabled.
+    private func unlockSeedPhrase(_ show: @escaping () -> Void) {
+        if settingsViewModel.settings.biometricSeedPhraseEnabled {
+            DeviceAuth.authenticate(reason: "Unlock to view your seed phrase", onSuccess: show)
+        } else {
+            show()
         }
     }
 }

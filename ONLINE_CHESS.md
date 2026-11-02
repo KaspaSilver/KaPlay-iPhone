@@ -199,27 +199,54 @@ the store retains, and the leaderboard is local (both periods, same rules).
 
 Play > Bots: five bots, level 1 to 5 (Kaspa Silver, Izio Dev, Coderofstuff, Michael Sutton,
 Yonatan Sompolinsky). Level 1 is open; each level opens when the one before it is beaten
-(kept on the phone, per address). The bot runs on the player's phone, and the game is put on
-chain as it is played:
+(kept on the phone, per address). The bot runs on the player's phone and the game costs nothing
+while it is played. **When it ends, its result and moves go on chain in one transaction**, the
+stamp, signed by the player's address, about 0.0017 KAS. Online games (§1-6) stay on chain move
+by move: their transactions are how the phones talk, and there is no referee to replace them.
 
-- Channel **`#chess-bots`**, not the arena - bot games are nobody else's business, and they
-  would only add rows every arena reader has to scan. Payloads are
-  `kchat:1:bcast:chess-bots:<json>`.
-- Every message is signed by the **player's** address: the player's moves and the bot's
-  replies alike (the bot has no key). So a bot game costs the player one transaction per
-  ply, both sides - about 0.0017 KAS each.
-- Sends go one at a time, in order. The bot replies only once the player's move is on
-  chain, and the player moves only once the bot's is; a failed send holds the game until
-  Retry. The chain therefore always holds the game up to the board.
+- Channel **`#chess-bots`**, not the arena. Payloads are `kchat:1:bcast:chess-bots:<json>`.
+- Every finished game is stamped: a win, a loss, a draw or a resignation. A game abandoned by
+  closing the app is not, and costs nothing.
+- A failed send holds until Retry. A level unlocks on the phone the moment it is won, stamped or
+  not; only a stamped win counts on the leaderboard.
 
-| `a` | Fields | Meaning |
-|---|---|---|
-| `start` | `g`, `bot` (1...5), `c` (`"w"` or `"b"`, the player's colour) | A new game against bot level `bot`. |
-| `move` | `g`, `n`, `from`, `to`, `promo`? | Ply `n` (1 = white's first), whichever side made it - `n` and `c` say whose. |
-| `resign` | `g` | The player resigned. |
+| Field | Meaning |
+|---|---|
+| `type`, `v` | `"chess_bot"`, `2` |
+| `g` | Game id: a lowercase UUID |
+| `a` | `"result"` |
+| `bot` | The bot's level, 1...5 |
+| `c` | The player's colour: `"w"` or `"b"` |
+| `r` | How it ended for the player: `"won"`, `"lost"` or `"drawn"` |
+| `why` | `checkmate`, `resignation`, `stalemate`, `insufficient material`, `the fifty-move rule`, `threefold repetition` |
+| `m` | Every move of the game, both sides, space separated: `e2e4 e7e5`, a promotion `e7e8q` |
 
-`type` is `"chess_bot"`, `v` is `1`, `g` is the game id (a lowercase UUID). Checkmate,
-stalemate, insufficient material, fifty moves and threefold repetition are not sent: they
-follow from the moves. There is no clock. Bot games do not count toward the leaderboard.
+Example: `{"a":"result","bot":3,"c":"w","g":"3b0f…","m":"e2e4 e7e5 d1h5 b8c6 f1c4 g8f6 h5f7","r":"won","type":"chess_bot","v":2,"why":"checkmate"}`
 
-Example: `{"a":"move","from":"g8","g":"3b0f…","n":2,"to":"f6","type":"chess_bot","v":1}`
+Earlier builds sent `v: 1` messages per move (`start`, `move`, `resign`). They are still on chain
+and count for nothing.
+
+### 7.1 Bot leaderboards
+
+One board per bot: each player's **fewest moves to win**, this month and all time (the periods of
+§6). "Moves" are the player's own: a win as white in `m` of 7 plies is 4 moves. A tie goes to the
+earlier win. Bot games still do not count on the 1v1 or Tournaments boards.
+
+The phone reads `GET /chess/bots/leaderboard?period=month|all&limit=100` (the hand-off is
+`docs/CHESS_BOT_LEADERBOARD.md` in the indexer repo) and merges the player's own stamped wins, kept
+on the phone, so a win shows at once.
+
+The board is **not cheat proof**. The bot has no key and plays with randomness on the player's
+phone, so nobody else can tell whether it really chose the moves in `m`: the indexer can check that
+they are legal and end in checkmate, not that the game happened. It is a board for fun.
+
+### 7.2 Links with KaPost
+
+- **Share:** after a win is stamped, Share to KaPost opens `kaposts://compose?text=<percent-encoded
+  post>`: KaPost's composer with the post written, and the player taps Post. Without KaPost the
+  App Store opens.
+- **The post** ends in the challenge link:
+  `kachatchess://bot/<level>?name=<bot name>&moves=<n>&by=<address>&game=<game id>`. KaPost draws it
+  as a card with a Challenge button, which opens the link, or the App Store without KaPlay.
+- **KaPlay** opens the link on the Play tab: that bot's screen with the challenge at the top, or the
+  ladder if the bot is still locked. Only the level is required; a bad `moves` or `by` is left out.

@@ -67,7 +67,7 @@ struct ChessTournamentsView: View {
         .navigationTitle(mode.rawValue)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
+            ToolbarItem(placement: .principal) { ScreenTitleToolbarLabel(title: Text(mode.rawValue)) }
         }
         .navigationDestination(isPresented: Binding(
             get: { openTournamentId != nil },

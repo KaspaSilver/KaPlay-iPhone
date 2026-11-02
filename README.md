@@ -1,7 +1,7 @@
 # KaChat Chess
 
-Chess on Kaspa: every move is a Kaspa transaction, so every game is on chain for good.
-Public 1v1 rooms, private games by code, and eight-player knockout tournaments, five
+Chess on Kaspa: online, every move is a Kaspa transaction, so every game is on chain for
+good. Public 1v1 rooms, private games by code, and eight-player knockout tournaments, five
 minutes a side, with monthly and all-time leaderboards.
 
 KaChat Chess is KaChat's Chess Online made into its own iPhone app. It plays the same
@@ -13,8 +13,10 @@ leaderboard from the KaChat indexer's `/chess/leaderboard`).
 
 - **Play**: 1v1 (the public room taking players, or a friend by code) and Tournaments,
   each with Active and Finished games to watch; and Bots, a ladder of five bots (level 1
-  to 5) whose games go on chain move by move too (ONLINE_CHESS.md §7).
-- **Leaderboard**: 1v1 games and tournaments, this month and all time.
+  to 5) whose games are stamped on chain once, when they end (ONLINE_CHESS.md §7). A win can
+  be shared to KaPost as a challenge.
+- **Leaderboard**: 1v1 games, tournaments and each bot (fewest moves to win), this month and
+  all time.
 - **Wallet**: the one address every move is signed by: balance, history, UTXOs, Receive
   and Send.
 - **Settings**: appearance, language and currency, security, the Kaspa node and indexer,

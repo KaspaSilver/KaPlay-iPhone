@@ -3,7 +3,8 @@ import UIKit
 
 /// KaChat Chess's entry point. KaChat's own (`KaChatApp`) also ran chats, calls, push, Siri,
 /// the share sheet and link routing; none of that is here - only the wallet, the node pool,
-/// and the services Chess Online reads the arena and sends its moves through.
+/// the services Chess Online reads the arena and sends its moves through, and the bot challenge
+/// link (`ChessBotLinks`).
 @main
 struct KaChatChessApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -48,6 +49,11 @@ struct KaChatChessApp: App {
                 .onAppear {
                     ChatService.shared.settingsViewModel = settingsViewModel
                     applyWindowAppearanceOverride()
+                }
+                .onOpenURL { url in
+                    if let challenge = ChessBotLinks.challenge(from: url) {
+                        ChessBotLinkRouter.shared.challenge = challenge
+                    }
                 }
                 .preferredColorScheme(settingsViewModel.settings.appearance.colorScheme)
                 .onChange(of: settingsViewModel.settings.appearance) { _ in

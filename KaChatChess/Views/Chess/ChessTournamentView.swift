@@ -33,7 +33,7 @@ struct ChessTournamentView: View {
         .navigationTitle(tournament?.name ?? "Tournament")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
+            ToolbarItem(placement: .principal) { ScreenTitleToolbarLabel(title: Text(tournament?.name ?? "Tournament")) }
         }
         .navigationDestination(isPresented: Binding(
             get: { openGameId != nil },

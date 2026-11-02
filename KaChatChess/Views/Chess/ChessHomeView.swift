@@ -8,6 +8,9 @@ struct ChessHomeView: View {
     @EnvironmentObject private var walletManager: WalletManager
     @State private var openMode: ChessTournamentsView.Mode?
     @State private var openBots = false
+    @ObservedObject private var links = ChessBotLinkRouter.shared
+    /// A challenge from a KaPost being shown (`ChessBotLinks`).
+    @State private var openChallenge: ChessBotChallenge?
 
     var body: some View {
         NavigationStack {
@@ -18,7 +21,7 @@ struct ChessHomeView: View {
                             .foregroundColor(.accentColor)
                         Text("Choose your game")
                             .font(.title2.weight(.bold))
-                        Text("Five minutes a side. Every move is a Kaspa transaction, so every game is on chain for good.")
+                        Text("Online, five minutes a side and every move is a Kaspa transaction. Bot games stamp their result on Kaspa when they end.")
                             .font(.subheadline)
                             .foregroundColor(.secondary)
                             .multilineTextAlignment(.center)
@@ -64,7 +67,7 @@ struct ChessHomeView: View {
                     gameCard(
                         icon: "cpu",
                         title: "Bots",
-                        detail: "Five bots, level 1 to 5, from Kaspa Silver to Yonatan Sompolinsky. Beat one to unlock the next. Every move on Kaspa."
+                        detail: "Five bots, level 1 to 5, from Kaspa Silver to Yonatan Sompolinsky. Beat one to unlock the next. The result goes on Kaspa."
                     ) { openBots = true }
                 }
                 .padding(.bottom, 24)
@@ -74,7 +77,7 @@ struct ChessHomeView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) { ConnectionStatusIndicator() }
-                ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
+                ToolbarItem(placement: .principal) { ScreenTitleToolbarLabel(title: Text("Play")) }
             }
             .navigationDestination(isPresented: Binding(
                 get: { openMode != nil },
@@ -87,9 +90,32 @@ struct ChessHomeView: View {
             .navigationDestination(isPresented: $openBots) {
                 ChessBotsView()
             }
-            .onAppear { service.acquire() }
+            .navigationDestination(isPresented: Binding(
+                get: { openChallenge != nil },
+                set: { if !$0 { openChallenge = nil } }
+            )) {
+                if let openChallenge {
+                    // A bot still locked: the ladder, which says who to beat first.
+                    if ChessBotProgress.shared.isUnlocked(openChallenge.bot) {
+                        ChessBotDetailView(bot: openChallenge.bot, challenge: openChallenge)
+                    } else {
+                        ChessBotsView(challenge: openChallenge)
+                    }
+                }
+            }
+            .onAppear {
+                service.acquire()
+                takeChallenge()
+            }
+            .onChange(of: links.challenge) { _ in takeChallenge() }
             .onDisappear { service.release() }
         }
+    }
+
+    private func takeChallenge() {
+        guard let challenge = links.challenge else { return }
+        links.challenge = nil
+        openChallenge = challenge
     }
 
     private func gameCard(icon: String, title: String, detail: String, open: @escaping () -> Void) -> some View {

@@ -2647,8 +2647,8 @@ struct AppSettings: Codable {
             hubTabs: AppTab.defaultHub.map { $0.rawValue },
             childModeEnabled: false,
             biometricSeedPhraseEnabled: true,
-            // Account-login biometrics are opt-in (off by default) on every platform.
-            biometricAccountLoginEnabled: false,
+            // Asked when signing back in to a saved account: on by default, as in KaPay.
+            biometricAccountLoginEnabled: true,
             biometricSpendingKeyEnabled: true,
             swapDisclaimerAgreed: false,
             indexerURL: defaultIndexerURL,
@@ -2774,7 +2774,7 @@ struct AppSettings: Codable {
         hubTabs: [String] = AppTab.defaultHub.map { $0.rawValue },
         childModeEnabled: Bool = false,
         biometricSeedPhraseEnabled: Bool = true,
-        biometricAccountLoginEnabled: Bool = false,
+        biometricAccountLoginEnabled: Bool = true,
         biometricSpendingKeyEnabled: Bool = true,
         swapDisclaimerAgreed: Bool = false,
         verboseAPILogging: Bool = false,
@@ -2926,7 +2926,7 @@ struct AppSettings: Codable {
         hubTabs = try container.decodeIfPresent([String].self, forKey: .hubTabs) ?? AppTab.defaultHub.map { $0.rawValue }
         childModeEnabled = try container.decodeIfPresent(Bool.self, forKey: .childModeEnabled) ?? false
         biometricSeedPhraseEnabled = try container.decodeIfPresent(Bool.self, forKey: .biometricSeedPhraseEnabled) ?? true
-        biometricAccountLoginEnabled = try container.decodeIfPresent(Bool.self, forKey: .biometricAccountLoginEnabled) ?? false
+        biometricAccountLoginEnabled = try container.decodeIfPresent(Bool.self, forKey: .biometricAccountLoginEnabled) ?? true
         biometricSpendingKeyEnabled = try container.decodeIfPresent(Bool.self, forKey: .biometricSpendingKeyEnabled) ?? true
         swapDisclaimerAgreed = try container.decodeIfPresent(Bool.self, forKey: .swapDisclaimerAgreed) ?? false
         verboseAPILogging = try container.decodeIfPresent(Bool.self, forKey: .verboseAPILogging) ?? false

@@ -13,7 +13,7 @@ struct ChessBotGameView: View {
 }
 
 /// The board against the bot, laid out like the online board: who you play and where the game
-/// stands, the board, then how much of the game is on chain and the moves so far.
+/// stands, the board, then where the game's stamp on chain stands and the moves so far.
 private struct ChessBotMatchView: View {
     @StateObject private var game: ChessBotGame
     let onPlayAgain: () -> Void
@@ -52,7 +52,7 @@ private struct ChessBotMatchView: View {
         .navigationTitle("Level \(bot.level)")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
+            ToolbarItem(placement: .principal) { ScreenTitleToolbarLabel(title: Text("Level \(bot.level)")) }
             if isLockedIn {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button {
@@ -124,7 +124,7 @@ private struct ChessBotMatchView: View {
             }
             Text(statusText)
                 .font(.subheadline.weight(.semibold))
-                .foregroundColor(game.sendError != nil ? .red : (game.isOver ? .secondary : .primary))
+                .foregroundColor(game.isOver ? .secondary : .primary)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal)
@@ -133,14 +133,12 @@ private struct ChessBotMatchView: View {
     private var statusText: String {
         if let result = game.result {
             switch result {
-            case .won(let why): return "You won by \(why)."
+            case .won(let why): return "You won by \(why) in \(game.playerMoveCount) moves."
             case .lost(let why): return why == "resignation" ? "You resigned. \(bot.name) wins." : "\(bot.name) won by \(why)."
             case .drawn(let why): return "Draw by \(why)."
             }
         }
-        if game.sendError != nil { return "Couldn't put the last move on Kaspa." }
         if game.isThinking { return "\(bot.name) is thinking…" }
-        if !game.outbox.isEmpty { return game.moves.isEmpty ? "Starting the game on Kaspa…" : "Putting the move on Kaspa…" }
         if game.board.sideToMove == game.playerColor {
             return ChessEngine.isKingInCheck(color: game.playerColor, board: game.board) ? "Check. Your move." : "Your move"
         }
@@ -290,6 +288,10 @@ private struct ChessBotMatchView: View {
                         .font(.subheadline.weight(.semibold))
                         .foregroundColor(.orange)
                 }
+                if case .won = result {
+                    shareButton
+                        .padding(.top, 6)
+                }
                 HStack(spacing: 10) {
                     Button {
                         onPlayAgain()
@@ -325,14 +327,46 @@ private struct ChessBotMatchView: View {
                 }
                 .buttonStyle(.plain)
             }
-            .padding(24)
+            .padding(16)
         }
+    }
+
+    /// Share to KaPost, once the win is on chain: what the post shows off can be looked up.
+    private var shareButton: some View {
+        let title: String = {
+            switch game.stamp {
+            case .stamped: return "Share to KaPost"
+            case .failed: return "Retry the stamp"
+            case .none, .sending: return "Stamping the result…"
+            }
+        }()
+        return Button {
+            switch game.stamp {
+            case .stamped:
+                Haptics.impact(.light)
+                ChessBotLinks.shareToKaPost(bot: bot, moves: game.playerMoveCount, gameId: game.id)
+            case .failed:
+                game.retry()
+            case .none, .sending:
+                break
+            }
+        } label: {
+            Label(title, systemImage: "square.and.arrow.up")
+                .font(.subheadline.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+                .background(Color.orange)
+                .foregroundColor(.white)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
+        .disabled(game.stamp == .sending || game.stamp == .none)
     }
 
     // MARK: - Resign
 
     private func resignSheet(leaving: Bool) -> some View {
-        let consequence = "It counts as a loss against \(bot.name). Resigning is one transaction."
+        let consequence = "It counts as a loss against \(bot.name), and the result goes on Kaspa in one transaction."
         return VStack(spacing: 16) {
             Image(systemName: leaving ? "rectangle.portrait.and.arrow.right" : "flag.fill")
                 .font(.scaled(size: 34))
@@ -383,28 +417,31 @@ private struct ChessBotMatchView: View {
 
     // MARK: - On chain, and the moves
 
-    /// How much of the game is on chain: a spinner while a move is going out, a check when
-    /// everything is, Retry when a send failed.
+    /// Where the stamp stands: a spinner while it goes out, a check once it is on chain, Retry
+    /// when it failed.
     private var chainBar: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 Image(systemName: "link")
                     .foregroundColor(.accentColor)
-                Text("\(game.movesOnChain) of \(game.moves.count) moves on Kaspa")
+                Text(chainText)
                     .font(.caption.weight(.semibold))
                 Spacer()
-                if game.sendError != nil {
-                    Button("Retry") { game.retry() }
-                        .font(.caption.weight(.bold))
-                } else if !game.outbox.isEmpty {
+                switch game.stamp {
+                case .none:
+                    EmptyView()
+                case .sending:
                     ProgressView()
                         .scaleEffect(0.8)
-                } else {
+                case .stamped:
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundColor(.green)
+                case .failed:
+                    Button("Retry") { game.retry() }
+                        .font(.caption.weight(.bold))
                 }
             }
-            if let error = game.sendError {
+            if case .failed(let error) = game.stamp {
                 Text(error)
                     .font(.caption2)
                     .foregroundColor(.red)
@@ -413,6 +450,15 @@ private struct ChessBotMatchView: View {
         }
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+    }
+
+    private var chainText: String {
+        switch game.stamp {
+        case .none: return "The result goes on Kaspa when the game ends"
+        case .sending: return "Stamping the result on Kaspa…"
+        case .stamped: return "Result stamped on Kaspa"
+        case .failed: return "Couldn't stamp the result on Kaspa"
+        }
     }
 
     private struct MovePair: Identifiable {

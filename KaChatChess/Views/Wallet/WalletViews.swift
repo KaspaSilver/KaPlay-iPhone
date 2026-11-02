@@ -46,6 +46,9 @@ struct ChattingAddressManageView: View {
     /// The "Address Actions" half sheet, and the public-key screen it can open.
     @State private var showAddressActions = false
     @State private var showPublicKeySheet = false
+    @ObservedObject private var backupStatus = AccountBackupStatus.shared
+    @State private var showAccountBackup = false
+    @State private var showBackupHygiene = false
     @State private var utxoLabels: [String: String] = [:]
     @State private var renamingUtxo: UTXO?
     @State private var renameUtxoText = ""
@@ -67,6 +70,23 @@ struct ChattingAddressManageView: View {
         "\(utxo.outpoint.transactionId):\(utxo.outpoint.index)"
     }
 
+    /// Until this account's backup steps are finished, red once it holds funds. After that, Backup
+    /// Hygiene every six months.
+    @ViewBuilder
+    private var accountBackupSection: some View {
+        if backupStatus.isPending(address) {
+            AccountBackupCard(hasFunds: balanceSompi > 0) {
+                AccountBackupView.unlock { showAccountBackup = true }
+            }
+            .padding(.horizontal)
+            .padding(.top, 12)
+        } else if backupStatus.isHygieneDue(address) {
+            BackupHygieneCard { showBackupHygiene = true }
+                .padding(.horizontal)
+                .padding(.top, 12)
+        }
+    }
+
     /// Plain names - History, UTXOs - the way the user asked for them.
     private func tabLabel(_ tab: Tab) -> String {
         tab.rawValue
@@ -83,6 +103,7 @@ struct ChattingAddressManageView: View {
             }
             .padding(.top, 12)
 
+            accountBackupSection
 
             // What used to be two unlabelled glyphs in the navigation bar. A pair of icons has
             // room for no words at all, so neither said what it did, and there was nowhere to put
@@ -127,6 +148,12 @@ struct ChattingAddressManageView: View {
         .sheet(isPresented: $showPublicKeySheet) {
             ChattingAddressPublicKeyView(address: address)
         }
+        .sheet(isPresented: $showAccountBackup) {
+            AccountBackupView()
+        }
+        .sheet(isPresented: $showBackupHygiene) {
+            BackupHygieneView()
+        }
         .safeAreaInset(edge: .bottom) {
             HStack(spacing: 12) {
                 Button {
@@ -158,6 +185,19 @@ struct ChattingAddressManageView: View {
         .sheet(isPresented: $showReceiveSheet) {
             NavigationStack {
                 ChattingAddressQRView(address: address, balanceSompi: balanceSompi)
+                    // a reminder only: receiving is never blocked
+                    .safeAreaInset(edge: .top, spacing: 0) {
+                        if backupStatus.isPending(address) {
+                            Label("This account isn't backed up yet. Use the card on the Wallet tab to back it up.",
+                                  systemImage: "exclamationmark.shield.fill")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundColor(.orange)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 10)
+                                .background(Color.orange.opacity(0.12))
+                        }
+                    }
                     .toolbar {
                         ToolbarItem(placement: .navigationBarLeading) {
                             Button("Close") { showReceiveSheet = false }
@@ -574,7 +614,7 @@ private struct ChattingAddressPrivateKeyView: View {
                 Spacer()
             }
             .padding()
-            .navigationTitle("Your Address")
+            .navigationTitle("Chatting Address")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
@@ -641,7 +681,7 @@ private struct ChattingAddressPublicKeyView: View {
                     Label("Safe to share", systemImage: "checkmark.seal.fill")
                         .font(.headline)
                         .foregroundColor(.accentColor)
-                    Text("This is the public half of your address. It identifies you and cannot spend anything.")
+                    Text("This is the public half of your chatting address. It identifies you and cannot spend anything.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                 }
@@ -710,7 +750,7 @@ private struct ChattingAddressPublicKeyView: View {
 struct ChattingAddressQRView: View {
     let address: String
     let balanceSompi: UInt64?
-    var subtitle: String = "Every move you play is a Kaspa transaction from this address, about 0.0017 KAS each: 1 KAS covers about 500 moves."
+    var subtitle: String = "Every online move you play is a Kaspa transaction from this address, about 0.0017 KAS each: 1 KAS covers about 500 moves."
 
     @State private var qrImage: UIImage?
     @State private var toastMessage: String?
@@ -776,11 +816,16 @@ struct ChattingAddressQRView: View {
             .toast(message: toastMessage)
             .toolbar {
                 ToolbarItem(placement: .principal) {
-                    Text(balanceSompi.map { "\(formatKaspaExact($0)) \(KaspaUnit.symbol)" } ?? "—")
-                        .font(.caption)
-                        .fontWeight(.bold)
-                        .monospacedDigit()
-                        .foregroundColor(.primary)
+                    // Black in dark mode too: this screen is always white.
+                    VStack(spacing: 0) {
+                        Text("Receive")
+                            .font(.headline)
+                        Text(balanceSompi.map { "\(formatKaspaExact($0)) \(KaspaUnit.symbol)" } ?? "—")
+                            .font(.caption)
+                            .fontWeight(.bold)
+                            .monospacedDigit()
+                    }
+                    .foregroundColor(.black)
                 }
             }
             .navigationBarTitleDisplayMode(.inline)
@@ -855,7 +900,7 @@ struct WithdrawKaspaView: View {
     var lockedSource: SendSource? = nil
     var onComplete: (() -> Void)? = nil
 
-    /// Where the Kaspa leaves from (the From step): your address by default.
+    /// Where the Kaspa leaves from (the From step): the chatting address by default.
     @State private var source: SendSource = .chatting
     /// The From address's balance: the amount's Available and its check.
     @State private var sourceBalanceSompi: UInt64?
@@ -1181,7 +1226,7 @@ struct WithdrawKaspaView: View {
 
     // MARK: Step 2 - From
 
-    /// "Where are you sending from?": your address, or Choose an Address with your addresses
+    /// "Where are you sending from?": the Chatting Address, or Choose an Address with your addresses
     /// listed right here (no sheet).
     private var fromStep: some View {
         SendStepScreen(title: Text(LocalizedStringKey(screenTitle)),
@@ -1194,7 +1239,7 @@ struct WithdrawKaspaView: View {
                 VStack(alignment: .leading, spacing: 14) {
                     SendStepQuestion(text: "Where are you sending from?")
                     HStack(spacing: 10) {
-                        SelectablePill(title: "Your Address", selected: !choosingFrom) {
+                        SelectablePill(title: "Chatting Address", selected: !choosingFrom) {
                             choosingFrom = false
                             source = .chatting
                         }
@@ -1208,13 +1253,13 @@ struct WithdrawKaspaView: View {
                             .foregroundColor(.secondary)
                         OwnAddressList(selected: source == .chatting ? nil : source.address) { picked in
                             source = picked
-                            // your address picked from the list: back on its own pill
+                            // the chatting address picked from the list: back on its own pill
                             if picked == .chatting { choosingFrom = false }
                         }
                     } else if let address = source.address {
                         HStack(spacing: 12) {
                             VStack(alignment: .leading, spacing: 3) {
-                                Text("Your Address")
+                                Text("Chatting Address")
                                     .font(.subheadline.weight(.semibold))
                                 Text(verbatim: "\(address.prefix(14))...\(address.suffix(6))")
                                     .font(.caption.monospaced())
@@ -1239,7 +1284,7 @@ struct WithdrawKaspaView: View {
         }
     }
 
-    /// "From Your Address" (or the picked address), on the amount step.
+    /// "From Chatting Address" (or the picked address), on the amount step.
     private var fromChip: some View {
         SendStepChip(label: "From", value: sourceTitle)
     }
@@ -1405,7 +1450,7 @@ struct WithdrawKaspaView: View {
     private var sourceTitle: String {
         if isCompoundMode { return AppLocalization.string("This address") }
         switch source {
-        case .chatting: return AppLocalization.string("Your Address")
+        case .chatting: return AppLocalization.string("Chatting Address")
         case .spending(_, _, let label): return label
         }
     }
@@ -1451,7 +1496,10 @@ struct WithdrawKaspaView: View {
     private func resolveKNSDomain(_ domain: String) {
         isResolvingKNS = true
 
-        Task {
+        // On the main actor: the check below must read the field as it is now. Read from a
+        // background task while typing fast, it could see an older value, take this lookup for a
+        // stale one and stop - leaving "Looking up domain..." up for good.
+        Task { @MainActor in
             try? await Task.sleep(nanoseconds: 300_000_000)
 
             guard addressInput.trimmingCharacters(in: .whitespacesAndNewlines) == domain ||

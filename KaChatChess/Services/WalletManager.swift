@@ -377,7 +377,21 @@ final class WalletManager: ObservableObject {
     @discardableResult
     func commitCreatedWallet(seedPhrase: SeedPhrase, passphrase: String, alias: String) async throws -> Wallet {
         let sp = SeedPhrase(words: seedPhrase.words, passphrase: passphrase.isEmpty ? nil : passphrase)
-        return try await importWallet(from: sp, alias: alias)
+        let wallet = try await importWallet(from: sp, alias: alias)
+        // nobody has seen these words yet: the Wallet tab's card stays until they're backed up
+        AccountBackupStatus.shared.markPending(wallet.publicAddress)
+        return wallet
+    }
+
+    /// The name a new account gets, renameable later: "My Account", then "My Account 2" and on,
+    /// skipping any name a saved account already has.
+    func nextDefaultAccountName() -> String {
+        let base = AppLocalization.string("My Account")
+        let taken = Set(savedAccounts.map { $0.alias.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        guard taken.contains(base.lowercased()) else { return base }
+        var number = 2
+        while taken.contains("\(base) \(number)".lowercased()) { number += 1 }
+        return "\(base) \(number)"
     }
 
     /// Convenience one-shot create (generate + commit with no passphrase). Retained for callers
@@ -505,6 +519,8 @@ final class WalletManager: ObservableObject {
             throw KasiaError.seedPhraseParsingFailed(wordCount: words.count)
         }
         let wallet = try await importWallet(from: seedPhrase, alias: alias, family: family)
+        // whoever typed the words has them
+        AccountBackupStatus.shared.markDone(wallet.publicAddress)
         // A restored seed finds its spending addresses by itself - legacy and quantum, the same
         // sweep as Manage Addresses' Discover Addresses - so balances and change rotation are
         // right without anyone knowing to tap it (owner's call, 2026-10-21). Only this path: a
@@ -535,6 +551,7 @@ final class WalletManager: ObservableObject {
             await MessageStore.shared.destroyLocalStoreFiles()
         }
         if let walletAddressToDelete {
+            AccountBackupStatus.shared.forget(walletAddressToDelete)
             // its .kachat reminders would keep firing for names this phone no longer holds - on
         }
 
@@ -682,6 +699,7 @@ final class WalletManager: ObservableObject {
                 for address in Self.accountAddressVariants(account.publicAddress) {
                     ContactsManager.shared.deletePersistedContacts(forWalletAddress: address)
                 }
+                AccountBackupStatus.shared.forget(account.publicAddress)
                 removeSavedAccountFromStorage(account)
                 return
             }
@@ -714,6 +732,7 @@ final class WalletManager: ObservableObject {
             return
         }
 
+        AccountBackupStatus.shared.forget(account.publicAddress)
         removeSavedAccountFromStorage(account)
         currentWallet = nil
         isBalanceRefreshing = false
