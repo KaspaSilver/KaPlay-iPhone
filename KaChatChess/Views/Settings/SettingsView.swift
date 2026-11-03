@@ -2121,6 +2121,8 @@ struct SettingsView: View {
     @EnvironmentObject var settingsViewModel: SettingsViewModel
 
     @State private var showSeedPhrase = false
+    @State private var showNFCCardBackup = false
+    @State private var accountHasPassphrase = false
     @State private var showLogoutConfirmation = false
     @State private var showDeleteAccountConfirmation = false
     /// The seed phrase over the Delete Account warning, which it closes back to.
@@ -2157,9 +2159,30 @@ struct SettingsView: View {
                     Button {
                         unlockSeedPhrase { showSeedPhrase = true }
                     } label: {
-                        Label("View Seed Phrase", systemImage: "key")
-                            .foregroundColor(.red)
+                        Label {
+                            Text("View Seed Phrase")
+                                .foregroundColor(.primary)
+                        } icon: {
+                            Image(systemName: "key")
+                                .foregroundColor(.accentColor)
+                        }
                     }
+                    #if canImport(CoreNFC) && !targetEnvironment(macCatalyst)
+                    // Without a passphrase, nothing would protect the seed if someone got past the PIN.
+                    if NFCCard.isAvailable && accountHasPassphrase {
+                        Button {
+                            unlockSeedPhrase { showNFCCardBackup = true }
+                        } label: {
+                            Label {
+                                Text("Back Up to NFC Card")
+                                    .foregroundColor(.primary)
+                            } icon: {
+                                Image(systemName: "wave.3.right")
+                                    .foregroundColor(.accentColor)
+                            }
+                        }
+                    }
+                    #endif
                     Button {
                         showDeleteAccountConfirmation = true
                     } label: {
@@ -2197,6 +2220,15 @@ struct SettingsView: View {
             .toast(message: toastMessage, style: .error)
             .sheet(isPresented: $showSeedPhrase) {
                 SeedPhraseView()
+            }
+            .task(id: walletManager.currentWallet?.publicAddress) {
+                let passphrase = (try? walletManager.getSeedPhrase())?.passphrase ?? ""
+                accountHasPassphrase = !passphrase.isEmpty
+            }
+            .sheet(isPresented: $showNFCCardBackup) {
+                #if canImport(CoreNFC) && !targetEnvironment(macCatalyst)
+                NFCCardBackupView()
+                #endif
             }
             .sheet(isPresented: $showOpenSourceLicenses) {
                 OpenSourceLicensesView()

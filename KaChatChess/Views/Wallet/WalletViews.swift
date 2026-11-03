@@ -214,6 +214,7 @@ struct ChattingAddressManageView: View {
                     await loadUtxos()
                 }
             }
+            .sendKaspaSheetSizing()
         }
         .sheet(isPresented: $showCompoundSheet) {
             WithdrawKaspaView(fromAddress: address, availableBalanceSompi: balanceSompi, isCompoundMode: true) {
@@ -222,6 +223,7 @@ struct ChattingAddressManageView: View {
                     await loadUtxos()
                 }
             }
+            .sendKaspaSheetSizing()
         }
         .sheet(isPresented: $showPrivateKeySheet) {
             ChattingAddressPrivateKeyView(address: address)

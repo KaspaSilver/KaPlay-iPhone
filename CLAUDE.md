@@ -39,16 +39,34 @@ adding Terms of Use, Report and Block too, as KaPost has them.
 The same as KaPay's; keep them in step. Create New Account makes an account in one tap: 24 words,
 no passphrase, the next free default name (`WalletManager.nextDefaultAccountName`). "Advanced:
 Create with a Passphrase" (`CreateWalletView`) is the only other way: also 24 words, through
-`PassphraseOptionView`, whose entry screen shows the address and its balance as you type. Import
-still takes 12 or 24 words.
+`PassphraseOptionView`, whose entry screen shows the address and its balance as you type
+(`PassphraseAddressPreview`). Import still takes 12 or 24 words; with a passphrase it checks the
+first 50 identity addresses, picks the first with funds, lists any others to choose from, and
+imports onto the chosen one (`WalletManager.findChattingAddresses`).
 
 Creating never shows the seed phrase: an account made here is owed a backup
 (`AccountBackupStatus`), and until the backup steps (`AccountBackupView`) are finished the Wallet
 tab shows `AccountBackupCard` above Address Actions (red once the account holds funds), its dock
 icon has a yellow dot (`ChessMainTabView.owesBackup`, Backup Hygiene too), Receive shows a reminder and the Delete Account warning leads with Back Up Account; deleting is never
-blocked. Imported and older accounts are never owed one. Finishing the steps starts a six-month
-timer; when it runs out the Wallet tab shows `BackupHygieneCard` in the same place, and
-`BackupHygieneView` asks for five random words, then the passphrase if there is one.
+blocked. Imported and older accounts are never owed one. Finishing the steps or importing, by
+typing the words or from a card, starts a six-month timer, and a changed chatting address keeps the
+status (`AccountBackupStatus.moveStatus`). When it runs out the Wallet tab shows `BackupHygieneCard`
+in the same place, and `BackupHygieneView` asks for five random words, then the passphrase if there
+is one.
+
+**NFC card backup** (`Services/NFCCard.swift`, beta only: `NFCCard.isAvailable`, hidden once
+`KACHAT_IS_RELEASE` is YES and where NFC can't read): an extra copy of the words of a seed phrase
+the user already has, on a Java Card loaded with
+[KaChat-NFC](https://github.com/KaspaSilver/KaChat-NFC) through Kaspa Quick Start's NFC Card page.
+Not cold storage: the card never generates or uses a key. The same as KaPay's and KaChat's; the card
+commands and backup format are that repo's `docs/PROTOCOL.md`, so change them there first. Settings
+> Back Up to NFC Card (`NFCCardBackupView`, behind the seed phrase's biometric gate) only exists for
+an account with a passphrase, which is what protects it: it's never written to the card. The Import
+chooser's Restore from NFC Card (`NFCCardRestoreView`) reads with the 6-digit PIN, asks for the
+passphrase and checks it against the saved chatting address. Saving to a card never clears the
+backup card. Before an App Store submission without this feature, remove the NFC entitlement in
+`KaChatChess.entitlements` and `KaChatChessRelease.entitlements` and the NFC keys in `Info.plist`.
+The App ID needs Near Field Communication Tag Reading on.
 
 Settings' Account section ends with Delete Account (`DeleteAccountSheet`, the warning the sign-in
 screen's Delete also shows) and Log Out. Every sign-in gets new tabs (`ContentView`'s
