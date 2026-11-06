@@ -70,8 +70,8 @@ struct SecuritySettingsPage: View {
         Form {
             Section("Security") {
                 biometricToggle(
-                    "Biometrics for Seed Phrase",
-                    reason: "Unlock to change the seed phrase biometric lock",
+                    "Biometrics for 12 or 24 Words",
+                    reason: "Unlock to change the 12 or 24 words biometric lock",
                     isOn: $settingsViewModel.settings.biometricSeedPhraseEnabled
                 )
                 biometricToggle(
@@ -274,11 +274,11 @@ struct SeedPhraseView: View {
                         .font(.headline)
                         .foregroundColor(.orange)
 
-                    Text("Anyone with your seed phrase can access your account. Never share it with anyone.")
+                    Text("Anyone with your 12 or 24 words can access your account. Never share them with anyone.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
 
-                    Text("Best practice is to write your seed phrase down to back it up, and never store it online.")
+                    Text("Best practice is to write your 12 or 24 words down to back them up, and never store it online.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                 }
@@ -347,9 +347,9 @@ struct SeedPhraseView: View {
                             Button {
                                 copySensitiveToClipboard(seedPhrase.words.joined(separator: " "))
                                 Haptics.success()
-                                showToast("Seed phrase copied. Clipboard will clear in 30s.")
+                                showToast("Words copied. Clipboard will clear in 30s.")
                             } label: {
-                                Label("Copy Seed Phrase", systemImage: "doc.on.doc")
+                                Label("Copy 12 or 24 Words", systemImage: "doc.on.doc")
                             }
                             Button {
                                 guard let privateKey = walletManager.getPrivateKey() else {
@@ -378,7 +378,7 @@ struct SeedPhraseView: View {
                             VStack(spacing: 12) {
                                 Image(systemName: "eye.slash.fill")
                                     .font(.largeTitle)
-                                Text("Tap to reveal seed phrase")
+                                Text("Tap to reveal your 12 or 24 words")
                                     .font(.subheadline)
                             }
                             .frame(maxWidth: .infinity)
@@ -398,7 +398,7 @@ struct SeedPhraseView: View {
                 Spacer()
             }
             .padding()
-            .navigationTitle("Seed Phrase")
+            .navigationTitle("12 or 24 Words")
             .navigationBarTitleDisplayMode(.inline)
             .toast(message: toastMessage, style: toastStyle)
             .toolbar {
@@ -1258,9 +1258,13 @@ struct BalanceToolbarLabel: View {
 extension View {
     /// A menu's title, the same as KaPosts': big, fixed above the content that scrolls, with the
     /// balance alone in the center of the bar (a system large title would move with the scroll
-    /// view). Keep `navigationTitle` as well: the next screen's Back reads it.
-    func fixedScreenTitle(_ title: Text) -> some View {
+    /// view). Keep `navigationTitle` as well: the next screen's Back reads it. A tab's first screen
+    /// passes `showsBackupBanner`, so `AccountBackupBanner` sits above its title, as in KaChat.
+    func fixedScreenTitle(_ title: Text, showsBackupBanner: Bool = false) -> some View {
         VStack(spacing: 0) {
+            if showsBackupBanner {
+                AccountBackupBanner()
+            }
             title
                 .font(.largeTitle.weight(.bold))
                 .lineLimit(1)
@@ -2130,86 +2134,66 @@ struct SettingsView: View {
     /// The backup steps over the Delete Account warning, for an account that hasn't finished them.
     @State private var showBackupOverDeleteWarning = false
     @ObservedObject private var backupStatus = AccountBackupStatus.shared
-    @State private var showOpenSourceLicenses = false
+    @State private var showAccountBackup = false
     @State private var toastMessage: String?
 
     var body: some View {
         NavigationStack {
             Form {
-                Section {
-                    settingsCategoryRow("Customization", icon: "paintbrush.pointed", tint: .accentColor) {
-                        Form {
-                            Section("Customization") {
-                                AppWideCustomizationPickers()
-                            }
+                // Alphabetical, as in KaChat. Delete Account and Log Out stay apart below.
+                settingsCategoryRow("About", icon: "info.circle", tint: .accentColor) {
+                    AccountAboutPage()
+                }
+                settingsCategoryRow("Account Name", icon: "pencil", tint: .accentColor) {
+                    AccountNamePage()
+                }
+                settingsCategoryRow("Back Up Account", icon: "key", tint: .accentColor) {
+                    backUpAccountPage
+                }
+                settingsCategoryRow("Connection", icon: "antenna.radiowaves.left.and.right", tint: .accentColor) {
+                    ConnectionHubPage()
+                }
+                settingsCategoryRow("Customization", icon: "paintbrush.pointed", tint: .accentColor) {
+                    Form {
+                        Section("Customization") {
+                            AppWideCustomizationPickers()
                         }
-                        .navigationTitle("Customization")
-                        .navigationBarTitleDisplayMode(.inline)
                     }
-                    settingsCategoryRow("Security", icon: "lock.shield", tint: .accentColor) {
-                        SecuritySettingsPage()
-                    }
-                    settingsCategoryRow("Connection", icon: "antenna.radiowaves.left.and.right", tint: .accentColor) {
-                        ConnectionHubPage()
-                    }
+                    .navigationTitle("Customization")
+                    .navigationBarTitleDisplayMode(.inline)
+                }
+                settingsCategoryRow("Security", icon: "lock.shield", tint: .accentColor) {
+                    SecuritySettingsPage()
                 }
 
-                Section("Account") {
-                    // Straight into the seed phrase, behind the biometric gate when enabled.
-                    Button {
-                        unlockSeedPhrase { showSeedPhrase = true }
-                    } label: {
-                        Label {
-                            Text("View Seed Phrase")
-                                .foregroundColor(.primary)
-                        } icon: {
-                            Image(systemName: "key")
-                                .foregroundColor(.accentColor)
-                        }
-                    }
-                    #if canImport(CoreNFC) && !targetEnvironment(macCatalyst)
-                    // Without a passphrase, nothing would protect the seed if someone got past the PIN.
-                    if NFCCard.isAvailable && accountHasPassphrase {
-                        Button {
-                            unlockSeedPhrase { showNFCCardBackup = true }
-                        } label: {
-                            Label {
-                                Text("Back Up to NFC Card")
-                                    .foregroundColor(.primary)
-                            } icon: {
-                                Image(systemName: "wave.3.right")
-                                    .foregroundColor(.accentColor)
-                            }
-                        }
-                    }
-                    #endif
-                    Button {
+                // Its own section at the very bottom, so it is easy to find and hard to hit by
+                // accident. Log Out sits here too: KaPlay has no Profile tab, where KaChat keeps it.
+                Section {
+                    Button(role: .destructive) {
                         showDeleteAccountConfirmation = true
                     } label: {
-                        Label("Delete Account", systemImage: "trash")
-                            .foregroundColor(.red)
+                        Label {
+                            Text("Delete Account")
+                                .foregroundColor(.red)
+                        } icon: {
+                            Image(systemName: "trash")
+                                .foregroundColor(.red)
+                        }
                     }
-                    Button {
+                    Button(role: .destructive) {
                         showLogoutConfirmation = true
                     } label: {
-                        Label("Log Out", systemImage: "rectangle.portrait.and.arrow.right")
-                            .foregroundColor(.red)
-                    }
-                }
-
-                Section("About") {
-                    HStack {
-                        Text("Version")
-                        Spacer()
-                        Text(verbatim: AppVersion.display)
-                            .foregroundColor(.secondary)
-                    }
-                    Button("Open Source Licenses") {
-                        showOpenSourceLicenses = true
+                        Label {
+                            Text("Log Out")
+                                .foregroundColor(.red)
+                        } icon: {
+                            Image(systemName: "rectangle.portrait.and.arrow.right")
+                                .foregroundColor(.red)
+                        }
                     }
                 }
             }
-            .fixedScreenTitle(Text("Settings"))
+            .fixedScreenTitle(Text("Settings"), showsBackupBanner: true)
             .background(Color(.systemGroupedBackground))
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -2230,8 +2214,8 @@ struct SettingsView: View {
                 NFCCardBackupView()
                 #endif
             }
-            .sheet(isPresented: $showOpenSourceLicenses) {
-                OpenSourceLicensesView()
+            .sheet(isPresented: $showAccountBackup) {
+                AccountBackupView()
             }
             .sheet(isPresented: $showLogoutConfirmation) {
                 ConfirmActionSheet(
@@ -2250,11 +2234,13 @@ struct SettingsView: View {
                     notBackedUp: backupStatus.isPending(walletManager.currentWallet?.publicAddress),
                     onBackUp: { AccountBackupView.unlock { showBackupOverDeleteWarning = true } }
                 ) {
-                    Task {
-                        do {
-                            try await walletManager.deleteWallet()
-                        } catch {
-                            toastMessage = "Couldn't delete the account: \(UserFacingError.message(for: error))"
+                    DeviceAuth.authenticate(reason: AppLocalization.string("Confirm deleting this account")) {
+                        Task {
+                            do {
+                                try await walletManager.deleteWallet()
+                            } catch {
+                                toastMessage = "Couldn't delete the account: \(UserFacingError.message(for: error))"
+                            }
                         }
                     }
                 }
@@ -2269,11 +2255,173 @@ struct SettingsView: View {
     }
 
     /// The seed phrase, behind the biometric gate when enabled.
+    private var backUpAccountPage: some View {
+        Form {
+            if backupStatus.isPending(walletManager.currentWallet?.publicAddress) {
+                Section {
+                    Button {
+                        AccountBackupView.unlock { showAccountBackup = true }
+                    } label: {
+                        Label {
+                            Text("Complete Your Backup")
+                                .foregroundColor(.primary)
+                        } icon: {
+                            Image(systemName: "exclamationmark.shield.fill")
+                                .foregroundColor(.orange)
+                        }
+                    }
+                }
+            }
+            Section {
+                Button {
+                    unlockSeedPhrase { showSeedPhrase = true }
+                } label: {
+                    Label {
+                        Text("View 12 or 24 Words")
+                            .foregroundColor(.primary)
+                    } icon: {
+                        Image(systemName: "key")
+                            .foregroundColor(.accentColor)
+                    }
+                }
+                #if canImport(CoreNFC) && !targetEnvironment(macCatalyst)
+                // Without a passphrase, nothing would protect the seed if someone got past the PIN.
+                if NFCCard.isAvailable && accountHasPassphrase {
+                    Button {
+                        unlockSeedPhrase { showNFCCardBackup = true }
+                    } label: {
+                        Label {
+                            Text("Back Up to NFC Card")
+                                .foregroundColor(.primary)
+                        } icon: {
+                            Image(systemName: "wave.3.right")
+                                .foregroundColor(.accentColor)
+                        }
+                    }
+                }
+                #endif
+            }
+        }
+        .navigationTitle("Back Up Account")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
     private func unlockSeedPhrase(_ show: @escaping () -> Void) {
         if settingsViewModel.settings.biometricSeedPhraseEnabled {
-            DeviceAuth.authenticate(reason: "Unlock to view your seed phrase", onSuccess: show)
+            DeviceAuth.authenticate(reason: "Unlock to view your 12 or 24 words", onSuccess: show)
         } else {
             show()
+        }
+    }
+}
+
+// MARK: - Account name
+
+/// Your own label for this account, on this device. Saved when you leave the screen or tap Done,
+/// into the saved-accounts list and the account's wallet record (`renameSavedAccount`).
+private struct AccountNamePage: View {
+    @EnvironmentObject private var walletManager: WalletManager
+    @State private var name = ""
+
+    var body: some View {
+        Form {
+            Section {
+                TextField("Account name", text: $name)
+                    .submitLabel(.done)
+                    .onSubmit(save)
+            }
+        }
+        .navigationTitle("Account Name")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear { name = walletManager.currentWallet?.alias ?? "" }
+        .onDisappear(perform: save)
+    }
+
+    private func save() {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let wallet = walletManager.currentWallet, !trimmed.isEmpty, trimmed != wallet.alias,
+              let account = walletManager.savedAccounts.first(where: { WalletManager.isSameAccount($0.publicAddress, wallet.publicAddress) })
+        else { return }
+        walletManager.renameSavedAccount(account, to: trimmed)
+    }
+}
+
+// MARK: - About
+
+/// Settings > About: this account's created date, then the app's version, links and licenses.
+/// The same page as KaChat's, with its website, support email and privacy policy.
+private struct AccountAboutPage: View {
+    @EnvironmentObject private var walletManager: WalletManager
+
+    @State private var showOpenSourceLicenses = false
+
+    private static let websiteURL = URL(string: "https://home.kachat.app")!
+    private static let privacyPolicyURL = URL(string: "https://home.kachat.app/privacy/")!
+    private static let supportEmailURL = URL(string: "mailto:kaspasilver@gmail.com")!
+
+    var body: some View {
+        Form {
+            Section {
+                if let wallet = walletManager.currentWallet {
+                    HStack {
+                        Text("Created")
+                        Spacer()
+                        Text(SharedFormatting.mediumDateShortTime.string(from: wallet.createdAt))
+                            .foregroundColor(.secondary)
+                    }
+                }
+                HStack {
+                    Text("Version")
+                    Spacer()
+                    Text(verbatim: AppVersion.display)
+                        .foregroundColor(.secondary)
+                }
+                Link(destination: Self.websiteURL) {
+                    HStack {
+                        Text("Website")
+                            .foregroundColor(.primary)
+                        Spacer()
+                        Text(verbatim: "home.kachat.app")
+                            .foregroundColor(.secondary)
+                    }
+                }
+                Link(destination: Self.supportEmailURL) {
+                    HStack {
+                        Text("Support Email")
+                            .foregroundColor(.primary)
+                        Spacer()
+                        Text(verbatim: "kaspasilver@gmail.com")
+                            .foregroundColor(.secondary)
+                    }
+                }
+                Link(destination: Self.privacyPolicyURL) {
+                    HStack {
+                        Text("Privacy Policy")
+                            .foregroundColor(.primary)
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundColor(.secondary)
+                    }
+                }
+                Button {
+                    showOpenSourceLicenses = true
+                } label: {
+                    HStack {
+                        Text("Open Source Licenses")
+                            .foregroundColor(.primary)
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+        }
+        .navigationTitle("About")
+        .navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $showOpenSourceLicenses) {
+            OpenSourceLicensesView()
         }
     }
 }

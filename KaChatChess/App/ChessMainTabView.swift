@@ -10,20 +10,12 @@ struct ChessMainTabView: View {
     @EnvironmentObject private var walletManager: WalletManager
     @State private var selection: Tab = .play
     @ObservedObject private var links = ChessBotLinkRouter.shared
-    @ObservedObject private var backupStatus = AccountBackupStatus.shared
 
     /// KaPay's (and KaPosts') wallet symbol; it only exists from iOS 17, so iOS 16 gets the
     /// pass-style wallet.
     private static var walletIcon: String {
         if #available(iOS 17, *) { return "wallet.bifold" }
         return "wallet.pass"
-    }
-
-    /// The Wallet tab is showing a backup card (`accountBackupSection`): its dock icon has a yellow
-    /// dot until the card's steps are done.
-    private var owesBackup: Bool {
-        let address = walletManager.currentWallet?.publicAddress
-        return backupStatus.isPending(address) || backupStatus.isHygieneDue(address)
     }
 
     var body: some View {
@@ -36,8 +28,6 @@ struct ChessMainTabView: View {
                 .tag(Tab.leaderboard)
             ChessWalletView()
                 .tabItem { Label("Wallet", systemImage: Self.walletIcon) }
-                // UIKit draws a dot for an empty badge.
-                .badge(owesBackup ? Text(verbatim: "") : nil)
                 .tag(Tab.wallet)
             SettingsView()
                 .tabItem { Label("Settings", systemImage: "gearshape.fill") }
@@ -47,10 +37,7 @@ struct ChessMainTabView: View {
         .onChange(of: links.challenge) { challenge in
             if challenge != nil { selection = .play }
         }
-        .onChange(of: selection) { _ in colorDockBadges() }
-        .onChange(of: owesBackup) { _ in colorDockBadges() }
         .onAppear {
-            colorDockBadges()
             // What KaChat's dock did on appearing: connect to the node pool and subscribe to
             // this address's coins (`ChatService.startPolling`; its chat phases are off, see
             // `syncsChats`). A hold left from onboarding is lifted first, or nothing would start.
@@ -58,26 +45,6 @@ struct ChessMainTabView: View {
                 chatService.releaseSyncForOnboarding()
             }
             chatService.startPolling()
-        }
-    }
-
-    /// SwiftUI's `.badge` has no color, so it goes straight on the tab bar's items. The dock's only
-    /// badge is the backup dot, so every item gets yellow.
-    private func colorDockBadges() {
-        DispatchQueue.main.async {
-            for scene in UIApplication.shared.connectedScenes {
-                guard let windowScene = scene as? UIWindowScene else { continue }
-                for window in windowScene.windows {
-                    var queue: [UIViewController] = window.rootViewController.map { [$0] } ?? []
-                    while let controller = queue.popLast() {
-                        if let tabs = controller as? UITabBarController {
-                            tabs.tabBar.items?.forEach { $0.badgeColor = .systemYellow }
-                            return
-                        }
-                        queue.append(contentsOf: controller.children)
-                    }
-                }
-            }
         }
     }
 }
@@ -101,7 +68,7 @@ struct ChessLeaderboardTabView: View {
                 .padding(.vertical, 12)
                 Spacer(minLength: 0)
             }
-            .fixedScreenTitle(Text("Leaderboard"))
+            .fixedScreenTitle(Text("Leaderboard"), showsBackupBanner: true)
             .background(Color(.systemGroupedBackground))
             .navigationDestination(isPresented: Binding(
                 get: { openMode != nil },

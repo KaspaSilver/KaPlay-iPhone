@@ -35,8 +35,19 @@ struct ChessTournamentGameView: View {
     /// The board is drawn from the viewer's side: black players see black at the bottom.
     private var flipped: Bool { myColor == .black }
     /// A player in a game that is still on: no wandering off - the back button asks, the
-    /// swipe-back is off, the dock is hidden. A spectator, or a game that is over, is free.
-    private var isLockedIn: Bool { myColor != nil && game?.isOver == false }
+    /// swipe-back is off, the dock is hidden. A spectator, or a game that is over, is free -
+    /// and so is a game decided on the clock with the claim still to come: its winner must not
+    /// have only Resign, which would hand the opponent the win.
+    private var isLockedIn: Bool {
+        guard myColor != nil, let game else { return false }
+        return !game.isDecided(at: service.now)
+    }
+    /// Won on time, the claim not on chain yet (the app posts it by itself; this is the button
+    /// for when it has not taken).
+    private var canClaimWin: Bool {
+        guard let game, let me, !game.isOver else { return false }
+        return game.decidedWinner(at: service.now) == me
+    }
 
     var body: some View {
         Group {
@@ -67,6 +78,16 @@ struct ChessTournamentGameView: View {
                         Text("Resign")
                             .font(.subheadline.weight(.semibold))
                             .foregroundColor(.red)
+                    }
+                }
+            }
+            if canClaimWin {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        if let tournament, let game { service.claimWin(tournament, game: game) }
+                    } label: {
+                        Text("Claim win")
+                            .font(.subheadline.weight(.semibold))
                     }
                 }
             }
@@ -379,7 +400,7 @@ struct ChessTournamentGameView: View {
                     }
                 }
                 // Same "Waiting on opponent..." as the 1:1 board, while it is their move.
-                if let myColor, !game.isOver, game.sideToMove != myColor {
+                if let myColor, !game.isDecided(at: service.now), game.sideToMove != myColor {
                     WaitingOnOpponentOverlay()
                 }
                 if showEndOverlay, let winner = game.winner, let outcome = game.outcome {

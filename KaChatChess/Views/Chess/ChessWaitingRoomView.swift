@@ -17,6 +17,15 @@ struct ChessWaitingRoomView: View {
     @State private var showLeaveWarning = false
     @State private var isLeaving = false
     @State private var handedOff = false
+    /// The reducer has shown this player in a seat here: only after that does "not seated"
+    /// mean the seat ran out (or was given back), not "the join has not landed yet".
+    @State private var wasSeated = false
+    /// Leave went out: the room closes when the chain shows the seat given back - or opens the
+    /// board, if the room filled first.
+    @State private var leftByChoice = false
+    @State private var appearedAt: Int64?
+    /// A join that never shows up (ignored, or never mined) does not hold this screen forever.
+    private static let seatWaitMs: Int64 = 30_000
 
     private var tournament: ChessTournament? { service.tournaments[tournamentId] }
     private var me: String? { walletManager.currentWallet?.publicAddress }
@@ -61,7 +70,7 @@ struct ChessWaitingRoomView: View {
                 Button(role: .destructive) {
                     showLeaveWarning = true
                 } label: {
-                    Text(isLeaving ? "Leaving…" : "Leave")
+                    Text(isLeaving || leftByChoice ? "Leaving…" : "Leave")
                         .font(.subheadline.weight(.semibold))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 12)
@@ -74,7 +83,7 @@ struct ChessWaitingRoomView: View {
                 .padding(.bottom, 24)
                 // No leaving once the room has filled - the game exists on chain.
                 .opacity(matchFound ? 0 : 1)
-                .disabled(matchFound)
+                .disabled(matchFound || isLeaving || leftByChoice)
             }
         }
         .interactiveDismissDisabled()
@@ -83,7 +92,7 @@ struct ChessWaitingRoomView: View {
                 .presentationDetents([.height(300)])
                 .presentationDragIndicator(.visible)
         }
-        .onAppear { service.acquire(); check() }
+        .onAppear { service.acquire(); appearedAt = service.now; check() }
         .onDisappear { service.release() }
         .onChange(of: tournament?.status) { _ in check() }
         .onChange(of: service.now) { _ in check() }
@@ -112,10 +121,11 @@ struct ChessWaitingRoomView: View {
                     isLeaving = true
                     showLeaveWarning = false
                     Task {
-                        await service.leave(tournament)
+                        // Not closed here: a leave that failed (the error shows) keeps the
+                        // player waiting, and one beaten by the last join is a game - `check`
+                        // closes the room, or opens the board, by what the chain says.
+                        if await service.leave(tournament) { leftByChoice = true }
                         isLeaving = false
-                        handedOff = true
-                        onFinished(false)
                     }
                 } label: {
                     Text(isLeaving ? "Leaving…" : "Leave")
@@ -167,9 +177,14 @@ struct ChessWaitingRoomView: View {
             handedOff = true
             Haptics.success()
             onStarted(tournament.id)
-        } else if tournament.status == .cancelled || !tournament.isSeated(me, at: service.now) {
+        } else if tournament.status == .cancelled {
             handedOff = true
-            onFinished(tournament.status != .cancelled)
+            onFinished(false)
+        } else if tournament.isSeated(me, at: service.now) {
+            wasSeated = true
+        } else if wasSeated || service.now - (appearedAt ?? service.now) > Self.seatWaitMs {
+            handedOff = true
+            onFinished(wasSeated && !leftByChoice)
         }
     }
 

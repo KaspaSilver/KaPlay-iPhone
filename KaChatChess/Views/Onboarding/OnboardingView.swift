@@ -11,6 +11,9 @@ struct OnboardingView: View {
     @State private var pendingRemovalAccount: SavedAccountSummary?
     /// The pencil's half sheet: Rename or Delete for one saved account.
     @State private var accountActionsTarget: SavedAccountSummary?
+    /// What the half sheet's choice opens, once the half sheet has finished closing: presenting
+    /// the next sheet or alert while it is still going away can be dropped.
+    @State private var afterAccountActions: (() -> Void)?
     @State private var isRemovingAccount = false
     @State private var signInErrorMessage: String?
     /// A saved account this device has no keys for (tapped after an iPhone restore): the sheet
@@ -82,7 +85,11 @@ struct OnboardingView: View {
                 // identity derivation path family, then seed entry continues as before.
                 ImportSourceWalletView()
             }
-            .sheet(item: $accountActionsTarget) { account in
+            .sheet(item: $accountActionsTarget, onDismiss: {
+                let next = afterAccountActions
+                afterAccountActions = nil
+                next?()
+            }) { account in
                 accountActionsSheet(account)
             }
             .sheet(isPresented: Binding(
@@ -94,7 +101,9 @@ struct OnboardingView: View {
                         confirmSubtitle: "Deletes \(account.displayAlias) (\(account.shortPublicAddress)) and its local data from this device.",
                         notBackedUp: AccountBackupStatus.shared.isPending(account.publicAddress)
                     ) {
-                        removeSavedAccount(account)
+                        DeviceAuth.authenticate(reason: AppLocalization.string("Confirm deleting this account")) {
+                            removeSavedAccount(account)
+                        }
                     }
                 }
             }
@@ -157,6 +166,12 @@ struct OnboardingView: View {
 
     private var hasSavedAccounts: Bool { !walletManager.savedAccounts.isEmpty }
 
+    /// Creating, signing in or removing: one at a time, since each one replaces the account in
+    /// the active slot.
+    private var isAccountActionRunning: Bool {
+        isCreatingAccount || signingInAccountId != nil || isRemovingAccount
+    }
+
     /// Wordmark with the app mark beside it, matching Android. The tagline stays whether or not
     /// there are accounts saved: it is what the screen is, and hiding it on a returning device
     /// left the wordmark sitting on its own with nothing saying what it belongs to.
@@ -202,6 +217,7 @@ struct OnboardingView: View {
                 .foregroundColor(.white)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
             }
+            .disabled(signingInAccountId != nil || isRemovingAccount)
 
             Button {
                 showImportWallet = true
@@ -216,7 +232,7 @@ struct OnboardingView: View {
                 .foregroundColor(.primary)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
             }
-            .disabled(isCreatingAccount)
+            .disabled(isAccountActionRunning)
 
             Button {
                 showCreateWallet = true
@@ -225,7 +241,7 @@ struct OnboardingView: View {
                     .font(.footnote.weight(.semibold))
                     .foregroundColor(.accentColor)
             }
-            .disabled(isCreatingAccount)
+            .disabled(isAccountActionRunning)
         }
         .padding(.horizontal, 32)
         .padding(.bottom, 40)
@@ -303,11 +319,11 @@ struct OnboardingView: View {
                 subtitle: "Gives this account a name of your own.",
                 systemImage: "pencil"
             ) {
-                accountActionsTarget = nil
-                DispatchQueue.main.async {
+                afterAccountActions = {
                     renameText = account.alias
                     pendingRenameAccount = account
                 }
+                accountActionsTarget = nil
             }
             ActionSheetRow(
                 title: "Delete",
@@ -315,8 +331,8 @@ struct OnboardingView: View {
                 systemImage: "trash",
                 tint: .red
             ) {
+                afterAccountActions = { pendingRemovalAccount = account }
                 accountActionsTarget = nil
-                DispatchQueue.main.async { pendingRemovalAccount = account }
             }
 
             Spacer(minLength: 0)
@@ -352,7 +368,7 @@ struct OnboardingView: View {
                 }
             }
             .buttonStyle(.plain)
-            .disabled(signingInAccountId != nil || isRemovingAccount)
+            .disabled(isAccountActionRunning)
 
             // Half sheet rather than a context menu, like every other chooser in the app - and
             // Delete gets a line saying what it takes with it, which a menu of bare verbs cannot.
@@ -366,7 +382,7 @@ struct OnboardingView: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .disabled(signingInAccountId != nil || isRemovingAccount)
+            .disabled(isAccountActionRunning)
         }
         .padding(.horizontal, 12)
         .frame(height: Self.savedAccountRowHeight)
@@ -375,7 +391,7 @@ struct OnboardingView: View {
     }
 
     private func signIn(_ account: SavedAccountSummary) {
-        guard signingInAccountId == nil, !isRemovingAccount else { return }
+        guard !isAccountActionRunning else { return }
         signInErrorMessage = nil
 
         if settingsViewModel.settings.biometricAccountLoginEnabled {
@@ -390,6 +406,8 @@ struct OnboardingView: View {
     }
 
     private func performSignIn(_ account: SavedAccountSummary) {
+        // the Face ID prompt may have let another action start meanwhile
+        guard !isAccountActionRunning else { return }
         signingInAccountId = account.id
         Task {
             let didSignIn = await walletManager.signInToSavedAccount(account)
@@ -411,7 +429,7 @@ struct OnboardingView: View {
     /// A new account in one tap: 24 words, no passphrase, the next free default name. The seed
     /// phrase comes later, through the Wallet tab's backup card.
     private func createAccount() {
-        guard !isCreatingAccount else { return }
+        guard !isAccountActionRunning else { return }
         isCreatingAccount = true
         Task {
             do {
@@ -429,7 +447,7 @@ struct OnboardingView: View {
     }
 
     private func removeSavedAccount(_ account: SavedAccountSummary) {
-        guard !isRemovingAccount else { return }
+        guard !isAccountActionRunning else { return }
         isRemovingAccount = true
         Task {
             await walletManager.removeSavedAccount(account)
@@ -459,10 +477,10 @@ private struct AccountKeysNeededSheet: View {
                 .font(.scaled(size: 44, weight: .semibold))
                 .foregroundColor(.accentColor)
                 .padding(.top, 28)
-            Text("Recovery Phrase Needed")
+            Text("12 or 24 Words Needed")
                 .font(.title3.weight(.bold))
                 .multilineTextAlignment(.center)
-            Text(String(format: AppLocalization.string("%@ is on this iPhone, but its keys are not. That happens after restoring from a backup, because keys are locked to the phone they were made on. Enter the account's recovery phrase to sign in. Its history on this phone is kept."), account.displayAlias))
+            Text(String(format: AppLocalization.string("%@ is on this iPhone, but its keys are not. That happens after restoring from a backup, because keys are locked to the phone they were made on. Enter the account's 12 or 24 words to sign in. Its history on this phone is kept."), account.displayAlias))
                 .font(.subheadline)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
@@ -485,7 +503,7 @@ private struct AccountKeysNeededSheet: View {
                 Button {
                     onEnterPhrase()
                 } label: {
-                    Text("Enter Recovery Phrase")
+                    Text("Enter 12 or 24 Words")
                         .font(.subheadline.weight(.semibold))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 14)

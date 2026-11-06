@@ -3,202 +3,89 @@ import CoreImage
 import CoreImage.CIFilterBuiltins
 import UIKit
 
-// The Wallet tab: KaChat's chatting-address screen and the Receive / Send sheets it opens,
-// taken from KaChat's Profile (ContactsView.swift) with nothing else of that file.
+// The Wallet tab, the same look as KaPost's Wallet screen, and the Receive / Send sheets it opens.
 
-/// Transaction history for the chatting (identity) address, reached from its dropdown in
-/// Profile. Same pattern as ManageAddressesView's SpendingAddressTransactionHistoryView: tapping
-/// a transaction opens it directly on whichever block explorer is selected in Settings >
-/// Connection > Kaspa Explorer, rather than showing an in-app detail screen.
-/// Full-featured detail screen for the wallet's own chatting/identity address — field-for-field
-/// the same screen as ManageAddressesView's SpendingAddressTransactionHistoryView (balance,
-/// Transaction History/UTXOs tabs, Compound UTXOs, Export private key, Explorer, Receive/Send),
-/// just address-based instead of index-based. Reached from the Profile screen's Chatting Address
-/// section's "Manage Address" row.
+/// The Wallet tab, like KaPost's `KaPostWalletView`: the total up top, split into the chatting and
+/// spending addresses, then Send, Receive and More (Compound UTXOs, keys, the explorer), the Backup
+/// Hygiene card when due, then the chatting address's history. KaPlay only uses the chatting
+/// address, the one every move and bot result is signed by: Send leaves from it and Receive is paid
+/// to it. Other addresses count in the total and are managed in KaChat and KaPay.
 struct ChattingAddressManageView: View {
     let address: String
-
 
     @EnvironmentObject var chatService: ChatService
     @EnvironmentObject var settingsViewModel: SettingsViewModel
     @EnvironmentObject var walletManager: WalletManager
+    @ObservedObject private var priceStore = KaspaPriceStore.shared
+    @ObservedObject private var backupStatus = AccountBackupStatus.shared
 
-    private enum Tab: String, CaseIterable {
-        case transactions = "History"
-        case utxos = "UTXOs"
-    }
-
-    @State private var selectedTab: Tab = .transactions
     @State private var transactions: [KaspaFullTransactionResponse] = []
     /// The last history fetch gave up partway. Kept separate from `transactions.isEmpty` because
-    /// the two mean opposite things and used to render identically: a rate-limited request looked
-    /// exactly like an address that has never been used.
+    /// the two mean opposite things: a rate-limited request isn't an address never used.
     @State private var historyIncomplete = false
     @State private var isLoading = false
+    /// Only for Compound UTXOs, which needs two or more coins to combine.
     @State private var utxos: [UTXO] = []
-    @State private var isLoadingUtxos = false
-    /// See `CoinControlView.loadError`.
-    @State private var utxoLoadError: String?
+    /// Every revealed spending address together. Nil until it's known, which shows as a dash.
+    @State private var spendingTotalSompi: UInt64?
     @State private var showReceiveSheet = false
     @State private var showSendSheet = false
     @State private var showCompoundSheet = false
     @State private var showPrivateKeySheet = false
-    /// The "Address Actions" half sheet, and the public-key screen it can open.
+    /// The More half sheet, and the public-key screen it can open.
     @State private var showAddressActions = false
     @State private var showPublicKeySheet = false
-    @ObservedObject private var backupStatus = AccountBackupStatus.shared
-    @State private var showAccountBackup = false
     @State private var showBackupHygiene = false
-    @State private var utxoLabels: [String: String] = [:]
-    @State private var renamingUtxo: UTXO?
-    @State private var renameUtxoText = ""
+    @State private var toastMessage: String?
+    @State private var toastToken = UUID()
 
     /// The live balance when this is the signed-in address: WalletManager follows the node's
-    /// UTXO notifications, so a payment shows the moment it lands. This screen's own UTXO fetch
-    /// is taken only when it appears (and on pull to refresh), so summing it alone left the
-    /// balance at whatever it was then - while History, refetched, already showed the payment.
+    /// UTXO notifications, so a payment shows the moment it lands.
     private var liveBalanceSompi: UInt64? {
         guard let wallet = walletManager.currentWallet, wallet.publicAddress == address else { return nil }
         return wallet.balanceSompi
     }
 
-    private var balanceSompi: UInt64 {
-        liveBalanceSompi ?? utxos.reduce(UInt64(0)) { $0 + $1.amount }
-    }
-
-    private func outpointKey(_ utxo: UTXO) -> String {
-        "\(utxo.outpoint.transactionId):\(utxo.outpoint.index)"
-    }
-
-    /// Until this account's backup steps are finished, red once it holds funds. After that, Backup
-    /// Hygiene every six months.
-    @ViewBuilder
-    private var accountBackupSection: some View {
-        if backupStatus.isPending(address) {
-            AccountBackupCard(hasFunds: balanceSompi > 0) {
-                AccountBackupView.unlock { showAccountBackup = true }
-            }
-            .padding(.horizontal)
-            .padding(.top, 12)
-        } else if backupStatus.isHygieneDue(address) {
-            BackupHygieneCard { showBackupHygiene = true }
-                .padding(.horizontal)
-                .padding(.top, 12)
-        }
-    }
-
-    /// Plain names - History, UTXOs - the way the user asked for them.
-    private func tabLabel(_ tab: Tab) -> String {
-        tab.rawValue
+    /// Nil until it's known, which shows as a dash: a failed read isn't an empty address.
+    private var balanceSompi: UInt64? {
+        liveBalanceSompi ?? (utxos.isEmpty ? nil : utxos.reduce(UInt64(0)) { $0 + $1.amount })
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            VStack(spacing: 2) {
-                Text("Balance")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Text(verbatim: "\(formatKasExact(balanceSompi)) \(KaspaUnit.symbol)")
-                    .font(.title3.weight(.semibold))
+        ScrollView {
+            VStack(spacing: 20) {
+                balanceCard
+                actionsRow
+                if backupStatus.isHygieneDue(address) {
+                    BackupHygieneCard { showBackupHygiene = true }
+                }
+                history
             }
-            .padding(.top, 12)
-
-            accountBackupSection
-
-            // What used to be two unlabelled glyphs in the navigation bar. A pair of icons has
-            // room for no words at all, so neither said what it did, and there was nowhere to put
-            // a third thing. Same button and same sheet as Manage Addresses' own Address Actions.
-            Button {
-                Haptics.impact(.light)
-                showAddressActions = true
-            } label: {
-                Text("Address Actions")
-                    .font(.subheadline)
-                    .fontWeight(.bold)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                    .foregroundColor(.black)
-                    .background(Capsule().fill(Color.accentColor))
-            }
-            .buttonStyle(.plain)
-            .padding(.horizontal)
-            .padding(.top, 12)
-            .padding(.bottom, 8)
-
-            // Right above what it switches, the way Chats has it.
-            UnderlineTabBar(
-                tabs: Tab.allCases.map { (tab: $0, title: tabLabel($0)) },
-                selection: $selectedTab
-            )
-
-            switch selectedTab {
-            case .transactions:
-                transactionsList
-            case .utxos:
-                utxosList
-            }
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+            .padding(.bottom, 24)
         }
-        .fixedScreenTitle(Text("Wallet"))
+        .refreshable { await refresh() }
+        .fixedScreenTitle(Text("Wallet"), showsBackupBanner: true)
+        .background(Color(.systemGroupedBackground))
         .navigationTitle("Wallet")
         .navigationBarTitleDisplayMode(.inline)
+        .toast(message: toastMessage)
         .sheet(isPresented: $showAddressActions) {
             addressActionsSheet
-                .presentationDetents([.height(330)])
+                .presentationDetents([.height(410)])
                 .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $showPublicKeySheet) {
             ChattingAddressPublicKeyView(address: address)
         }
-        .sheet(isPresented: $showAccountBackup) {
-            AccountBackupView()
-        }
         .sheet(isPresented: $showBackupHygiene) {
             BackupHygieneView()
         }
-        .safeAreaInset(edge: .bottom) {
-            HStack(spacing: 12) {
-                Button {
-                    showReceiveSheet = true
-                } label: {
-                    Label("Receive", systemImage: "qrcode")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 16)
-                        .foregroundColor(.black)
-                        .background(Capsule().fill(Color.accentColor))
-                }
-                Button {
-                    showSendSheet = true
-                } label: {
-                    Label("Send", systemImage: "arrow.up.circle.fill")
-                        .font(.subheadline.weight(.bold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 16)
-                        .foregroundColor(.black)
-                        .background(Capsule().fill(Color.accentColor))
-                }
-                .disabled(balanceSompi == 0)
-                .opacity(balanceSompi == 0 ? 0.5 : 1)
-            }
-            .padding(.horizontal)
-            .padding(.bottom, 16)
-        }
         .sheet(isPresented: $showReceiveSheet) {
             NavigationStack {
+                // nil while unknown: the sheet shows a dash, not a 0 the address may not hold
                 ChattingAddressQRView(address: address, balanceSompi: balanceSompi)
-                    // a reminder only: receiving is never blocked
-                    .safeAreaInset(edge: .top, spacing: 0) {
-                        if backupStatus.isPending(address) {
-                            Label("This account isn't backed up yet. Use the card on the Wallet tab to back it up.",
-                                  systemImage: "exclamationmark.shield.fill")
-                                .font(.footnote.weight(.semibold))
-                                .foregroundColor(.orange)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 10)
-                                .background(Color.orange.opacity(0.12))
-                        }
-                    }
                     .toolbar {
                         ToolbarItem(placement: .navigationBarLeading) {
                             Button("Close") { showReceiveSheet = false }
@@ -209,55 +96,27 @@ struct ChattingAddressManageView: View {
         .sheet(isPresented: $showSendSheet) {
             WithdrawKaspaView(fromAddress: address, availableBalanceSompi: balanceSompi,
                               lockedSource: .chatting) {
-                Task {
-                    await loadTransactions()
-                    await loadUtxos()
-                }
+                Task { await refresh() }
             }
             .sendKaspaSheetSizing()
         }
         .sheet(isPresented: $showCompoundSheet) {
             WithdrawKaspaView(fromAddress: address, availableBalanceSompi: balanceSompi, isCompoundMode: true) {
-                Task {
-                    await loadTransactions()
-                    await loadUtxos()
-                }
+                Task { await refresh() }
             }
             .sendKaspaSheetSizing()
         }
         .sheet(isPresented: $showPrivateKeySheet) {
             ChattingAddressPrivateKeyView(address: address)
         }
-        .alert(
-            "Rename UTXO",
-            isPresented: Binding(
-                get: { renamingUtxo != nil },
-                set: { if !$0 { renamingUtxo = nil } }
-            )
-        ) {
-            TextField("Name", text: $renameUtxoText)
-            Button("Save") {
-                if let renamingUtxo {
-                    WalletManager.shared.setSpendingUtxoLabel(address: address, outpointKey: outpointKey(renamingUtxo), label: renameUtxoText)
-                    utxoLabels = WalletManager.shared.loadSpendingUtxoLabels(address: address)
-                }
-                renamingUtxo = nil
-            }
-            Button("Cancel", role: .cancel) {
-                renamingUtxo = nil
-            }
-        }
-        .task {
-            utxoLabels = WalletManager.shared.loadSpendingUtxoLabels(address: address)
-            await loadTransactions()
-            await loadUtxos()
-        }
-        // The coins moved (a payment in, a move or send out): the UTXOs and History follow. The
-        // history comes from the indexer, which can be a moment behind the node, so it is asked
-        // again a few seconds later.
+        .task { await refresh() }
+        // The coins moved (a payment in, a move or send out): the history follows. It comes from
+        // the indexer, which can be a moment behind the node, so it is asked again a few seconds
+        // later.
         .onChange(of: liveBalanceSompi) { _ in
             Task {
                 await loadUtxos()
+                await loadSpendingTotal()
                 await loadTransactions()
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
                 await loadTransactions()
@@ -265,16 +124,140 @@ struct ChattingAddressManageView: View {
         }
     }
 
-    /// The half sheet behind "Address Actions". Same shape as Manage Addresses' and Cold
-    /// Storage's sheets of the same name, so all three read as the same object.
+    // MARK: - Balance
+
+    private var balanceCard: some View {
+        let chatting = balanceSompi
+        // Both parts or a dash: a total missing one of them would read as the whole balance.
+        let total: UInt64? = {
+            guard let chatting, let spendingTotalSompi else { return nil }
+            return chatting + spendingTotalSompi
+        }()
+        return VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Total Balance")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                Button {
+                    guard let total else { return }
+                    UIPasteboard.general.string = KaspaUnit.plain(total)
+                    Haptics.success()
+                    showToast(AppLocalization.string("Balance copied to clipboard."))
+                } label: {
+                    Text(verbatim: total.map(KaspaUnit.amount) ?? "--")
+                        .font(.largeTitle.weight(.bold))
+                        .foregroundColor(.primary)
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                }
+                .buttonStyle(.plain)
+                if let fiat = fiatText(total) {
+                    Text(verbatim: fiat)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            Divider()
+
+            HStack(alignment: .top, spacing: 16) {
+                balancePart(title: "Chatting", sompi: chatting)
+                balancePart(title: "Spending", sompi: spendingTotalSompi)
+            }
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(LinearGradient(
+                    colors: [Color.accentColor.opacity(0.32), Color.accentColor.opacity(0.08)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(Color.accentColor.opacity(0.35), lineWidth: 0.8)
+                )
+        )
+    }
+
+    private func balancePart(title: LocalizedStringKey, sompi: UInt64?) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text(verbatim: sompi.map(KaspaUnit.amount) ?? "--")
+                .font(.footnote.weight(.semibold))
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// What the balance is worth in your currency. Testnet coins aren't worth anything.
+    private func fiatText(_ sompi: UInt64?) -> String? {
+        guard let sompi, AppSettings.load().networkType == .mainnet,
+              let price = priceStore.currentPriceUsd, price > 0 else { return nil }
+        return formatFiatAmount(Double(sompi) / 100_000_000.0 * price, currency: priceStore.currentCurrency)
+    }
+
+    // MARK: - Actions
+
+    private var actionsRow: some View {
+        HStack(alignment: .top, spacing: 12) {
+            actionButton(title: "Send", icon: "arrow.up", enabled: (balanceSompi ?? 0) > 0) { showSendSheet = true }
+            actionButton(title: "Receive", icon: "arrow.down") { showReceiveSheet = true }
+            actionButton(title: "More", icon: "ellipsis") { showAddressActions = true }
+        }
+    }
+
+    private func actionButton(title: LocalizedStringKey, icon: String, enabled: Bool = true, perform: @escaping () -> Void) -> some View {
+        Button {
+            Haptics.impact(.light)
+            perform()
+        } label: {
+            VStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.scaled(size: 22, weight: .semibold))
+                    .foregroundColor(.black)
+                    .frame(width: 60, height: 60)
+                    .background(Circle().fill(Color.accentColor))
+                Text(title)
+                    .font(.subheadline)
+                    .foregroundColor(.primary)
+            }
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.5)
+    }
+
+    /// The half sheet behind More: Compound UTXOs (greyed out under two coins), the chatting
+    /// address's keys and the explorer.
     private var addressActionsSheet: some View {
         VStack(spacing: 0) {
-            Text("Address Actions")
+            Text("Chatting Address")
                 .font(.headline)
                 .padding(.top, 20)
                 .padding(.bottom, 16)
 
             VStack(spacing: 12) {
+                // Always listed, so it's there to find; it takes two coins to combine.
+                ActionSheetRow(
+                    title: "Compound UTXOs",
+                    subtitle: utxos.count > 1
+                        ? "Combines this address's coins into one, so later sends need fewer inputs."
+                        : "Combines this address's coins into one. It needs two or more coins.",
+                    systemImage: "arrow.triangle.merge",
+                    isDisabled: utxos.count < 2
+                ) {
+                    showAddressActions = false
+                    DispatchQueue.main.async { showCompoundSheet = true }
+                }
                 ActionSheetRow(
                     title: "View Private Key",
                     subtitle: "The key that spends this address. Never share it.",
@@ -283,7 +266,8 @@ struct ChattingAddressManageView: View {
                     showAddressActions = false
                     // A turn later: presenting straight from a dismissing sheet is dropped.
                     DispatchQueue.main.async {
-                        if settingsViewModel.settings.biometricSeedPhraseEnabled {
+                        // Settings' "Biometrics for Address Private Keys", which this key is one of
+                        if settingsViewModel.settings.biometricSpendingKeyEnabled {
                             DeviceAuth.authenticate(reason: "Unlock to view this address's private key") {
                                 showPrivateKeySheet = true
                             }
@@ -319,17 +303,16 @@ struct ChattingAddressManageView: View {
         .padding(.bottom, 20)
     }
 
-    private var transactionsList: some View {
-        List {
+    // MARK: - History
+
+    private var history: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Transaction History")
+                .font(.headline)
             if isLoading && transactions.isEmpty {
-                HStack {
-                    Spacer()
-                    ProgressView()
-                    Spacer()
-                }
+                HStack { Spacer(); ProgressView(); Spacer() }
+                    .padding(.vertical, 18)
             } else if transactions.isEmpty && historyIncomplete {
-                // A failed fetch is not an empty history. Saying "No transactions yet." here was
-                // a confident answer about someone's money that the app had not actually got.
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Could not load transactions.")
                         .foregroundColor(.secondary)
@@ -343,128 +326,34 @@ struct ChattingAddressManageView: View {
                     .foregroundColor(.secondary)
             } else {
                 if historyIncomplete {
-                    // Some pages landed, some did not. Say so rather than letting a truncated
-                    // list read as the whole history.
                     Text("Some transactions could not be loaded. Pull to refresh to try again.")
                         .font(.caption)
                         .foregroundColor(.orange)
                 }
-                ForEach(transactions, id: \.transactionId) { tx in
-                    Button {
-                        Haptics.impact(.light)
-                        openInExplorer(tx)
-                    } label: {
-                        transactionRow(tx)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-        .listStyle(.insetGrouped)
-        .refreshable {
-            await loadTransactions()
-        }
-    }
-
-    private var utxosList: some View {
-        List {
-            if utxos.count > 1 {
-                Section {
-                    Button {
-                        showCompoundSheet = true
-                    } label: {
-                        HStack {
-                            Image(systemName: "arrow.triangle.merge")
-                            Text("Compound UTXOs")
-                                .fontWeight(.semibold)
-                            Spacer()
+                VStack(spacing: 0) {
+                    ForEach(transactions, id: \.transactionId) { tx in
+                        Button {
+                            Haptics.impact(.light)
+                            openInExplorer(tx)
+                        } label: {
+                            transactionRow(tx)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 6)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        if tx.transactionId != transactions.last?.transactionId {
+                            Divider().padding(.leading, 14)
                         }
                     }
-                } footer: {
-                    Text("Combines all UTXOs at this address into a single one, to reduce the number of inputs a future send needs.")
                 }
-            }
-            if isLoadingUtxos && utxos.isEmpty {
-                HStack {
-                    Spacer()
-                    ProgressView()
-                    Spacer()
-                }
-            } else if utxos.isEmpty {
-                if let utxoLoadError {
-                    UtxoLoadFailureRow(detail: utxoLoadError) {
-                        Task { await loadUtxos() }
-                    }
-                } else {
-                    Text("No UTXOs.")
-                        .foregroundColor(.secondary)
-                }
-            } else {
-                ForEach(Array(utxos.enumerated()), id: \.offset) { _, utxo in
-                    utxoRow(utxo)
-                }
+                .background(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(Color(.secondarySystemGroupedBackground))
+                )
             }
         }
-        .listStyle(.insetGrouped)
-        .refreshable {
-            await loadUtxos()
-        }
-    }
-
-    private func utxoRow(_ utxo: UTXO) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: utxo.isCoinbase ? "cube.fill" : "circle.grid.2x2.fill")
-                .font(.title2)
-                .foregroundColor(.accentColor)
-            VStack(alignment: .leading, spacing: 2) {
-                if let label = utxoLabels[outpointKey(utxo)], !label.isEmpty {
-                    Text(label)
-                        .font(.caption)
-                        .fontWeight(.bold)
-                        .foregroundColor(.accentColor)
-                }
-                Text(verbatim: "\(formatKasExact(utxo.amount)) \(KaspaUnit.symbol)")
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
-                Text("\(utxo.outpoint.transactionId):\(utxo.outpoint.index)")
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            Spacer()
-            if utxo.isCoinbase {
-                Text("Coinbase")
-                    .font(.caption2)
-                    .fontWeight(.semibold)
-                    .foregroundColor(.secondary)
-            }
-            Button {
-                renameUtxoText = utxoLabels[outpointKey(utxo)] ?? ""
-                renamingUtxo = utxo
-            } label: {
-                Image(systemName: "pencil")
-                    .foregroundColor(.accentColor)
-                    .frame(width: 32, height: 32)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.vertical, 4)
-    }
-
-    private func loadUtxos() async {
-        isLoadingUtxos = true
-        do {
-            utxos = try await NodePoolService.shared.getUtxosByAddresses([address])
-            utxoLoadError = nil
-            // A fresh count is the balance: keep the app-wide one (the header above) in step.
-            walletManager.updateBalanceIfCurrentWallet(address: address, utxos: utxos)
-        } catch {
-            // The list keeps what it had; an outage is not an empty address.
-            utxoLoadError = UserFacingError.message(for: error)
-        }
-        isLoadingUtxos = false
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func transactionRow(_ tx: KaspaFullTransactionResponse) -> some View {
@@ -520,10 +409,44 @@ struct ChattingAddressManageView: View {
         String(format: "%.8f", Double(sompi) / 100_000_000.0)
     }
 
+    // MARK: - Loading
+
+    private func refresh() async {
+        async let coins: Void = loadUtxos()
+        async let spending: Void = loadSpendingTotal()
+        async let history: Void = loadTransactions()
+        _ = await (coins, spending, history)
+    }
+
+    private func loadSpendingTotal() async {
+        // A read that finishes after an account switch belongs to the old account: dropped.
+        let account = walletManager.currentWallet?.publicAddress
+        // The whole set, in ONE call - a per-address loop would be dozens of requests on a wallet
+        // that has been used, and the node takes the list.
+        let all = walletManager.allSpendingAddresses()
+        // None revealed yet: nothing has been sent there.
+        guard !all.isEmpty else {
+            spendingTotalSompi = 0
+            return
+        }
+        // A failure leaves the previous total in place: a few seconds stale reads better than a
+        // figure that vanishes because one request timed out.
+        if let utxos = try? await NodePoolService.shared.getUtxosByAddresses(all),
+           walletManager.currentWallet?.publicAddress == account {
+            spendingTotalSompi = utxos.reduce(UInt64(0)) { $0 + $1.amount }
+        }
+    }
+
+    private func loadUtxos() async {
+        // A failure keeps what it had: an outage is not an empty address.
+        guard let fresh = try? await NodePoolService.shared.getUtxosByAddresses([address]) else { return }
+        utxos = fresh
+        // A fresh count is the balance: keep the app-wide one (the bar's) in step.
+        walletManager.updateBalanceIfCurrentWallet(address: address, utxos: fresh)
+    }
+
     private func loadTransactions() async {
         isLoading = true
-        // Confirmed live against api.kaspa.org that limit=500 works fine in a single call
-        // (~0.7s) - cuts this from up to 4 sequential round trips down to 1.
         let result = await chatService.fetchFullTransactionsResult(for: address, pageSize: 200, maxTransactions: 200)
         // block rewards the chain never accepted paid nothing: not history
         transactions = result.transactions.filter(\.belongsInHistory)
@@ -535,13 +458,28 @@ struct ChattingAddressManageView: View {
         guard let url = settingsViewModel.settings.kaspaExplorer.txURL(for: tx.transactionId) else { return }
         UIApplication.shared.open(url)
     }
+
+    private func showToast(_ message: String) {
+        let token = UUID()
+        toastToken = token
+        withAnimation(.easeOut(duration: 0.2)) {
+            toastMessage = message
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+            if toastToken == token {
+                withAnimation(.easeIn(duration: 0.2)) {
+                    toastMessage = nil
+                }
+            }
+        }
+    }
 }
 
 /// Private-key reveal for the wallet's own chatting/identity address — mirrors
 /// SpendingAddressPrivateKeyView, but reads the wallet's own root private key rather than a
 /// derived spending key, since the identity address isn't part of the spending-chain derivation.
-/// Gated by `biometricSeedPhraseEnabled` (not `biometricSpendingKeyEnabled`) since this is the
-/// wallet's primary key, matching the same higher-stakes gate as Settings > View Seed Phrase.
+/// Gated by `biometricSpendingKeyEnabled`, Settings' "Biometrics for Address Private Keys": it is an
+/// address's private key like the others that toggle covers (the Wallet's More sheet checks it).
 private struct ChattingAddressPrivateKeyView: View {
     let address: String
     @Environment(\.dismiss) private var dismiss
@@ -955,6 +893,14 @@ struct WithdrawKaspaView: View {
     @State private var feeError: String?
     /// The fee being typed on the fee screen, in KAS.
     @State private var feeDraft = ""
+    /// The fee this exact send pays at the chosen speed (network fee, extra and any change too
+    /// small to keep), from an estimate made with that extra; nil until it is known.
+    @State private var builtFeeSompi: UInt64?
+    /// The Max on screen is what one transaction can carry, not the whole balance (the address
+    /// holds more coins than one transaction can spend).
+    @State private var maxCapped = false
+    /// The latest Max request: an older one finishing later (a fee tapped twice fast) is dropped.
+    @State private var maxRequest = UUID()
 
     private let knsService = KNSService.shared
 
@@ -975,8 +921,11 @@ struct WithdrawKaspaView: View {
         return isValidAddress && !isResolvingKNS
     }
 
+    /// The swipe waits for the amount and the fee it shows to be the ones that will be sent: not
+    /// while Max or the fee is being worked out again, and not when the fee couldn't be.
     private var canSend: Bool {
         hasValidRecipient && amountSompi != nil && !isSending
+            && !isEstimatingMax && !isEstimatingFee && feeError == nil && totalFeeSompi != nil
     }
 
     /// Extra priority tip on top of the base (Normal-tier) fee, for network congestion.
@@ -988,16 +937,16 @@ struct WithdrawKaspaView: View {
     }
 
     private var totalFeeSompi: UInt64? {
-        guard let normalFeeSompi else { return nil }
-        return normalFeeSompi + extraFeeSompi
+        guard normalFeeSompi != nil else { return nil }
+        return builtFeeSompi
     }
 
-    /// Debounce/cancellation key: only re-estimate when the resolved address or amount
-    /// actually changes, not on every fee-tier tap (the tier is applied client-side as a
-    /// multiplier of the already-fetched base fee, no extra network round-trip needed).
+    /// Debounce/cancellation key. The speed and a custom fee are in it: a bigger extra can make the
+    /// send take another coin, or no longer leave change worth keeping, so the fee shown is worked
+    /// out with the extra actually paid rather than added on top of the Normal estimate.
     private var feeEstimationKey: String {
         let manualKey = manualUtxos?.map { "\($0.outpoint.transactionId):\($0.outpoint.index)" }.sorted().joined(separator: ",") ?? ""
-        return "\(hasValidRecipient ? effectiveAddress : "")|\(amountSompi ?? 0)|\(manualKey)|\(source.spendingIndex ?? -1)"
+        return "\(hasValidRecipient ? effectiveAddress : "")|\(amountSompi ?? 0)|\(manualKey)|\(source.spendingIndex ?? -1)|\(feeTier.rawValue)|\(customExtraFeeSompi.map { String($0) } ?? "")"
     }
 
     /// The steps of a send: who it goes to, which of your addresses it leaves from, how much
@@ -1087,8 +1036,10 @@ struct WithdrawKaspaView: View {
             .task(id: source) {
                 sourceBalanceSompi = nil
                 guard let address = source.address else { return }
-                let utxos = (try? await NodePoolService.shared.getUtxosByAddresses([address])) ?? []
-                guard !Task.isCancelled else { return }
+                // A failed read stays unknown: shown as 0 it said the address was empty and
+                // blocked every amount as "more than the address holds".
+                guard let utxos = try? await NodePoolService.shared.getUtxosByAddresses([address]),
+                      !Task.isCancelled else { return }
                 sourceBalanceSompi = utxos.reduce(UInt64(0)) { $0 + $1.amount }
             }
             .onChange(of: feeTier) { _ in
@@ -1114,25 +1065,40 @@ struct WithdrawKaspaView: View {
             .task(id: feeEstimationKey) {
                 guard hasValidRecipient, let amountSompi else {
                     normalFeeSompi = nil
+                    builtFeeSompi = nil
                     feeError = nil
+                    isEstimatingFee = false
                     return
                 }
                 isEstimatingFee = true
                 try? await Task.sleep(nanoseconds: 400_000_000)
                 guard !Task.isCancelled else { return }
-                do {
-                    let fee: UInt64
-                    if let index = source.spendingIndex {
-                        fee = try await chatService.estimateSpendingAddressWithdrawalFee(index: index, toAddress: effectiveAddress, amountSompi: amountSompi, manualUtxos: manualUtxos)
-                    } else {
-                        fee = try await chatService.estimateWithdrawalFee(toAddress: effectiveAddress, amountSompi: amountSompi, manualUtxos: manualUtxos)
+                let index = source.spendingIndex
+                let recipient = effectiveAddress
+                let coins = manualUtxos
+                func estimate(extra: UInt64) async throws -> SendFeeEstimate {
+                    if let index {
+                        return try await chatService.estimateSpendingAddressWithdrawalFee(index: index, toAddress: recipient, amountSompi: amountSompi, manualUtxos: coins, extraFeeSompi: extra)
                     }
+                    return try await chatService.estimateWithdrawalFee(toAddress: recipient, amountSompi: amountSompi, manualUtxos: coins, extraFeeSompi: extra)
+                }
+                do {
+                    // The Normal fee is the base the speeds multiply (and the editor's minimum).
+                    let base = try await estimate(extra: 0)
                     guard !Task.isCancelled else { return }
-                    normalFeeSompi = fee
+                    let extra = customExtraFeeSompi ?? base.networkFee * (feeTier.multiplier - 1)
+                    // With the extra in, the estimate builds the same shape the send will: its
+                    // network fee already holds the extra, and change too small to keep goes on top.
+                    var paid = base
+                    if extra > 0 { paid = try await estimate(extra: extra) }
+                    guard !Task.isCancelled else { return }
+                    normalFeeSompi = base.networkFee
+                    builtFeeSompi = paid.networkFee + paid.foldedChange
                     feeError = nil
                 } catch {
                     guard !Task.isCancelled else { return }
                     normalFeeSompi = nil
+                    builtFeeSompi = nil
                     feeError = UserFacingError.message(for: error)
                 }
                 isEstimatingFee = false
@@ -1212,6 +1178,7 @@ struct WithdrawKaspaView: View {
                     onMax: setMaxAmount,
                     onKeyTyped: {
                         usedMax = false
+                        maxCapped = false
                         errorMessage = nil
                     }
                 )
@@ -1223,8 +1190,21 @@ struct WithdrawKaspaView: View {
     private var amountFootnote: String? {
         if let errorMessage { return errorMessage }
         if exceedsBalance { return AppLocalization.string("This is more than the address you're sending from holds.") }
+        if usedMax && maxCapped { return maxCappedNote }
         guard let sourceBalanceSompi else { return nil }
         return KaspaUnit.label(String(format: AppLocalization.string("Available: %@ KAS"), locale: AppLocalization.locale, KaspaUnit.plain(sourceBalanceSompi)))
+    }
+
+    /// Why Max isn't the whole balance: one transaction spends at most
+    /// `maxInputsPerTransaction` coins, and this address holds more.
+    private var maxCappedNote: String {
+        let limit = KasiaTransactionBuilder.maxInputsPerTransaction
+        if isCompoundMode {
+            return String(format: AppLocalization.string("One transaction can combine %d coins, so this combines the largest %d. Compound again for the rest."),
+                          locale: AppLocalization.locale, limit, limit)
+        }
+        return String(format: AppLocalization.string("Max is what one transaction can carry: its largest %d coins. Compound UTXOs, under More, combines the rest."),
+                      locale: AppLocalization.locale, limit)
     }
 
     // MARK: Step 2 - From
@@ -1385,6 +1365,11 @@ struct WithdrawKaspaView: View {
                     Text(message)
                         .font(.footnote)
                         .foregroundColor(.red)
+                        .multilineTextAlignment(.center)
+                } else if usedMax && maxCapped {
+                    Text(maxCappedNote)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
                 }
             }
@@ -1549,21 +1534,28 @@ struct WithdrawKaspaView: View {
         let recipient = effectiveAddress
         let tipSompi = extraFeeSompi
         let spendingIndex = isCompoundMode ? nil : source.spendingIndex
+        let request = UUID()
+        maxRequest = request
         Task {
             do {
-                let maxSompi: UInt64
+                let result: (amountSompi: UInt64, cappedAtInputLimit: Bool)
                 if let index = spendingIndex {
-                    maxSompi = try await chatService.estimateMaxSpendingAddressAmount(index: index, toAddress: recipient, manualUtxos: manualUtxos, extraFeeSompi: tipSompi)
+                    result = try await chatService.estimateMaxSpendingAddressAmount(index: index, toAddress: recipient, manualUtxos: manualUtxos, extraFeeSompi: tipSompi)
                 } else {
-                    maxSompi = try await chatService.estimateMaxWithdrawalAmount(toAddress: recipient, manualUtxos: manualUtxos, extraFeeSompi: tipSompi)
+                    result = try await chatService.estimateMaxWithdrawalAmount(toAddress: recipient, manualUtxos: manualUtxos, extraFeeSompi: tipSompi)
                 }
                 await MainActor.run {
-                    amountInput = fiatAmountState.setMaxKas(Double(maxSompi) / 100_000_000.0, priceInCurrency: priceStore.currentPriceUsd)
+                    // a newer Max (another speed tapped meanwhile) decides the amount
+                    guard maxRequest == request else { return }
+                    amountInput = fiatAmountState.setMaxKas(Double(result.amountSompi) / 100_000_000.0, priceInCurrency: priceStore.currentPriceUsd)
+                    maxCapped = result.cappedAtInputLimit
                     isEstimatingMax = false
                 }
             } catch {
                 await MainActor.run {
+                    guard maxRequest == request else { return }
                     errorMessage = UserFacingError.message(for: error)
+                    maxCapped = false
                     isEstimatingMax = false
                 }
             }
@@ -1587,7 +1579,8 @@ struct WithdrawKaspaView: View {
     }
 
     private func send() {
-        guard let amountSompi else { return }
+        // one send at a time: a second swipe or activation must never build a second transaction
+        guard let amountSompi, !isSending else { return }
         isSending = true
         errorMessage = nil
         let recipient = effectiveAddress.trimmingCharacters(in: .whitespacesAndNewlines)

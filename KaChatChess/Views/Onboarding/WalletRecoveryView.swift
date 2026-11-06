@@ -24,10 +24,10 @@ struct WalletRecoveryView: View {
                     .font(.scaled(size: 52, weight: .semibold))
                     .foregroundColor(.accentColor)
                 VStack(spacing: 10) {
-                    Text("Recovery Phrase Needed")
+                    Text("12 or 24 Words Needed")
                         .font(.title2.weight(.bold))
                         .multilineTextAlignment(.center)
-                    Text("This iPhone has your account but not its keys. That happens after restoring a phone from a backup, because KaChat's keys are locked to the device they were created on. Enter your recovery phrase to unlock it here. Your messages on this device are kept.")
+                    Text("This iPhone has your account but not its keys. That happens after restoring a phone from a backup, because KaPlay's keys are locked to the device they were created on. Enter your 12 or 24 words to unlock it here. Your messages on this device are kept.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
@@ -51,7 +51,7 @@ struct WalletRecoveryView: View {
                     Button {
                         showImport = true
                     } label: {
-                        Text("Enter Recovery Phrase")
+                        Text("Enter 12 or 24 Words")
                             .font(.subheadline.weight(.semibold))
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 14)
@@ -82,10 +82,15 @@ struct WalletRecoveryView: View {
                 ImportSourceWalletView()
             }
             .alert("Remove this account?", isPresented: $showRemoveConfirmation) {
-                Button("Remove", role: .destructive) { remove() }
+                // Face ID first, as on both Delete Account sheets.
+                Button("Remove", role: .destructive) {
+                    DeviceAuth.authenticate(reason: AppLocalization.string("Confirm deleting this account")) {
+                        remove()
+                    }
+                }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("The account and its message history are deleted from this phone. Nothing on the blockchain changes, and you can add the account again later with its recovery phrase.")
+                Text("The account and its message history are deleted from this phone. Nothing on the blockchain changes, and you can add the account again later with its 12 or 24 words.")
             }
             .alert("Couldn't remove", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
                 Button("OK", role: .cancel) {}
@@ -102,6 +107,7 @@ struct WalletRecoveryView: View {
     }
 
     private func remove() {
+        guard !isRemoving else { return }
         isRemoving = true
         Task {
             do {

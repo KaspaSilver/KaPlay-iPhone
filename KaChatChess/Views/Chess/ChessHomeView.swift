@@ -11,6 +11,8 @@ struct ChessHomeView: View {
     @ObservedObject private var links = ChessBotLinkRouter.shared
     /// A challenge from a KaPost being shown (`ChessBotLinks`).
     @State private var openChallenge: ChessBotChallenge?
+    /// This screen is the top of the stack (not under a pushed screen).
+    @State private var isVisible = false
 
     var body: some View {
         ScrollView {
@@ -103,15 +105,24 @@ struct ChessHomeView: View {
             }
         }
         .onAppear {
+            isVisible = true
             service.acquire()
             takeChallenge()
         }
         .onChange(of: links.challenge) { _ in takeChallenge() }
-        .onDisappear { service.release() }
+        // The online game a challenge waited for is over: take it here, never from under a
+        // pushed screen.
+        .onChange(of: service.myActiveTournament?.id) { _ in if isVisible { takeChallenge() } }
+        .onDisappear {
+            isVisible = false
+            service.release()
+        }
     }
 
+    /// A challenge never pops a board or a waiting room: while the player is seated or playing
+    /// online, it waits in the router until that is over and this screen is back.
     private func takeChallenge() {
-        guard let challenge = links.challenge else { return }
+        guard let challenge = links.challenge, service.myActiveTournament == nil else { return }
         links.challenge = nil
         openChallenge = challenge
     }

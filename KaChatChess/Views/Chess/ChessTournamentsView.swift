@@ -115,7 +115,9 @@ struct ChessTournamentsView: View {
         .toast(message: waitingNotice, style: .error)
         // Back on this screen with a live seat (a relaunch, a tap on a public room card):
         // the waiting room is the only place to be.
-        .onChange(of: service.myActiveTournament?.id) { _ in showWaitingRoomIfSeated() }
+        // Its status too: a room that fills keeps its id, and a player whose leave lost the race
+        // to the last join must still be taken to the board.
+        .onChange(of: service.myActiveTournament.map { "\($0.id)|\($0.status)" }) { _ in showWaitingRoomIfSeated() }
         .onAppear { showWaitingRoomIfSeated() }
         // The result screen's Done lands here, not on the board.
         .onChange(of: service.popToLobbyRequest) { _ in

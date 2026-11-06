@@ -13,6 +13,13 @@ Tabs (`ChessMainTabView.Tab`): Play, Leaderboard, Wallet (`Views/Wallet/WalletVi
 Settings. Play opens on `GamesView`, a card per game; Chess is the only one so far and opens
 `ChessHomeView`. A new game is one more card there.
 
+The Wallet tab (`ChattingAddressManageView`) is laid out like KaPost's Wallet screen
+(`KaPostWalletView`): the total (tap to copy), split into Chatting and Spending, then Send, Receive
+and More (Compound UTXOs, always listed and greyed out under two coins, the keys, the explorer), the Backup
+Hygiene card when due, then the chatting address's history. KaPlay uses only the chatting address,
+the one it plays from: Send leaves from it and Receive is paid to it. Spending addresses only count
+in the total; they're managed in KaChat and KaPay.
+
 Every menu's title is the same as KaPosts': big and fixed above the content that scrolls
 (`fixedScreenTitle`), with the balance alone in the center of the bar (`BalanceToolbarLabel`). The
 game boards have no room for it, so `ScreenTitleToolbarLabel` puts their title over the balance in
@@ -26,6 +33,14 @@ ONLINE_CHESS.md §7); online games stay on chain move by move. The Leaderboard t
 (`ChessLeaderboardPage`), Bots `ChessBotLeaderboardsView`, a board per played bot ranked by fewest
 moves to win (`ChessBotLeaderboardService`). A stamped win can be shared to KaPost, and the post's Challenge
 button opens KaPlay (`ChessBotLinks`, ONLINE_CHESS.md §7.2).
+
+Online moves, joins, claims and bot stamps never wait in a silent background retry
+(`PublicChatService.sendPublicChat(deferNoInputRetry: false)`): no coins on the chatting address says
+"Not enough KAS on your Chatting Address", and only "change not mined yet" is retried, a few times.
+A move the chain hasn't shown in 25 s can be played again. A timeout claim is retried every 30 s
+until the chain decides the game, the board offers Claim win, and a decided game can be left
+without resigning. Per-account arena state (queued join, pending moves, claims) clears when the
+account changes. The 30-day replay runs off the main thread (`reduceArena`).
 
 ## Nothing players type reaches other players
 
@@ -45,32 +60,40 @@ first 50 identity addresses, picks the first with funds, lists any others to cho
 imports onto the chosen one (`WalletManager.findChattingAddresses`).
 
 Creating never shows the seed phrase: an account made here is owed a backup
-(`AccountBackupStatus`), and until the backup steps (`AccountBackupView`) are finished the Wallet
-tab shows `AccountBackupCard` above Address Actions (red once the account holds funds), its dock
-icon has a yellow dot (`ChessMainTabView.owesBackup`, Backup Hygiene too), Receive shows a reminder and the Delete Account warning leads with Back Up Account; deleting is never
-blocked. Imported and older accounts are never owed one. Finishing the steps or importing, by
+(`AccountBackupStatus`), and until the backup steps (`AccountBackupView`) are finished every tab's
+first screen shows `AccountBackupBanner` above its title (`fixedScreenTitle(_:showsBackupBanner:)`,
+red once the chatting address holds funds; the dock has no badge) and the Delete Account warning
+leads with Back Up Account; deleting is never blocked. The words are called "12 or 24 words" everywhere people read,
+as in KaChat. Imported and older accounts are never owed one. Finishing the steps or importing, by
 typing the words or from a card, starts a six-month timer, and a changed chatting address keeps the
 status (`AccountBackupStatus.moveStatus`). When it runs out the Wallet tab shows `BackupHygieneCard`
 in the same place, and `BackupHygieneView` asks for five random words, then the passphrase if there
 is one.
 
-**NFC card backup** (`Services/NFCCard.swift`, beta only: `NFCCard.isAvailable`, hidden once
-`KACHAT_IS_RELEASE` is YES and where NFC can't read): an extra copy of the words of a seed phrase
+**NFC card backup** (`Services/NFCCard.swift`, in App Store builds too since 2026-11-06, as in
+KaChat; `NFCCard.isAvailable` hides it where NFC can't read these cards, such as iPad): an extra copy of the words of a seed phrase
 the user already has, on a Java Card loaded with
 [KaChat-NFC](https://github.com/KaspaSilver/KaChat-NFC) through Kaspa Quick Start's NFC Card page.
 Not cold storage: the card never generates or uses a key. The same as KaPay's and KaChat's; the card
 commands and backup format are that repo's `docs/PROTOCOL.md`, so change them there first. Settings
-> Back Up to NFC Card (`NFCCardBackupView`, behind the seed phrase's biometric gate) only exists for
+> Back Up Account > Back Up to NFC Card (`NFCCardBackupView`, behind the seed phrase's biometric gate) only exists for
 an account with a passphrase, which is what protects it: it's never written to the card. The Import
 chooser's Restore from NFC Card (`NFCCardRestoreView`) reads with the 6-digit PIN, asks for the
 passphrase and checks it against the saved chatting address. Saving to a card never clears the
-backup card. Before an App Store submission without this feature, remove the NFC entitlement in
-`KaChatChess.entitlements` and `KaChatChessRelease.entitlements` and the NFC keys in `Info.plist`.
-The App ID needs Near Field Communication Tag Reading on.
+backup strip. The App ID needs Near Field Communication Tag Reading on.
 
-Settings' Account section ends with Delete Account (`DeleteAccountSheet`, the warning the sign-in
-screen's Delete also shows) and Log Out. Every sign-in gets new tabs (`ContentView`'s
-`signInSession`), opening on Play.
+Settings is KaChat's alphabetical cards: About (created date, version, website, support email, the
+privacy policy at home.kachat.app/privacy/, licenses), Account Name, Back Up Account (Complete Your
+Backup while owed, View 12 or 24 Words, Back Up to NFC Card), Connection, Customization, Security.
+Below them Delete Account (`DeleteAccountSheet`, the warning the sign-in screen's Delete also shows)
+and Log Out, which KaChat keeps on Profile and KaPlay has no Profile for. Every sign-in gets new tabs
+(`ContentView`'s `signInSession`), opening on Play. Biometrics for Account Login is off by default,
+and existing installs were switched off once (`AppSettings.accountLoginBiometricsOffMigration`).
+
+Face ID, as in KaChat: `SwipeUpToSendScrollView` asks `DeviceAuth` before every send (declined, the
+screen settles back filled in), and both Delete Account sheets ask too. Chess moves don't ask. A
+send a node may have taken without answering ends on "Not confirmed" with only Done
+(`SendOutcomeUnknownError`), never Try Again, which could pay twice.
 
 ## Send Kaspa
 
@@ -94,7 +117,8 @@ KaPay's.
    `.task(id: source)`) is the amount's Available. Continue says "Review".
 4. **Review**: `SwipeUpToSendScrollView` with Back: "You're sending X KAS", To, From, Total.
    Nothing can change but the fee and coin control (`SendFeeControls`); a Max amount is worked
-   out again when they change. The fee's Edit (`onEditFee`) opens `SendFeeEditorScreen` (the fee
+   out again when they change. Change too small to keep goes to the fee, so the Review's fee and
+   Total count it (`SendFeeEstimate`, as in KaChat). The fee's Edit (`onEditFee`) opens `SendFeeEditorScreen` (the fee
    typed on the keypad, never under the network's minimum); Confirm goes back to the review.
 
 The only send screen is `WithdrawKaspaView` (`Views/Wallet/WalletViews.swift`): the Wallet tab's

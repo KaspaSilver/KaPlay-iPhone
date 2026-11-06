@@ -552,14 +552,14 @@ struct DeleteAccountSheet: View {
                         .foregroundColor(.red)
                         .multilineTextAlignment(.center)
                     if onBackUp == nil {
-                        Text("To back it up first, sign in to it and use the card on the Wallet tab.")
+                        Text("To back it up first, sign in to it and tap the backup banner at the top of any tab.")
                             .font(.subheadline)
                             .foregroundColor(.secondary)
                             .multilineTextAlignment(.center)
                     }
                 }
 
-                Text("Make sure your seed phrase is backed up, and your passphrase too if you have one. They are the only way to recover this account and its funds.")
+                Text("Make sure your 12 or 24 words are backed up, and your passphrase too if you have one. They are the only way to recover this account and its funds.")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
@@ -568,13 +568,13 @@ struct DeleteAccountSheet: View {
                 if notBackedUp, let onBackUp {
                     ActionSheetRow(
                         title: "Back Up Account",
-                        subtitle: "Write down your seed phrase before you delete.",
+                        subtitle: "Write down your 12 or 24 words before you delete.",
                         systemImage: "exclamationmark.shield",
                         action: onBackUp
                     )
                 } else if let onViewSeedPhrase {
                     ActionSheetRow(
-                        title: "View Seed Phrase and Passphrase",
+                        title: "View 12 or 24 Words and Passphrase",
                         subtitle: "The passphrase shows too, if this account has one.",
                         systemImage: "key",
                         action: onViewSeedPhrase

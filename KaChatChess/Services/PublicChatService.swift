@@ -100,6 +100,11 @@ final class PublicChatService: ObservableObject {
     @Published var editingMessage: PublicChatMessage?
     @Published var lastSendError: KasiaError?
     @Published var replyingTo: PublicChatMessage?
+    /// Rows of the service channels (the chess arena) this phone sent whose block time is still
+    /// this phone's own clock: the chain's time has not reached us yet. The arena's reducer
+    /// orders these by the moves around them, never by the local stamp (see
+    /// `ChessTournamentService.reduce`).
+    private(set) var locallyStampedTxIds: Set<String> = []
     /// Set when a public chat-room notification is tapped, so the chat list can navigate to that
     /// room - mirrors `ChatService.pendingChatNavigation`'s cold-start handling.
     @Published var pendingPublicChatNavigation: String?
@@ -315,7 +320,10 @@ final class PublicChatService: ObservableObject {
             if Self.serviceChannels.contains(channel) {
                 // Our own arena rows take the chain's block time - see processPublicChatHits.
                 var changed = false
-                for row in rows where store.updateBlockTime(id: row.id, blockTime: row.blockTime) { changed = true }
+                for row in rows {
+                    locallyStampedTxIds.remove(row.id)
+                    if store.updateBlockTime(id: row.id, blockTime: row.blockTime) { changed = true }
+                }
                 if changed { loadMessages(for: channel) }
             }
             guard !fresh.isEmpty else { return true }
@@ -841,6 +849,7 @@ final class PublicChatService: ObservableObject {
             // Rows this phone sent carry its own clock until the chain's time reaches us -
             // see processPublicChatHits.
             for row in rows {
+                locallyStampedTxIds.remove(row.id)
                 let key = "\(row.id)@\(row.blockTime)"
                 guard !wasApplied(key, channel: channel) else { continue }
                 if store.updateBlockTime(id: row.id, blockTime: row.blockTime) {
@@ -1278,13 +1287,18 @@ final class PublicChatService: ObservableObject {
         try await sendPublicChat(channel: channel, content: jsonString)
     }
 
-    func sendPublicChat(channel rawChannel: String, content: String, feeOverride: UInt64? = nil) async throws {
+    /// `deferNoInputRetry` false (the chess sends): a send whose coins are not spendable yet
+    /// throws instead of being retried later in the background, so the caller - which retries a
+    /// few times itself and then shows the error - never reports a move as sent that is not.
+    /// Returns the transaction id; nil only when the send was deferred.
+    @discardableResult
+    func sendPublicChat(channel rawChannel: String, content: String, feeOverride: UInt64? = nil, deferNoInputRetry: Bool = true) async throws -> String? {
         let channel = PublicChatChannelName.normalize(rawChannel)
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard PublicChatChannelName.isValid(channel) else {
             throw KasiaError.networkError("Invalid channel name")
         }
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else { return nil }
         guard let wallet = WalletManager.shared.currentWallet else {
             throw KasiaError.walletNotFound
         }
@@ -1321,7 +1335,7 @@ final class PublicChatService: ObservableObject {
         loadMessages(for: channel)
 
         do {
-            _ = try await ChatService.shared.enqueueOutgoingTxOperation {
+            let txId = try await ChatService.shared.enqueueOutgoingTxOperation {
                 try await self.sendPublicChatInternal(
                     channel: channel,
                     content: payload,
@@ -1332,6 +1346,7 @@ final class PublicChatService: ObservableObject {
                 )
             }
             replyingTo = nil
+            return txId
         } catch {
             try await handleSendFailure(
                 error,
@@ -1339,9 +1354,28 @@ final class PublicChatService: ObservableObject {
                 content: payload,
                 walletAddress: wallet.publicAddress,
                 privateKey: privateKey,
-                pendingId: pendingId
+                pendingId: pendingId,
+                deferRetry: deferNoInputRetry
             )
+            return nil
         }
+    }
+
+    /// What a chess send should say when the chatting address has no coins at all - not the
+    /// "wait for confirmations" of a change output still being mined, which retries.
+    static var notEnoughKasMessage: String {
+        AppLocalization.string("Not enough KAS on your Chatting Address. Add some and try again.")
+    }
+
+    /// Worth trying again in a moment: the coins are there but not spendable yet (the change of
+    /// the last send), or the node rejected the transaction as an orphan / already spent - none
+    /// of which reached the chain. Anything else (no funds, a timeout whose outcome is unknown)
+    /// is not retried blindly.
+    static func isRetryableSendError(_ error: Error) -> Bool {
+        let chatService = ChatService.shared
+        if chatService.isNoConfirmedInputsError(error) || chatService.shouldRetrySendError(error) { return true }
+        let confirming = AppLocalization.string("The network is still confirming your previous send. Please try again in a few seconds.").lowercased()
+        return error.localizedDescription.lowercased().contains(confirming)
     }
 
     /// If sending too quickly back-to-back races the previous public chat's not-yet-confirmed
@@ -1354,9 +1388,10 @@ final class PublicChatService: ObservableObject {
         content: String,
         walletAddress: String,
         privateKey: Data,
-        pendingId: String
+        pendingId: String,
+        deferRetry: Bool = true
     ) async throws {
-        if ChatService.shared.isNoConfirmedInputsError(error) {
+        if deferRetry, ChatService.shared.isNoConfirmedInputsError(error) {
             let delay = ChatService.shared.nextNoInputRetryDelay(for: pendingId)
             AppLog.log("[PublicChatService] Deferred retry (no confirmed inputs) for %@ in %.0fs",
                   String(pendingId.prefix(12)), delay)
@@ -1444,6 +1479,9 @@ final class PublicChatService: ObservableObject {
         let freshUtxos = try await NodePoolService.shared.getUtxosByAddresses([walletAddress])
         let candidateUtxos = chatService.prepareMessageUtxos(confirmed: freshUtxos)
         guard !candidateUtxos.isEmpty else {
+            // No coin at all on the address (and none in flight): waiting will not help, so say
+            // so instead of "wait for confirmations" - which retried in the background forever.
+            if freshUtxos.isEmpty { throw KasiaError.networkError(Self.notEnoughKasMessage) }
             throw KasiaError.networkError(chatService.noSpendableFundsYetMessage())
         }
 
@@ -1518,6 +1556,7 @@ final class PublicChatService: ObservableObject {
             }
             chatService.clearNoInputRetryState(for: pendingId)
             let blockTime = Int64(Date().timeIntervalSince1970 * 1000)
+            if Self.serviceChannels.contains(channel) { locallyStampedTxIds.insert(txId) }
             store.resolvePendingMessage(pendingId: pendingId, realId: txId, blockTime: blockTime)
             loadMessages(for: channel)
             return txId
@@ -1537,6 +1576,7 @@ final class PublicChatService: ObservableObject {
         if lower.contains("orphan") || lower.contains("already spent") || lower.contains("double spend") {
             return AppLocalization.string("The network is still confirming your previous send. Please try again in a few seconds.")
         }
+        if lower.contains("insufficient funds") { return notEnoughKasMessage }
         return raw
     }
 
@@ -1735,6 +1775,7 @@ final class PublicChatService: ObservableObject {
                 (id: $0.txId, channel: $0.channel, senderAddress: $0.senderAddress, content: $0.content, blockTime: $0.blockTime)
             })
             for hit in messageHits {
+                if Self.serviceChannels.contains(hit.channel) { locallyStampedTxIds.remove(hit.txId) }
                 if inserted.contains(hit.txId) {
                     touchedChannels.insert(hit.channel)
                     notifyIfEnabled(channel: hit.channel, senderAddress: hit.senderAddress, content: hit.content, txId: hit.txId)

@@ -22,7 +22,7 @@ struct GamesView: View {
                 }
                 .padding(.vertical, 16)
             }
-            .fixedScreenTitle(Text("Play"))
+            .fixedScreenTitle(Text("Play"), showsBackupBanner: true)
             .background(Color(.systemGroupedBackground))
             .navigationTitle("Play")
             .navigationBarTitleDisplayMode(.inline)

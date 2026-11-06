@@ -727,7 +727,7 @@ struct KasiaTransactionBuilder {
         extraFeeSompi: UInt64 = 0,
         virtualDaaScore: UInt64? = nil,
         signatureScriptSize: Int = 66
-    ) throws -> UInt64 {
+    ) throws -> SendFeeEstimate {
         let selection: PaymentSelection
         if let manualUtxos, !manualUtxos.isEmpty {
             selection = try selectManualUtxosForPayment(
@@ -758,12 +758,15 @@ struct KasiaTransactionBuilder {
         if selection.keepsChange(withRecipientAmount: amount) {
             outputs.append(KaspaRpcTransactionOutput(value: selection.change, scriptPublicKey: KaspaScriptPublicKey(version: 0, script: senderScriptPubKey)))
         }
-        return estimateFee(payload: Data(), inputCount: selection.utxos.count, outputs: outputs,
-                           signatureScriptSize: signatureScriptSize) + extraFeeSompi
+        return SendFeeEstimate(
+            networkFee: estimateFee(payload: Data(), inputCount: selection.utxos.count, outputs: outputs,
+                                    signatureScriptSize: signatureScriptSize) + extraFeeSompi,
+            foldedChange: selection.keepsChange(withRecipientAmount: amount) ? 0 : selection.change
+        )
     }
 
     /// Estimate payment fee based on payload and utxo set
-    static func estimatePaymentFee(utxos: [UTXO], payload: Data, amount: UInt64, recipientScriptPubKey: Data, senderScriptPubKey: Data, signatureScriptSize: Int = 66) throws -> UInt64 {
+    static func estimatePaymentFee(utxos: [UTXO], payload: Data, amount: UInt64, recipientScriptPubKey: Data, senderScriptPubKey: Data, signatureScriptSize: Int = 66) throws -> SendFeeEstimate {
         let selection = try selectUtxosForPayment(
             utxos: utxos,
             amount: amount,
@@ -786,8 +789,11 @@ struct KasiaTransactionBuilder {
             ))
         }
 
-        return estimateFee(payload: payload, inputCount: selection.utxos.count, outputs: outputs,
-                           signatureScriptSize: signatureScriptSize)
+        return SendFeeEstimate(
+            networkFee: estimateFee(payload: payload, inputCount: selection.utxos.count, outputs: outputs,
+                                    signatureScriptSize: signatureScriptSize),
+            foldedChange: selection.keepsChange(withRecipientAmount: amount) ? 0 : selection.change
+        )
     }
 
     /// Estimate fee for send-all transaction (all UTXOs, single output, no change)
@@ -1563,17 +1569,20 @@ struct KasiaTransactionBuilder {
                 signatureScriptSize: signatureScriptSize
             ) + 3 + extraFeeSompi
 
-            if total <= amount || total - amount < feeWithChange {
+            if total <= amount {
                 continue
             }
 
-            var change = total - amount - feeWithChange
             // Keep the change whenever this transaction's own storage mass allows it (see
             // `storageMass`). The flat `> dustThreshold` rule here handed up to 0.2 KAS of a
             // user's change to the miners as fee whenever it fell under the floor - money gone,
-            // not a rounding error - for change the network would have accepted.
-            if fitsStorageMass(inputAmounts: selected.map(\.amount), outputAmounts: [amount, change]) {
-                return PaymentSelection(utxos: selected, change: change, emitChange: true)
+            // not a rounding error - for change the network would have accepted. Too little left
+            // to pay for a change output at all (a Max send) still goes on to the no-change try.
+            if total - amount >= feeWithChange {
+                let change = total - amount - feeWithChange
+                if fitsStorageMass(inputAmounts: selected.map(\.amount), outputAmounts: [amount, change]) {
+                    return PaymentSelection(utxos: selected, change: change, emitChange: true)
+                }
             }
 
             // Try without change (treat dust as fee, + buffer, + priority tip) - only when the
@@ -1583,8 +1592,13 @@ struct KasiaTransactionBuilder {
             let feeNoChange = estimateFee(payload: payload, inputCount: selected.count, outputs: [recipientOutput],
                                           signatureScriptSize: signatureScriptSize) + 3 + extraFeeSompi
             if total > amount && total - amount >= feeNoChange {
-                change = total - amount - feeNoChange
-                if change <= maxFoldedChangeSompi {
+                let change = total - amount - feeNoChange
+                // The recipient's output alone must fit too: a small send carved from a bigger
+                // coin breaks the budget without any change (0.03 KAS from one 0.1 KAS coin), and
+                // the node would refuse it after the Review had shown the folded change as fee.
+                // Another coin lowers that mass, so keep adding before giving up.
+                if change <= maxFoldedChangeSompi,
+                   fitsStorageMass(inputAmounts: selected.map(\.amount), outputAmounts: [amount]) {
                     return PaymentSelection(utxos: selected, change: change, emitChange: false)
                 }
                 blockedByStorageMass = true
@@ -1652,7 +1666,9 @@ struct KasiaTransactionBuilder {
                                       signatureScriptSize: signatureScriptSize) + 3 + extraFeeSompi
         if total > amount, total - amount >= feeNoChange {
             let leftover = total - amount - feeNoChange
-            guard leftover <= maxFoldedChangeSompi else {
+            // the recipient's output alone must fit the storage-mass budget too (see the greedy selector)
+            guard leftover <= maxFoldedChangeSompi,
+                  fitsStorageMass(inputAmounts: usable.map(\.amount), outputAmounts: [amount]) else {
                 throw KasiaError.networkError(smallSendMassMessage)
             }
             return PaymentSelection(utxos: usable, change: leftover, emitChange: false)
@@ -2644,5 +2660,17 @@ struct KasiaTransactionBuilder {
 
     private static func hexString(from string: String) -> String {
         return Data(string.utf8).hexString
+    }
+}
+
+/// What a send costs. Change too small to keep goes to the fee (`selectUtxosForPayment`), which the
+/// wallet loses like any other fee, so it counts in what the Review shows. It isn't part of the
+/// base the speed tiers multiply, and a tier's extra comes out of it before anything more is spent.
+struct SendFeeEstimate: Equatable {
+    let networkFee: UInt64
+    let foldedChange: UInt64
+
+    func total(extra: UInt64) -> UInt64 {
+        networkFee + max(extra, foldedChange)
     }
 }

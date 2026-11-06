@@ -796,63 +796,6 @@ struct SendFeeEditorScreen: View {
     }
 }
 
-/// The amount step's From: the two pills of `SendFromSection` - Chatting Address and Choose an
-/// Address (any of your addresses; once picked, the pill shows its name) - without the address
-/// card under them, so the keypad has room. The balance it loads is the amount's Available.
-struct SendFromCompactRow: View {
-    @Binding var source: SendSource
-    /// The chosen address's balance, loaded here (nil while it loads).
-    @Binding var availableSompi: UInt64?
-    /// Opened from one address's own page: that address only, shown as the one pill.
-    var isLocked: Bool = false
-    @State private var showPicker = false
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Text("From")
-                .font(.caption.weight(.semibold))
-                .foregroundColor(.secondary)
-                .textCase(.uppercase)
-            if isLocked {
-                SelectablePill(title: LocalizedStringKey(sourceTitle), selected: true) {}
-                    .allowsHitTesting(false)
-            } else {
-                SelectablePill(title: "Chatting Address", selected: source == .chatting) {
-                    source = .chatting
-                }
-                SelectablePill(title: chooseTitle, selected: source != .chatting) {
-                    showPicker = true
-                }
-            }
-        }
-        .sheet(isPresented: $showPicker) {
-            OwnAddressPicker(title: "Send From", selected: source.address) { picked in
-                source = picked
-            }
-        }
-        .task(id: source) {
-            availableSompi = nil
-            guard let address = source.address else { return }
-            let utxos = (try? await NodePoolService.shared.getUtxosByAddresses([address])) ?? []
-            guard !Task.isCancelled else { return }
-            availableSompi = utxos.reduce(UInt64(0)) { $0 + $1.amount }
-        }
-    }
-
-    /// "Choose an Address", or the picked address's name.
-    private var chooseTitle: LocalizedStringKey {
-        if case .spending(_, _, let label) = source { return LocalizedStringKey(label) }
-        return "Choose an Address"
-    }
-
-    private var sourceTitle: String {
-        switch source {
-        case .chatting: return AppLocalization.string("Chatting Address")
-        case .spending(_, _, let label): return label
-        }
-    }
-}
-
 /// The amount on a send's amount step, typed on the app's own number pad (`KaspaKeypad`), so no
 /// system keyboard comes up: the big amount and its unit, the KAS / your-currency switch and
 /// Max, then the keys. Hands the screen the KAS amount text after every key, like
@@ -1095,8 +1038,8 @@ private struct KaspaKeypadKeyStyle: ButtonStyle {
 /// The send button: slide the knob to the right end to send, so a payment can't go out on a
 /// stray touch. Letting go before the end springs it back; after a send that didn't go through
 /// (an error, the small-amount question) it resets by itself. VoiceOver gets a plain activate
-/// action. With `requiresSlide: false` it's an ordinary tap in the same look (KasSigner's "Build
-/// Unsigned Transaction", which moves nothing by itself).
+/// action. With `requiresSlide: false` it's an ordinary tap in the same look, for a step that
+/// moves nothing by itself.
 struct SendActionButton: View {
     let title: LocalizedStringKey
     let isBusy: Bool
@@ -1246,7 +1189,7 @@ struct SwipeUpLabels {
     var working: LocalizedStringKey = "Sending"
     var workingDetail: LocalizedStringKey = "Broadcasting to the Kaspa BlockDAG..."
     var done: LocalizedStringKey = "Sent"
-    var hint: LocalizedStringKey = "Let go past halfway to send."
+    var hint: LocalizedStringKey = "Swipe up, then let go to send."
     /// Before the recipient line: "to kaspa:..." or "for name.kachat".
     var recipientWord = "to"
     var failedFallback = "The send didn't go out."
@@ -1257,7 +1200,7 @@ struct SwipeUpLabels {
         working: "Buying",
         workingDetail: "Sending the purchase to the Kaspa BlockDAG...",
         done: "Name Bought",
-        hint: "Let go past halfway to buy.",
+        hint: "Swipe up, then let go to buy.",
         recipientWord: "for",
         failedFallback: "The purchase didn't go out."
     )
@@ -1268,7 +1211,7 @@ struct SwipeUpLabels {
             working: "Sending",
             workingDetail: "Broadcasting to the Kaspa BlockDAG...",
             done: done,
-            hint: "Let go past halfway to confirm.",
+            hint: "Swipe up, then let go to confirm.",
             recipientWord: "for",
             failedFallback: "The transaction didn't go out."
         )
@@ -1278,7 +1221,7 @@ struct SwipeUpLabels {
         working: "Claiming",
         workingDetail: "Committing to the Kaspa BlockDAG...",
         done: "Claim Started",
-        hint: "Let go past halfway to claim.",
+        hint: "Swipe up, then let go to claim.",
         recipientWord: "for",
         failedFallback: "The claim didn't start."
     )
@@ -1286,7 +1229,7 @@ struct SwipeUpLabels {
 
 /// A send screen's scroll view with "Swipe up to Send" pinned at the bottom. Press the bar and
 /// drag it up: the whole screen moves up with the finger, and the send screen rises from below
-/// in its place. Letting go past halfway up sends: the send screen takes over the full screen,
+/// in its place. Letting go about a third of the way up sends: the send screen takes over the full screen,
 /// a BlockDAG runs across it while the transaction goes out, and then it shows the
 /// confirmation (`sent`). Letting go sooner springs it back. A send that fails or never starts
 /// shows "Failed" there with the screen's error, and Try Again brings the form back as it was.
@@ -1329,7 +1272,7 @@ struct SwipeUpToSendScrollView<Content: View>: View {
 
     /// How far the screen has been pushed up.
     @State private var lift: CGFloat = 0
-    /// Past halfway: letting go sends.
+    /// Past the threshold: letting go sends.
     @State private var armed = false
     @State private var phase: Phase = .form
     /// The DAG gets a moment on screen before the confirmation, however fast the send was.
@@ -1343,16 +1286,19 @@ struct SwipeUpToSendScrollView<Content: View>: View {
     @State private var confirmed = false
     /// The send ended without a transaction: the sending screen shows "Failed".
     @State private var failed = false
+    /// Face ID is up for a send. Until it answers the screen is still the form, so without this a
+    /// second swipe (or VoiceOver activation) in that moment asked again and could send twice.
+    @State private var authPending = false
 
     private static var barHeight: CGFloat { 64 }
     private static var settle: Animation { .spring(response: 0.45, dampingFraction: 0.86) }
 
-    private var active: Bool { isEnabled && !isBusy }
+    private var active: Bool { isEnabled && !isBusy && !authPending }
 
     var body: some View {
         GeometryReader { geometry in
             let height = geometry.size.height + geometry.safeAreaInsets.bottom
-            let threshold = max(160, height * 0.5)
+            let threshold = max(120, height * 0.3)
             ZStack(alignment: .top) {
                 form(threshold: threshold)
                     .offset(y: -lift)
@@ -1456,9 +1402,10 @@ struct SwipeUpToSendScrollView<Content: View>: View {
                     }
                 }
                 .onEnded { _ in
-                    guard phase == .form else { return }
+                    // a touch while Face ID is up leaves the waiting send as it is
+                    guard phase == .form, !authPending else { return }
                     if armed && active {
-                        startSending()
+                        authenticateThenSend()
                     } else {
                         armed = false
                         withAnimation(Self.settle) { lift = 0 }
@@ -1473,11 +1420,31 @@ struct SwipeUpToSendScrollView<Content: View>: View {
         .accessibilityAddTraits(.isButton)
         .accessibilityAction {
             guard active, phase == .form else { return }
-            startSending()
+            authenticateThenSend()
         }
     }
 
+    /// Kaspa never leaves on the swipe alone: Face ID first, on every Send Kaspa screen. Declined,
+    /// the screen settles back with everything still filled in.
+    private func authenticateThenSend() {
+        guard !authPending, phase == .form else { return }
+        authPending = true
+        DeviceAuth.authenticate(
+            reason: AppLocalization.string("Confirm sending Kaspa"),
+            onSuccess: {
+                startSending()
+                authPending = false
+            },
+            onFailure: {
+                authPending = false
+                armed = false
+                withAnimation(Self.settle) { lift = 0 }
+            }
+        )
+    }
+
     private func startSending() {
+        guard phase == .form else { return }
         armed = false
         dagShown = false
         sendStarted = isBusy
@@ -1547,6 +1514,9 @@ private struct SendProgressScreen: View {
     /// Sent or failed: the DAG steps back and the outcome takes over.
     private var finished: Bool { done || failure != nil }
 
+    /// It may have gone through, so there's nothing to try again.
+    private var outcomeUnknown: Bool { failure == SendOutcomeUnknownError.message }
+
     private var explorerURL: URL? {
         sent.flatMap { AppSettings.load().kaspaExplorer.txURL(for: $0.txId) }
     }
@@ -1564,6 +1534,11 @@ private struct SendProgressScreen: View {
                         .font(.scaled(size: 72, weight: .semibold))
                         .foregroundStyle(.black, Color.accentColor)
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
+                } else if outcomeUnknown {
+                    Image(systemName: "questionmark.circle.fill")
+                        .font(.scaled(size: 72, weight: .semibold))
+                        .foregroundStyle(.black, Color.orange)
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
                 } else if failure != nil {
                     Image(systemName: "xmark.circle.fill")
                         .font(.scaled(size: 72, weight: .semibold))
@@ -1573,7 +1548,7 @@ private struct SendProgressScreen: View {
             }
 
             VStack(spacing: 6) {
-                Text(done ? labels.done : failure != nil ? "Failed"
+                Text(done ? labels.done : outcomeUnknown ? "Not confirmed" : failure != nil ? "Failed"
                      : (isSending ? labels.working : (armed ? labels.release : "Keep Swiping")))
                     .font(.largeTitle.weight(.bold))
                 if let amount = sent?.amountSompi ?? amountSompi {
@@ -1606,7 +1581,7 @@ private struct SendProgressScreen: View {
                     Image(systemName: "exclamationmark.triangle.fill")
                 }
                 .font(.subheadline)
-                .foregroundColor(.red)
+                .foregroundColor(outcomeUnknown ? .orange : .red)
                 .padding(14)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(sendKaspaGlass(cornerRadius: 14))
@@ -1661,7 +1636,7 @@ private struct SendProgressScreen: View {
 
             Spacer(minLength: 0)
 
-            if done {
+            if done || outcomeUnknown {
                 Button(action: onDone) {
                     Text("Done")
                         .font(.headline)
@@ -1848,115 +1823,8 @@ struct SelectablePill: View {
     }
 }
 
-/// The From section every send screen starts with, so it is always plain which address the
-/// Kaspa leaves from: Chatting Address (the default) or Choose an Address (any of your
-/// addresses, each marked used or unused), and the chosen address with its balance.
-struct SendFromSection: View {
-    @Binding var source: SendSource
-    /// The chosen address's balance, loaded here (nil while it loads) - the screen's Available.
-    @Binding var availableSompi: UInt64?
-    /// Opened from one address's own page (its history's Send): that address only, no choice.
-    var isLocked: Bool = false
-    @State private var showPicker = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("From")
-                .font(.caption.weight(.semibold))
-                .foregroundColor(.secondary)
-                .textCase(.uppercase)
-            if !isLocked {
-                HStack(spacing: 10) {
-                    SelectablePill(title: "Chatting Address", selected: source == .chatting) {
-                        source = .chatting
-                    }
-                    SelectablePill(title: "Choose an Address", selected: source != .chatting) {
-                        showPicker = true
-                    }
-                }
-            }
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(verbatim: title)
-                        .font(.subheadline.weight(.semibold))
-                    if let address = source.address {
-                        Text(verbatim: "\(address.prefix(14))...\(address.suffix(6))")
-                            .font(.caption.monospaced())
-                            .foregroundColor(.secondary)
-                    }
-                }
-                Spacer()
-                if let availableSompi {
-                    Text(verbatim: "\(KaspaUnit.plain(availableSompi)) \(KaspaUnit.symbol)")
-                        .font(.subheadline.monospacedDigit().weight(.semibold))
-                } else {
-                    ProgressView().controlSize(.small)
-                }
-            }
-            .padding(12)
-            .background(sendKaspaGlass(cornerRadius: 14))
-        }
-        .sheet(isPresented: $showPicker) {
-            OwnAddressPicker(title: "Send From", selected: source.address) { picked in
-                source = picked
-            }
-        }
-        .task(id: source) {
-            availableSompi = nil
-            guard let address = source.address else { return }
-            let utxos = (try? await NodePoolService.shared.getUtxosByAddresses([address])) ?? []
-            guard !Task.isCancelled else { return }
-            availableSompi = utxos.reduce(UInt64(0)) { $0 + $1.amount }
-        }
-    }
-
-    private var title: String {
-        switch source {
-        case .chatting: return AppLocalization.string("Chatting Address")
-        case .spending(_, _, let label): return label
-        }
-    }
-}
-
-/// Your addresses to pick from - the chatting address, then the spending addresses (the ones
-/// Manage Addresses shows, plus hidden ones holding Kaspa) - each with its name, balance and
-/// whether it was ever used (a balance means used, else the cached answer, else a history
-/// lookup, eight at a time; "Checking" until answered, never a possibly-wrong "Unused").
-/// A send's Choose an Address, as a sheet (`OwnAddressPicker`).
-struct OwnAddressPicker: View {
-    let title: LocalizedStringKey
-    let selected: String?
-    /// The .kachat market signs its funding inputs as plain P2PK, which a quantum-safe (KIP-22)
-    /// address can't be - its picker leaves them out.
-    var excludeQuantum: Bool = false
-    let onPick: (SendSource) -> Void
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            ScrollView {
-                OwnAddressList(selected: selected, excludeQuantum: excludeQuantum) { picked in
-                    onPick(picked)
-                    dismiss()
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-            }
-            .navigationTitle(title)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
-                }
-            }
-        }
-        .presentationDetents([.medium, .large])
-        .presentationDragIndicator(.visible)
-    }
-}
-
-/// The address list itself, to sit on a screen (a send's From step) or in `OwnAddressPicker`'s
-/// sheet: the chatting address, then the spending addresses,
+/// The address list itself, to sit on a screen (a send's From step): the chatting address, then
+/// the spending addresses,
 /// as tappable cards with Used / Unused and the balance; the picked one has a check.
 struct OwnAddressList: View {
     let selected: String?

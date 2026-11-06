@@ -197,6 +197,14 @@ struct ChessTournamentGame: Identifiable, Equatable {
         return sideToMove
     }
 
+    /// The instant (chain time) the side to move runs out of clock, while the game is on: the
+    /// last event, plus this move's allowance, plus what is left on that side's clock.
+    var flagAt: Int64? {
+        guard !isOver else { return nil }
+        return lastEventAt + ChessTournamentCodec.allowanceMs(ply: moves.count + 1, startedAt: startedAt)
+            + ChessTournamentCodec.clockMs - usedMs(sideToMove)
+    }
+
     /// Over on the board, or on the clock with the claim still to come.
     func isDecided(at now: Int64) -> Bool { isOver || flaggedSide(at: now) != nil }
 

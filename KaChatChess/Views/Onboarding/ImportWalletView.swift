@@ -31,9 +31,9 @@ struct ImportLengthStep: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("Choose seed phrase length")
+                    Text("Choose 12 or 24 words")
                         .font(.title2.weight(.bold))
-                    Text("How many words is the seed phrase you're importing?")
+                    Text("How many words are you importing?")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                     SeedLengthButton(count: 12, title: "12 words", selection: $wordCount)
@@ -91,25 +91,29 @@ struct ImportWalletView: View {
     private var canImport: Bool { allWordsValid && !alias.isEmpty }
 
     /// Fills the slots from a phrase on the clipboard: 12 or 24 words, any spacing or line
-    /// breaks, numbering like "1." tolerated. Anything else is refused with a message, and the
-    /// clipboard is cleared once the words are in - a seed does not belong there.
+    /// breaks, numbering like "1." tolerated. Anything else is refused with a message that never
+    /// repeats what was pasted, and the clipboard is cleared as soon as it is read, whether or not
+    /// the words were accepted - secret words do not belong there either way.
     private func pasteSeedPhrase() {
         guard let raw = UIPasteboard.general.string else {
             error = "Nothing to paste."
             return
         }
+        UIPasteboard.general.string = ""
         let pasted = raw
             .lowercased()
             .split(whereSeparator: { $0.isWhitespace || $0 == "," })
             .map { String($0).trimmingCharacters(in: CharacterSet(charactersIn: ".)")) }
             .filter { !$0.isEmpty && !$0.allSatisfy(\.isNumber) }
         guard pasted.count == 12 || pasted.count == 24 else {
-            error = "A recovery phrase is 12 or 24 words - the clipboard holds \(pasted.count)."
+            error = "You need 12 or 24 words - the clipboard holds \(pasted.count)."
             return
         }
         let unknown = pasted.filter { !BIP39.shared.isValidWord($0) }
         guard unknown.isEmpty else {
-            error = "Not a recovery phrase word: \(unknown.prefix(3).joined(separator: ", "))."
+            error = unknown.count == 1
+                ? "One of the pasted words isn't a valid word. Check your copy and try again."
+                : "\(unknown.count) of the pasted words aren't valid words. Check your copy and try again."
             return
         }
         seedWordCount = pasted.count
@@ -117,14 +121,13 @@ struct ImportWalletView: View {
         for (index, word) in pasted.enumerated() { filled[index] = word }
         words = filled
         error = nil
-        UIPasteboard.general.string = ""
         Haptics.success()
     }
 
     var body: some View {
         VStack(spacing: 12) {
             HStack {
-                Text("Enter your recovery phrase")
+                Text("Enter your 12 or 24 words")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
                 Spacer()
@@ -191,7 +194,7 @@ struct ImportWalletView: View {
     private func advanceToPassphrase() {
         guard canImport else { return }
         guard BIP39.shared.validateMnemonic(seedPhraseText) else {
-            error = "This recovery phrase is invalid. Double-check the words - the last word encodes a checksum, so one wrong word fails validation."
+            error = "These words are invalid. Double-check the words - the last word encodes a checksum, so one wrong word fails validation."
             return
         }
         showPassphraseStep = true

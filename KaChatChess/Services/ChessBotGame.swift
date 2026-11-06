@@ -164,20 +164,24 @@ final class ChessBotGame: ObservableObject {
     }
 
     /// One broadcast transaction, with the retries a send needs while the change of the last
-    /// transaction is not spendable yet (the arena's sends do the same). Returns the error to
-    /// show, or nil once it is sent.
+    /// transaction is not spendable yet (the arena's sends do the same). Only that kind of error
+    /// is retried: no KAS on the chatting address, or a send whose outcome is unknown (a second
+    /// stamp of the same game), fails at once. Never deferred to a background retry, so nil -
+    /// "stamped" - means the transaction really went out. Returns the error to show otherwise.
     private func send(_ message: ChessBotMessage) async -> String? {
         let content = ChessBotCodec.encode(message)
         var attempt = 0
         while true {
             do {
-                try await PublicChatService.shared.sendPublicChat(channel: ChessBotCodec.channel, content: content)
-                return nil
+                let txId = try await PublicChatService.shared.sendPublicChat(
+                    channel: ChessBotCodec.channel, content: content, deferNoInputRetry: false
+                )
+                return txId == nil ? "The result was not sent." : nil
             } catch {
                 attempt += 1
-                if attempt > 5 {
-                    AppLog.log("[Chess] Bot game stamp failed after retries: %@", error.localizedDescription)
-                    return error.localizedDescription
+                if attempt > 5 || !PublicChatService.isRetryableSendError(error) {
+                    AppLog.log("[Chess] Bot game stamp failed: %@", error.localizedDescription)
+                    return PublicChatService.friendlySendErrorMessage(for: error)
                 }
                 try? await Task.sleep(nanoseconds: 1_200_000_000)
             }
