@@ -116,21 +116,3 @@ private struct ChessLeaderboardPage: View {
         .onDisappear { service.release() }
     }
 }
-
-/// The Wallet tab: the one address every move is signed by - its balance, history, Receive
-/// and Send.
-struct ChessWalletView: View {
-    @EnvironmentObject private var walletManager: WalletManager
-
-    var body: some View {
-        NavigationStack {
-            if let address = walletManager.currentWallet?.publicAddress {
-                ChattingAddressManageView(address: address)
-                    .toolbar {
-                        ToolbarItem(placement: .navigationBarLeading) { ConnectionStatusIndicator() }
-                        ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
-                    }
-            }
-        }
-    }
-}

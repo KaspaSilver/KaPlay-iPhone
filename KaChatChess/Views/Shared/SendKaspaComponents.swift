@@ -2,7 +2,8 @@ import SwiftUI
 import UIKit
 
 // The pieces every Send Kaspa screen is built from, so they look and behave the same as KaPay's
-// (copied from KaPay's SendKaspaComponents.swift): the Wallet tab's Send Kaspa and Compound UTXOs.
+// (copied from KaPay's SendKaspaComponents.swift): the Wallet tab's Send Kaspa, an address's Send,
+// a contact's, paying a payment request, Compound UTXOs and the .kachat transactions.
 // A send is steps: who to (the recipient card), how much (the app's own keypad), then a review
 // where only the fee and coin control can change before swiping up to send.
 
@@ -107,7 +108,7 @@ struct SendRecipientCard: View {
         }
     }
 
-    /// Paste, Scan QR: a labelled pill under the field.
+    /// Paste, Scan QR: a labelled pill under the field. No Contacts: KaPlay keeps none (KaChat and KaPay do).
     private func inputPill(_ title: LocalizedStringKey, systemImage: String, action: @escaping () -> Void) -> some View {
         Button {
             Haptics.impact(.light)
@@ -1259,6 +1260,8 @@ struct SwipeUpToSendScrollView<Content: View>: View {
     /// The screen's error for a send that failed, shown under "Failed".
     var failureMessage: String?
     var labels: SwipeUpLabels = .send
+    /// What the Face ID prompt says, when this screen does something other than send Kaspa.
+    var authReason: String? = nil
     /// For an action that ends without a `SentTransaction` (a .kachat claim): true once it
     /// worked, and `outcome` shows under the title in place of the transaction.
     var succeeded = false
@@ -1430,7 +1433,7 @@ struct SwipeUpToSendScrollView<Content: View>: View {
         guard !authPending, phase == .form else { return }
         authPending = true
         DeviceAuth.authenticate(
-            reason: AppLocalization.string("Confirm sending Kaspa"),
+            reason: authReason ?? AppLocalization.string("Confirm sending Kaspa"),
             onSuccess: {
                 startSending()
                 authPending = false
@@ -1823,7 +1826,8 @@ struct SelectablePill: View {
     }
 }
 
-/// The address list itself, to sit on a screen (a send's From step): the chatting address, then
+/// The address list itself, to sit on a screen (a send's From step, Request Payment's "Where do
+/// you want to be paid?"): the chatting address, then
 /// the spending addresses,
 /// as tappable cards with Used / Unused and the balance; the picked one has a check.
 struct OwnAddressList: View {

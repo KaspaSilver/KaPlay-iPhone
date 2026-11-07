@@ -293,6 +293,7 @@ final class WalletManager: ObservableObject {
                     isBalanceRefreshing = false
                     isLoggedOut = true
                     ContactsManager.shared.setActiveWalletAddress(nil)
+                    GlobalNotificationCenter.shared.reload()
                     await MessageStore.shared.setCurrentWallet(nil)
                     PublicChatService.shared.setCurrentWallet(nil)
                     SharedDataManager.syncWalletAddressForExtension()
@@ -334,6 +335,7 @@ final class WalletManager: ObservableObject {
                 migrateSpendingBoundsIfNeeded()
                 isBalanceRefreshing = true
                 ContactsManager.shared.setActiveWalletAddress(canonicalWallet.publicAddress)
+                GlobalNotificationCenter.shared.reload()
                 ChatService.shared.loadChatListSnapshot(for: canonicalWallet.publicAddress)
                 SharedDataManager.syncWalletAddressForExtension()
         NotificationCenter.default.post(name: .settingsDidChange, object: nil)
@@ -361,6 +363,7 @@ final class WalletManager: ObservableObject {
             isBalanceRefreshing = false
             UserDefaults.standard.removeObject(forKey: logoutFlagKey)
             ContactsManager.shared.setActiveWalletAddress(nil)
+            GlobalNotificationCenter.shared.reload()
             await MessageStore.shared.setCurrentWallet(nil)
             PublicChatService.shared.setCurrentWallet(nil)
             SharedDataManager.syncWalletAddressForExtension()
@@ -506,6 +509,7 @@ final class WalletManager: ObservableObject {
         isLoggedOut = false
         UserDefaults.standard.removeObject(forKey: logoutFlagKey)
         ContactsManager.shared.setActiveWalletAddress(wallet.publicAddress)
+        GlobalNotificationCenter.shared.reload()
         // Switch MessageStore to this wallet's store FIRST
         // This must happen before resetForNewWallet() to avoid clearing the wrong store
         await MessageStore.shared.setCurrentWallet(wallet.publicAddress)
@@ -561,7 +565,10 @@ final class WalletManager: ObservableObject {
         // sweep as Manage Addresses' Discover Addresses - so balances and change rotation are
         // right without anyone knowing to tap it (owner's call, 2026-10-21). Only this path: a
         // typed-in recovery phrase; creating or switching accounts doesn't scan.
-        Task { await self.discoverSpendingAddresses() }
+        Task {
+            await self.discoverSpendingAddresses()
+            await HotWalletBalance.shared.refresh(force: true)
+        }
         return wallet
     }
 
@@ -611,6 +618,8 @@ final class WalletManager: ObservableObject {
             AccountBackupStatus.shared.forget(walletAddressToDelete)
             for address in Self.accountAddressVariants(walletAddressToDelete) { Self.removeSpendingData(forAccount: address) }
             // its .kachat reminders would keep firing for names this phone no longer holds - on
+            // both networks' addresses - and its contacts and bell go with it, as in KaPay
+            await Self.removeWalletTabData(forAccount: walletAddressToDelete)
         }
 
         // The Secure Enclave key wraps every saved account's snapshot (and the device id, the
@@ -652,6 +661,7 @@ final class WalletManager: ObservableObject {
             ContactsManager.shared.deletePersistedContacts(forWalletAddress: walletAddressToDelete)
         }
         ContactsManager.shared.setActiveWalletAddress(nil)
+        GlobalNotificationCenter.shared.reload()
 
         // Switch MessageStore back to default store (no wallet)
         await MessageStore.shared.setCurrentWallet(nil)
@@ -678,6 +688,7 @@ final class WalletManager: ObservableObject {
         isLoggedOut = true
         UserDefaults.standard.set(true, forKey: logoutFlagKey)
         ContactsManager.shared.setActiveWalletAddress(nil)
+        GlobalNotificationCenter.shared.reload()
 
         await MessageStore.shared.setCurrentWallet(nil)
         PublicChatService.shared.setCurrentWallet(nil)
@@ -794,6 +805,7 @@ final class WalletManager: ObservableObject {
                 }
                 AccountBackupStatus.shared.forget(account.publicAddress)
                 for address in Self.accountAddressVariants(account.publicAddress) { Self.removeSpendingData(forAccount: address) }
+                await Self.removeWalletTabData(forAccount: account.publicAddress)
                 if let cached = cachedPrivateKey, Self.isSameAccount(cached.address, account.publicAddress) {
                     cachedPrivateKey = nil
                 }
@@ -843,6 +855,7 @@ final class WalletManager: ObservableObject {
 
         AccountBackupStatus.shared.forget(account.publicAddress)
         for address in Self.accountAddressVariants(account.publicAddress) { Self.removeSpendingData(forAccount: address) }
+        await Self.removeWalletTabData(forAccount: account.publicAddress)
         removeSavedAccountFromStorage(account)
         currentWallet = nil
         cachedPrivateKey = nil
@@ -856,6 +869,7 @@ final class WalletManager: ObservableObject {
         ChatService.shared.resetForNewWallet(skipStoreClear: true)
         ContactsManager.shared.deleteAllContacts()
         ContactsManager.shared.setActiveWalletAddress(nil)
+        GlobalNotificationCenter.shared.reload()
         SharedDataManager.clearAllSharedData()
         SharedDataManager.syncWalletAddressForExtension()
         NotificationCenter.default.post(name: .settingsDidChange, object: nil)
@@ -1978,5 +1992,17 @@ enum LaunchTrace {
         thread.name = "kachat.launch-watchdog"
         thread.qualityOfService = .utility
         thread.start()
+    }
+}
+
+extension WalletManager {
+    /// What the Wallet tab keeps for one account besides its spending data (KaPay's
+    /// `removeLocalData` takes the same, less contacts, which KaPlay has none of): its bell history
+    /// and its .kachat name reminders, on both networks' addresses.
+    static func removeWalletTabData(forAccount publicAddress: String) async {
+        for address in accountAddressVariants(publicAddress) {
+            await KachatNameReminders.removeAll(forWallet: address)
+            GlobalNotificationCenter.removeAllData(forWalletAddress: address)
+        }
     }
 }

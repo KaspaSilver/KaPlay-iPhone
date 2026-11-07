@@ -9,6 +9,8 @@ import CryptoKit
 extension ChatService {
     func handleUtxoChangeNotification(payload: Data) {
         guard let parsed = GrpcNotificationParser.parseUtxosChangedNotification(payload) else { return }
+        // the Wallet tab's bell and balances (KaPay's AddressActivityNotifier, for the chatting address)
+        WalletReceiptNotifier.shared.handle(parsed)
         enqueueUtxoNotification(parsed)
         processQueuedUtxoNotificationsIfNeeded()
     }

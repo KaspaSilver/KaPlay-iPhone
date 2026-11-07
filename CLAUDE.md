@@ -13,12 +13,31 @@ Tabs (`ChessMainTabView.Tab`): Play, Leaderboard, Wallet (`Views/Wallet/WalletVi
 Settings. Play opens on `GamesView`, a card per game; Chess is the only one so far and opens
 `ChessHomeView`. A new game is one more card there.
 
-The Wallet tab (`ChattingAddressManageView`) is laid out like KaPost's Wallet screen
-(`KaPostWalletView`): the total (tap to copy), split into Chatting and Spending, then Send, Receive
-and More (Compound UTXOs, always listed and greyed out under two coins, the keys, the explorer), the Backup
-Hygiene card when due, then the chatting address's history. KaPlay uses only the chatting address,
-the one it plays from: Send leaves from it and Receive is paid to it. Spending addresses only count
-in the total; they're managed in KaChat and KaPay.
+The Wallet tab (`ChessWalletView`, `Views/Wallet/WalletViews.swift`) is KaPay's Wallet tab
+(`ProfileView` there; every app has KaPay's full wallet, owner's call 2026-11-07), in KaPlay's look:
+the fixed title with the backup banner, `BalanceToolbarLabel` (the chatting address) in the bar,
+`ConnectionStatusIndicator` left and the bell right. The total balance split into Chatting and
+Spending (`WalletBalanceCard`, the spending part from `HotWalletBalance`), Send, Receive (a fresh
+address, `ReceiveKaspaQRView`) and Request (`CreatePaymentRequestView`, `Views/Shared/PaymentRequestViews.swift`:
+Fresh Address or Choose an Address), Backup Hygiene when due, the Manage Addresses square
+(`Views/Wallet/ManageAddressesView.swift`: spending addresses numbered from #1 with
+`WalletManager.addressNumber`, Discover Addresses, Address Visibility, each address's history,
+UTXOs, Domains, Send, compound and private key; its Chatting Address row opens
+`ChattingAddressManageView` with Address Actions for the keys and explorer, and Compound under UTXOs)
+and the Chatting Address square (its QR), then Your Domains (`KNSDomainsListView`: .kachat, .kas,
+.k, .kaspa; a .kas domain's detail has Set as Primary, Customize Profile (`KNSProfileEditorSheet`)
+and Send (`KNSDomainSendView`); .kachat names open `KachatLiveNameDetail`, `Views/Ecosystem/`),
+and Help (`ProfileHelpView`, the .kachat names guide). Left out from KaPay: Portfolio, Cold Storage,
+the .kachat marketplace (so Your Domains > .kachat has no Inscribe, and transactions open the
+explorer with no Add to Portfolio) and Contacts (owner's call, 2026-11-07: someone who wants saved
+contacts uses KaChat or KaPay, so KaPlay has no Address Book, Contacts pill or contact photos).
+
+Account removal clears the bell and .kachat reminders
+(`WalletManager.removeWalletTabData`). The bell (`GlobalNotificationCenter`) lists .kachat news
+(`KachatNamesNotifier`) and Kaspa received on the chatting address from someone else
+(`WalletReceiptNotifier`, fed each live UTXO batch; KaPlay's subscription is the chatting address
+only, so spending addresses get no Received rows). A row opens the address
+(`OwnAddressHistorySheet`) or the name.
 
 Every menu's title is the same as KaPosts': big and fixed above the content that scrolls
 (`fixedScreenTitle`), with the balance alone in the center of the bar (`BalanceToolbarLabel`). The
@@ -103,14 +122,15 @@ KaPay's file of the same name. Change those pieces, not one screen, and keep the
 KaPay's.
 
 1. **To**: `SendStepScreen` + `SendStepQuestion` ("Who are you sending to?") + `SendRecipientCard`
-   (address or name; Paste and Scan QR pills under the field - no Addresses pill, KaPlay has no
-   Address Book). Cancel sits at the bottom beside Continue (`SendContinueButton`) on a first
+   (address or name; Paste and Scan QR pills under the field).
+   Cancel sits at the bottom beside Continue (`SendContinueButton`) on a first
    step; later steps have Back and Cancel in the header (`SendStepHeader`).
 2. **From**: "Where are you sending from?" with the Chatting Address and Choose an Address pills.
    Chatting Address shows its card with the balance; Choose an Address lists every address right on
    the step (`OwnAddressList`: cards with Used / Unused and the balance, the picked one checked
    and outlined), and Continue waits for a pick. Skipped when the send's From is fixed
-   (`lockedSource`).
+   (`lockedSource`: an address's own Send). Moves, joins, claims and bot stamps never come here:
+   they always sign from the chatting address.
 3. **Amount**: `KaspaKeypadAmountEntry`, the app's own number pad (`KaspaKeypad`,
    `KeypadAmountText`), so no system keyboard covers the screen; a "To" chip and a "From" chip,
    the KAS / currency switch and Max. The From address's balance (loaded by the screen's
@@ -121,10 +141,13 @@ KaPay's.
    Total count it (`SendFeeEstimate`, as in KaChat). The fee's Edit (`onEditFee`) opens `SendFeeEditorScreen` (the fee
    typed on the keypad, never under the network's minimum); Confirm goes back to the review.
 
-The only send screen is `WithdrawKaspaView` (`Views/Wallet/WalletViews.swift`): the Wallet tab's
-Send, and Compound UTXOs, which opens on the review. A pre-filled recipient opens on From. The
-Wallet tab's Send is locked to the Chatting Address (`lockedSource: .chatting`: the Wallet is the one
-address every move is signed by), so it goes To → Amount → Review.
+Where each screen uses them: `WithdrawKaspaView` (`Views/Wallet/WalletViews.swift`) is the Wallet
+tab's Send (To → From → Amount → Review), the chatting address's own Send (From fixed), a pasted payment request (its address and amount fixed) and Compound UTXOs, which opens on the
+review. A pre-filled recipient opens on From. A spending address's Send and compound are
+`SpendingAddressWithdrawView` (Manage Addresses). Coin Control greys out what a send can't spend
+(`CoinControlView.hotWalletReason`: the chatting address's rule, or a spending address's, which can
+spend a mature mining reward). The .kachat transactions are `KachatTxSheet` (swipe up with its own
+Face ID reason, `authReason`).
 Prices come from `KaspaPriceStore` (KaPay's pieces read `PortfolioViewModel`). Your main address
 is the "Chatting Address", as in KaPay.
 

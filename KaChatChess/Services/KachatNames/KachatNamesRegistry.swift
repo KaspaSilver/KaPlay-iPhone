@@ -182,6 +182,8 @@ final class KachatNamesRegistry: ObservableObject {
                 revision += 1
                 revisionBumpedAt = Date()
             }
+            // what changed for this wallet's names and offers, into the Wallet tab's bell
+            Task { await KachatNamesNotifier.shared.check() }
         } catch {
             let message = error.localizedDescription
             lastError = message
@@ -336,6 +338,17 @@ final class KachatNamesRegistry: ObservableObject {
     }
 
     // MARK: - Reads
+
+    /// An indexer's answer is only a claim. Before a payment trusts it, the chain has to hold the name
+    /// record it describes: the script commits to the name and its owner, and carries the registry's
+    /// covenant id, so an indexer can't point a name at another address. Throws if it doesn't. A
+    /// record read from the chain itself needs no second look.
+    func confirmOnChain(_ n: KachatNames.NameInfo) async throws {
+        guard case .indexer? = source else { return }
+        guard let fields = n.fields else { throw KachatNames.Failure("the indexer's record can't be checked") }
+        let m = try await service.loadManifest()
+        _ = try await service.liveRegistryUtxo(script: m.name.script(fields.encoded), outpoint: n.outpoint)
+    }
 
     func lookup(_ raw: String) async throws -> KachatNames.Lookup {
         try await prepare()
@@ -1451,4 +1464,238 @@ final class KachatSocialImageResolver: ObservableObject {
 
 // MARK: - The Profile bell: what happened to your names and offers
 
+/// Turns registry changes into Wallet-tab bell rows (`GlobalNotificationCenter`, source `.kachat`),
+/// so a missed push still leaves a trace: an offer on one of your names, a name sold or
+/// reclaimed, its renewal window opening, its expiry and lapse, and what became of your own
+/// offers (accepted, declined, expired and returned). It compares what the registry says now
+/// with what it saw on the last check (persisted per wallet), after every registry refresh.
+/// The first check of a wallet only records where things stand.
+@MainActor
+final class KachatNamesNotifier {
+    static let shared = KachatNamesNotifier()
+    private init() {}
 
+    private struct Snapshot: Codable {
+        struct Name: Codable {
+            var expiresAt: Int64
+            var renewNoted = false
+            var graceNoted = false
+            var lapsedNoted = false
+        }
+        /// the names this wallet owned at the last check
+        var names: [String: Name] = [:]
+        /// open offers on those names, by id
+        var offersOnMine: Set<String> = []
+        /// this wallet's own open offers: id -> name
+        var myOffers: [String: String] = [:]
+    }
+
+    private var checking = false
+    /// Offers this person closed themselves (Withdraw, Refund): not news when they disappear.
+    var selfClosedOffers: Set<String> = []
+
+    private func key(_ wallet: String) -> String { "kachatNamesNotifier.\(wallet)" }
+
+    func check() async {
+        guard KachatNamesService.isLaunched, !checking,
+              let me = KachatNamesActions.shared.myKey, let wallet = KachatNamesActions.shared.myAddress,
+              let p = KachatNamesService.shared.manifest?.params else { return }
+        checking = true
+        defer { checking = false }
+        let registry = KachatNamesRegistry.shared
+        // every address of this wallet, not only the main one: a name claimed with Buy From
+        // gets its notices too (IOS-085 / XP-024)
+        guard let own = try? await KachatNamesActions.shared.ownNamesAndOffers(heldOnly: false) else { return }
+        let owned = own.names
+        let myOpenOffers = own.offers
+        let ownKeys = KachatNamesActions.shared.allOwnKeys
+        var offersOnMine: [KachatNames.OfferInfo] = []
+        for n in owned where n.status(graceMs: p.graceMs) == .active {
+            offersOnMine += ((try? await registry.offers(for: n.name)) ?? []).filter { ownKeys.contains($0.seller) }
+        }
+        // The indexer pushes name reminders only to the chatting address: for a name on another
+        // address of this wallet the phone schedules its own (XP-024).
+        // a different wallet signed in meanwhile: this answer isn't its
+        guard KachatNamesActions.shared.myAddress == wallet else { return }
+        await KachatNameReminders.schedule(for: owned.filter { $0.owner != me }, params: p, wallet: wallet)
+
+        let old: Snapshot? = UserDefaults.standard.data(forKey: key(wallet)).flatMap { try? JSONDecoder().decode(Snapshot.self, from: $0) }
+        let quiet = old == nil // the first check only records where things stand
+        var new = Snapshot()
+        let now = KachatNames.nowMs()
+
+        func post(_ id: String, _ name: String, _ title: String, _ body: String) {
+            guard !quiet else { return }
+            GlobalNotificationCenter.shared.record(id: "kachat-\(id)", source: .kachat, title: title, body: body,
+                                                   timestamp: now, targetId: name)
+        }
+        func S(_ key: String, _ args: CVarArg...) -> String {
+            KaspaUnit.label(String(format: AppLocalization.string(key), locale: AppLocalization.locale, arguments: args))
+        }
+
+        // Your names: renewal open, expired (grace), lapsed - once per paid period.
+        for n in owned {
+            let display = "\(n.name).kachat"
+            var s = old?.names[n.name].flatMap { $0.expiresAt == n.expiresAt ? $0 : nil } ?? Snapshot.Name(expiresAt: n.expiresAt)
+            switch n.status(graceMs: p.graceMs, nowMs: now) {
+            case .active:
+                if n.renewOpen(p, nowMs: now), !s.renewNoted {
+                    post("renew-\(n.name)-\(n.expiresAt)", n.name, S("Renew %@", display),
+                         S("Renewal is open: renew it before %@ to keep it.", KachatNamesActions.dayString(n.expiresAt)))
+                    s.renewNoted = true
+                }
+            case .grace:
+                s.renewNoted = true
+                if !s.graceNoted {
+                    post("grace-\(n.name)-\(n.expiresAt)", n.name, S("%@ has expired", display),
+                         S("Renew it before %@ or anyone can claim it.", KachatNamesActions.dayString(n.expiresAt + p.graceMs)))
+                    s.graceNoted = true
+                }
+            case .lapsed:
+                s.renewNoted = true
+                s.graceNoted = true
+                if !s.lapsedNoted {
+                    post("lapsed-\(n.name)-\(n.expiresAt)", n.name, S("%@ is no longer yours", display),
+                         AppLocalization.string("It expired and wasn't renewed, so it's now available to anyone in the marketplace. Your bond comes back to you when someone claims it."))
+                    s.lapsedNoted = true
+                }
+            }
+            new.names[n.name] = s
+        }
+
+        // Names that left this wallet: sold, bought through an offer, or reclaimed by someone.
+        // A transfer or release is your own doing and needs no notice.
+        for name in old.map({ Array($0.names.keys) }) ?? [] where new.names[name] == nil {
+            let history = (try? await registry.history(name: name)) ?? []
+            guard let last = history.first(where: { ["sale", "offer_accepted", "offer_accept", "transfer", "release", "reclaim"].contains($0.op) }) else { continue }
+            let display = "\(name).kachat"
+            switch last.op {
+            case "sale":
+                post("sold-\(last.txId)", name, S("%@ sold", display),
+                     last.price.map { S("%@ KAS was paid to you.", KaspaUnit.plain($0)) } ?? AppLocalization.string("Your listing was bought."))
+            case "offer_accepted", "offer_accept":
+                post("sold-\(last.txId)", name, S("%@ sold", display), AppLocalization.string("You accepted an offer for it."))
+            case "reclaim":
+                post("reclaimed-\(last.txId)", name, S("%@ was freed", display),
+                     AppLocalization.string("It expired and was cleared from the registry. Your bond is back with you."))
+            default:
+                break
+            }
+        }
+
+        // Offers on your names.
+        for o in offersOnMine {
+            new.offersOnMine.insert(o.id)
+            guard old?.offersOnMine.contains(o.id) != true, let name = o.name else { continue }
+            post("offer-\(o.id)", name, S("New offer on %@", "\(name).kachat"), S("%@ KAS offered for it.", KaspaUnit.plain(o.amount)))
+        }
+
+        // Your offers: accepted, or back with you.
+        for o in myOpenOffers { new.myOffers[o.id] = o.name ?? "" }
+        for (id, name) in old?.myOffers ?? [:] where new.myOffers[id] == nil && !name.isEmpty {
+            if selfClosedOffers.contains(id) { continue }
+            let display = "\(name).kachat"
+            if owned.contains(where: { $0.name == name }) {
+                post("myoffer-\(id)", name, AppLocalization.string("Offer accepted"), S("%@ is yours now.", display))
+                continue
+            }
+            let history = (try? await registry.history(name: name)) ?? []
+            switch history.first(where: { ["offer_decline", "offer_refund", "offer_withdraw"].contains($0.op) })?.op {
+            case "offer_decline":
+                post("myoffer-\(id)", name, S("Offer on %@ declined", display), AppLocalization.string("The owner declined it. The KAS is back with you."))
+            case "offer_refund":
+                post("myoffer-\(id)", name, S("Offer on %@ expired", display), AppLocalization.string("Nobody accepted it in time. The KAS is back with you."))
+            default:
+                post("myoffer-\(id)", name, S("Offer on %@ returned", display), AppLocalization.string("It can no longer be accepted. The KAS is back with you."))
+            }
+        }
+
+        if let data = try? JSONEncoder().encode(new) { UserDefaults.standard.set(data, forKey: key(wallet)) }
+    }
+}
+
+/// Local reminders for .kachat names held by one of this wallet's spending addresses (Buy From):
+/// the indexer's renewal and expiry pushes reach only the chatting address, so the phone
+/// schedules its own - renewal opens, the name expired, and a day before grace ends - from each
+/// name's expiry (XP-024). Nothing leaves the phone. Rescheduled on every notifier check: a
+/// renewed name moves its reminders, a name that left the wallet loses them. Tapping one opens
+/// the name (thread "kachat-names", like the pushes).
+@MainActor
+enum KachatNameReminders {
+    /// `kachat-reminder-<network>-<wallet tag>-<name>-<expiresAt>-<kind>`: each wallet and
+    /// network keeps its own set, so a check on one never removes another's (IOS-088).
+    private static let root = "kachat-reminder-"
+    /// The first build's ids, one device-wide set: removed wherever they are found.
+    private static let legacyPrefix = "kachat-local-"
+
+    /// A short, stable tag for a wallet in the ids (the address's last 12 characters).
+    private static func walletTag(_ wallet: String) -> String {
+        String(wallet.lowercased().suffix(12))
+    }
+
+    private static func prefix(wallet: String, network: String) -> String {
+        "\(root)\(network)-\(walletTag(wallet))-"
+    }
+
+    /// A wallet's reminders, for when it leaves this phone. The tag comes from the address as
+    /// given, whose checksum differs between kaspa: and kaspatest:, so a caller removing an
+    /// account calls this for each of its network variants (`accountAddressVariants`).
+    static func removeAll(forWallet wallet: String) async {
+        let center = UNUserNotificationCenter.current()
+        let tag = "-\(walletTag(wallet))-"
+        let ids = await center.pendingNotificationRequests().map(\.identifier)
+            .filter { $0.hasPrefix(root) && $0.contains(tag) }
+        if !ids.isEmpty { center.removePendingNotificationRequests(withIdentifiers: ids) }
+    }
+
+    static func schedule(for names: [KachatNames.NameInfo], params p: KachatNames.Params, wallet: String) async {
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        let all = await center.pendingNotificationRequests().map(\.identifier)
+        let legacy = all.filter { $0.hasPrefix(legacyPrefix) }
+        if !legacy.isEmpty { center.removePendingNotificationRequests(withIdentifiers: legacy) }
+        let prefix = prefix(wallet: wallet, network: KachatNamesService.networkName)
+        // only this wallet's reminders on this network are this call's to keep or drop
+        let pending = all.filter { $0.hasPrefix(prefix) }
+        guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else {
+            center.removePendingNotificationRequests(withIdentifiers: pending)
+            return
+        }
+        let now = KachatNames.nowMs()
+        var wanted: [String: (date: Int64, title: String, body: String, name: String)] = [:]
+        func S(_ key: String, _ args: CVarArg...) -> String {
+            KaspaUnit.label(String(format: AppLocalization.string(key), locale: AppLocalization.locale, arguments: args))
+        }
+        for n in names {
+            let display = "\(n.name).kachat"
+            let base = "\(prefix)\(n.name)-\(n.expiresAt)-"
+            let renewAt = n.expiresAt - p.renewWindowMs
+            if renewAt > now {
+                wanted[base + "renew"] = (renewAt, S("Renew %@", display),
+                                          S("Renewal is open: renew it before %@ to keep it.", KachatNamesActions.dayString(n.expiresAt)), n.name)
+            }
+            if n.expiresAt > now {
+                wanted[base + "grace"] = (n.expiresAt, S("%@ has expired", display),
+                                          S("Renew it before %@ or anyone can claim it.", KachatNamesActions.dayString(n.expiresAt + p.graceMs)), n.name)
+            }
+            let lastCall = n.expiresAt + p.graceMs - min(p.graceMs / 2, 86_400_000)
+            if lastCall > now {
+                wanted[base + "lastcall"] = (lastCall, S("%@ has expired", display),
+                                             S("Renew it before %@ or anyone can claim it.", KachatNamesActions.dayString(n.expiresAt + p.graceMs)), n.name)
+            }
+        }
+        let stale = pending.filter { wanted[$0] == nil }
+        if !stale.isEmpty { center.removePendingNotificationRequests(withIdentifiers: stale) }
+        for (id, r) in wanted where !pending.contains(id) {
+            let content = UNMutableNotificationContent()
+            content.title = r.title
+            content.body = r.body
+            content.sound = .default
+            content.threadIdentifier = "kachat-names"
+            content.userInfo = ["name": r.name]
+            let seconds = max(1, TimeInterval(r.date - now) / 1000)
+            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: seconds, repeats: false)
+            try? await center.add(UNNotificationRequest(identifier: id, content: content, trigger: trigger))
+        }
+    }
+}

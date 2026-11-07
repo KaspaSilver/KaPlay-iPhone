@@ -97,7 +97,7 @@ struct SpendingAddressEntry: Identifiable, Equatable, Codable {
     /// The row's number on its own chain, both named "Address #n" (quantum numbering starts at
     /// 0 again; the shield is what tells the chains apart).
     var displayTitle: String {
-        "Address #\(isQuantum ? index - WalletManager.quantumIndexBase : index)"
+        "Address #\(WalletManager.addressNumber(forIndex: index))"
     }
     /// Whether this address is hidden from the main Manage Addresses list. Enforced
     /// server-side (WalletManager.setSpendingAddressHidden refuses to hide the primary
