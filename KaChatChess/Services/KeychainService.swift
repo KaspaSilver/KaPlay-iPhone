@@ -542,6 +542,28 @@ final class KeychainService {
         try saveSensitiveDataRaw(wrapped, keyName: keyName)
     }
 
+    /// The accounts with saved keys on this device, read from the Keychain itself: the list of
+    /// saved accounts lives in UserDefaults and can miss one that these still hold.
+    func accountSnapshotAddresses() -> [String] {
+        guard let deviceId = try? deviceIdentifier() else { return [] }
+        let prefix = "\(KeychainKey.seedPhrase.rawValue).\(deviceId)."
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let items = result as? [[String: Any]] else { return [] }
+        return items.compactMap { item in
+            guard let account = item[kSecAttrAccount as String] as? String, account.hasPrefix(prefix) else { return nil }
+            // accountScopedKeyName stores "kaspa:" as "kaspa_"
+            return String(account.dropFirst(prefix.count)).replacingOccurrences(of: "_", with: ":")
+        }
+    }
+
     private func loadSensitiveDataForAccount(baseKey: KeychainKey, publicAddress: String) throws -> Data? {
         let keyName = try accountScopedKeyName(baseKey: baseKey, publicAddress: publicAddress)
         guard let data = try loadSensitiveDataRaw(keyName: keyName) else {

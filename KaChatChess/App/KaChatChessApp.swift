@@ -101,6 +101,13 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         UIDevice.current.userInterfaceIdiom == .pad ? .all : .portrait
     }
 
+    /// No third-party keyboards anywhere in the app, as in KaPost and KaPay: the passphrase, the
+    /// card PIN and the backup's word check are typed on the system keyboard, so a keyboard with
+    /// Full Access never sees them. They're offered the system's.
+    func application(_ application: UIApplication, shouldAllowExtensionPointIdentifier extensionPointIdentifier: UIApplication.ExtensionPointIdentifier) -> Bool {
+        extensionPointIdentifier != .keyboard
+    }
+
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         Task.detached(priority: .utility) { CacheManager.sweepStaleTempFiles() }
         return true

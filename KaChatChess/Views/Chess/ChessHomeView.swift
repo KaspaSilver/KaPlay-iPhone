@@ -109,20 +109,23 @@ struct ChessHomeView: View {
             service.acquire()
             takeChallenge()
         }
-        .onChange(of: links.challenge) { _ in takeChallenge() }
-        // The online game a challenge waited for is over: take it here, never from under a
-        // pushed screen.
-        .onChange(of: service.myActiveTournament?.id) { _ in if isVisible { takeChallenge() } }
+        // Never from under a pushed screen (a bot game, a board): it waits in the router until
+        // this screen is back.
+        .onChange(of: links.challenge) { _ in if isVisible { takeChallenge() } }
+        // The online game a challenge waited for is over (or the rooms have loaded): take it
+        // here, never from under a pushed screen.
+        .onChange(of: service.isBusyOnline) { busy in if !busy, isVisible { takeChallenge() } }
         .onDisappear {
             isVisible = false
             service.release()
         }
     }
 
-    /// A challenge never pops a board or a waiting room: while the player is seated or playing
-    /// online, it waits in the router until that is over and this screen is back.
+    /// A challenge never pops a board or a waiting room: while the player is busy online
+    /// (`ChessTournamentService.isBusyOnline`), it waits in the router until that is over and
+    /// this screen is back.
     private func takeChallenge() {
-        guard let challenge = links.challenge, service.myActiveTournament == nil else { return }
+        guard let challenge = links.challenge, !service.isBusyOnline else { return }
         links.challenge = nil
         openChallenge = challenge
     }

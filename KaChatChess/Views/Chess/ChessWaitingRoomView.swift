@@ -158,7 +158,7 @@ struct ChessWaitingRoomView: View {
     /// Filled, or the seat ran out: hand the screen over. Runs on every tick.
     /// The room has filled and the match-found countdown is still running.
     private var matchFound: Bool {
-        guard let tournament, tournament.status == .live else { return false }
+        guard let tournament, let me, tournament.status == .live, tournament.players.contains(me) else { return false }
         return service.now < (tournament.startedAt ?? 0) + ChessTournamentCodec.matchFoundDelayMs
     }
 
@@ -171,6 +171,13 @@ struct ChessWaitingRoomView: View {
     private func check() {
         guard !handedOff, let tournament, let me else { return }
         if tournament.status == .live || tournament.status == .finished {
+            // Filled without us: our join lost the race for the last seat. Not a match - the
+            // room closes, and the service joins the next room by itself.
+            guard tournament.players.contains(me) else {
+                handedOff = true
+                onFinished(false)
+                return
+            }
             // Filled: hold for the match-found countdown (chain time, the same on every phone),
             // then hand over to the board.
             guard !matchFound else { return }

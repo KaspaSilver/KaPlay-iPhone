@@ -26,6 +26,12 @@ struct ChattingAddressManageView: View {
     @State private var isLoading = false
     /// Only for Compound UTXOs, which needs two or more coins to combine.
     @State private var utxos: [UTXO] = []
+
+    /// The coins a send from here may spend: confirmed, not mining rewards, not just spent by a
+    /// move or send still listed by the node. Compound combines only these.
+    private var spendableCoinCount: Int {
+        chatService.withdrawalSpendable(utxos).count
+    }
     /// Every revealed spending address together. Nil until it's known, which shows as a dash.
     @State private var spendingTotalSompi: UInt64?
     @State private var showReceiveSheet = false
@@ -35,6 +41,11 @@ struct ChattingAddressManageView: View {
     /// The More half sheet, and the public-key screen it can open.
     @State private var showAddressActions = false
     @State private var showPublicKeySheet = false
+    /// The More row picked: opened once More has finished closing (`presentMoreChoice`). Opening a
+    /// sheet while another is still going away is dropped by iOS.
+    @State private var moreChoice: MoreChoice?
+
+    private enum MoreChoice { case compound, privateKey, publicKey }
     @State private var showBackupHygiene = false
     @State private var toastMessage: String?
     @State private var toastToken = UUID()
@@ -71,7 +82,7 @@ struct ChattingAddressManageView: View {
         .navigationTitle("Wallet")
         .navigationBarTitleDisplayMode(.inline)
         .toast(message: toastMessage)
-        .sheet(isPresented: $showAddressActions) {
+        .sheet(isPresented: $showAddressActions, onDismiss: presentMoreChoice) {
             addressActionsSheet
                 .presentationDetents([.height(410)])
                 .presentationDragIndicator(.visible)
@@ -249,40 +260,30 @@ struct ChattingAddressManageView: View {
                 // Always listed, so it's there to find; it takes two coins to combine.
                 ActionSheetRow(
                     title: "Compound UTXOs",
-                    subtitle: utxos.count > 1
+                    subtitle: spendableCoinCount > 1
                         ? "Combines this address's coins into one, so later sends need fewer inputs."
                         : "Combines this address's coins into one. It needs two or more coins.",
                     systemImage: "arrow.triangle.merge",
-                    isDisabled: utxos.count < 2
+                    isDisabled: spendableCoinCount < 2
                 ) {
+                    moreChoice = .compound
                     showAddressActions = false
-                    DispatchQueue.main.async { showCompoundSheet = true }
                 }
                 ActionSheetRow(
                     title: "View Private Key",
                     subtitle: "The key that spends this address. Never share it.",
                     systemImage: "key.fill"
                 ) {
+                    moreChoice = .privateKey
                     showAddressActions = false
-                    // A turn later: presenting straight from a dismissing sheet is dropped.
-                    DispatchQueue.main.async {
-                        // Settings' "Biometrics for Address Private Keys", which this key is one of
-                        if settingsViewModel.settings.biometricSpendingKeyEnabled {
-                            DeviceAuth.authenticate(reason: "Unlock to view this address's private key") {
-                                showPrivateKeySheet = true
-                            }
-                        } else {
-                            showPrivateKeySheet = true
-                        }
-                    }
                 }
                 ActionSheetRow(
                     title: "View Public Key",
                     subtitle: "The public half of this address, for anyone who asks for it.",
                     systemImage: "number"
                 ) {
+                    moreChoice = .publicKey
                     showAddressActions = false
-                    DispatchQueue.main.async { showPublicKeySheet = true }
                 }
                 if let url = settingsViewModel.settings.kaspaExplorer.addressURL(for: address) {
                     ActionSheetRow(
@@ -301,6 +302,24 @@ struct ChattingAddressManageView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .padding(.bottom, 20)
+    }
+
+    private func presentMoreChoice() {
+        guard let choice = moreChoice else { return }
+        moreChoice = nil
+        switch choice {
+        case .compound: showCompoundSheet = true
+        case .publicKey: showPublicKeySheet = true
+        case .privateKey:
+            // Settings' "Biometrics for Address Private Keys", which this key is one of
+            if settingsViewModel.settings.biometricSpendingKeyEnabled {
+                DeviceAuth.authenticate(reason: "Unlock to view this address's private key") {
+                    showPrivateKeySheet = true
+                }
+            } else {
+                showPrivateKeySheet = true
+            }
+        }
     }
 
     // MARK: - History
@@ -901,6 +920,9 @@ struct WithdrawKaspaView: View {
     @State private var maxCapped = false
     /// The latest Max request: an older one finishing later (a fee tapped twice fast) is dropped.
     @State private var maxRequest = UUID()
+    /// Bumped when a send stopped because its fee had changed, or by Try Again under a failed fee
+    /// estimate: the Review works the fee out again.
+    @State private var feeRefresh = 0
 
     private let knsService = KNSService.shared
 
@@ -931,8 +953,8 @@ struct WithdrawKaspaView: View {
     /// Extra priority tip on top of the base (Normal-tier) fee, for network congestion.
     /// A custom fee (the fee editor) overrides the tier multiplier until a tier is tapped again.
     private var extraFeeSompi: UInt64 {
-        guard let normalFeeSompi else { return 0 }
         if let customExtraFeeSompi { return customExtraFeeSompi }
+        guard let normalFeeSompi else { return 0 }
         return normalFeeSompi * (feeTier.multiplier - 1)
     }
 
@@ -946,7 +968,7 @@ struct WithdrawKaspaView: View {
     /// out with the extra actually paid rather than added on top of the Normal estimate.
     private var feeEstimationKey: String {
         let manualKey = manualUtxos?.map { "\($0.outpoint.transactionId):\($0.outpoint.index)" }.sorted().joined(separator: ",") ?? ""
-        return "\(hasValidRecipient ? effectiveAddress : "")|\(amountSompi ?? 0)|\(manualKey)|\(source.spendingIndex ?? -1)|\(feeTier.rawValue)|\(customExtraFeeSompi.map { String($0) } ?? "")"
+        return "\(hasValidRecipient ? effectiveAddress : "")|\(amountSompi ?? 0)|\(manualKey)|\(source.spendingIndex ?? -1)|\(feeTier.rawValue)|\(customExtraFeeSompi.map { String($0) } ?? "")|\(feeRefresh)"
     }
 
     /// The steps of a send: who it goes to, which of your addresses it leaves from, how much
@@ -1040,7 +1062,12 @@ struct WithdrawKaspaView: View {
                 // blocked every amount as "more than the address holds".
                 guard let utxos = try? await NodePoolService.shared.getUtxosByAddresses([address]),
                       !Task.isCancelled else { return }
-                sourceBalanceSompi = utxos.reduce(UInt64(0)) { $0 + $1.amount }
+                // what the send can spend: coins a move or send just spent, or not yet usable, aren't
+                // Available (an amount within the whole balance but over these could never go)
+                let spendable = source == .chatting
+                    ? chatService.withdrawalSpendable(utxos)
+                    : chatService.unreservedUtxos(utxos)
+                sourceBalanceSompi = spendable.reduce(UInt64(0)) { $0 + $1.amount }
             }
             .onChange(of: feeTier) { _ in
                 customExtraFeeSompi = nil
@@ -1063,8 +1090,9 @@ struct WithdrawKaspaView: View {
             }
             // The confirmation is the swipe-up's own full screen (SwipeUpToSendScrollView).
             .task(id: feeEstimationKey) {
+                // `normalFeeSompi` is kept when there's no fee to show: a nil base made the next
+                // Max and the speed extras fall back to no extra at all
                 guard hasValidRecipient, let amountSompi else {
-                    normalFeeSompi = nil
                     builtFeeSompi = nil
                     feeError = nil
                     isEstimatingFee = false
@@ -1097,7 +1125,7 @@ struct WithdrawKaspaView: View {
                     feeError = nil
                 } catch {
                     guard !Task.isCancelled else { return }
-                    normalFeeSompi = nil
+                    // no fee shown (so no swipe), but the last base stays for the next estimate
                     builtFeeSompi = nil
                     feeError = UserFacingError.message(for: error)
                 }
@@ -1366,6 +1394,11 @@ struct WithdrawKaspaView: View {
                         .font(.footnote)
                         .foregroundColor(.red)
                         .multilineTextAlignment(.center)
+                    // Without a fee the swipe stays off: a dropped connection mustn't strand it.
+                    if errorMessage == nil, !isEstimatingFee {
+                        Button("Try Again") { feeRefresh += 1 }
+                            .font(.footnote.weight(.semibold))
+                    }
                 } else if usedMax && maxCapped {
                     Text(maxCappedNote)
                         .font(.footnote)
@@ -1532,7 +1565,10 @@ struct WithdrawKaspaView: View {
         isEstimatingMax = true
         errorMessage = nil
         let recipient = effectiveAddress
-        let tipSompi = extraFeeSompi
+        // The speed is priced against the Max send's own coins (`ChatService.maxSendAmount`), the
+        // way the Review prices it, not from the base fee of whatever amount was there before.
+        let fixedExtra = customExtraFeeSompi ?? 0
+        let multiplier: UInt64 = customExtraFeeSompi == nil ? feeTier.multiplier : 1
         let spendingIndex = isCompoundMode ? nil : source.spendingIndex
         let request = UUID()
         maxRequest = request
@@ -1540,9 +1576,9 @@ struct WithdrawKaspaView: View {
             do {
                 let result: (amountSompi: UInt64, cappedAtInputLimit: Bool)
                 if let index = spendingIndex {
-                    result = try await chatService.estimateMaxSpendingAddressAmount(index: index, toAddress: recipient, manualUtxos: manualUtxos, extraFeeSompi: tipSompi)
+                    result = try await chatService.estimateMaxSpendingAddressAmount(index: index, toAddress: recipient, manualUtxos: manualUtxos, extraFeeSompi: fixedExtra, feeMultiplier: multiplier)
                 } else {
-                    result = try await chatService.estimateMaxWithdrawalAmount(toAddress: recipient, manualUtxos: manualUtxos, extraFeeSompi: tipSompi)
+                    result = try await chatService.estimateMaxWithdrawalAmount(toAddress: recipient, manualUtxos: manualUtxos, extraFeeSompi: fixedExtra, feeMultiplier: multiplier)
                 }
                 await MainActor.run {
                     // a newer Max (another speed tapped meanwhile) decides the amount
@@ -1585,15 +1621,17 @@ struct WithdrawKaspaView: View {
         errorMessage = nil
         let recipient = effectiveAddress.trimmingCharacters(in: .whitespacesAndNewlines)
         let tipSompi = extraFeeSompi
+        // what the Review shows: a send rebuilt from other coins that would pay more stops
+        let expectedFee = totalFeeSompi
         let spendingIndex = source.spendingIndex
         Task {
             do {
                 try await SendFailureSimulation.failIfEnabled()
                 let txId: String
                 if let spendingIndex {
-                    txId = try await chatService.sendFromSpendingAddress(index: spendingIndex, toAddress: recipient, amountSompi: amountSompi, manualUtxos: manualUtxos, extraFeeSompi: tipSompi)
+                    txId = try await chatService.sendFromSpendingAddress(index: spendingIndex, toAddress: recipient, amountSompi: amountSompi, manualUtxos: manualUtxos, extraFeeSompi: tipSompi, expectedFeeSompi: expectedFee)
                 } else {
-                    txId = try await chatService.sendWithdrawal(toAddress: recipient, amountSompi: amountSompi, manualUtxos: manualUtxos, extraFeeSompi: tipSompi)
+                    txId = try await chatService.sendWithdrawal(toAddress: recipient, amountSompi: amountSompi, manualUtxos: manualUtxos, extraFeeSompi: tipSompi, expectedFeeSompi: expectedFee)
                 }
                 await MainActor.run {
                     isSending = false
@@ -1608,6 +1646,8 @@ struct WithdrawKaspaView: View {
                 await MainActor.run {
                     isSending = false
                     errorMessage = UserFacingError.message(for: error)
+                    // nothing went out; Try Again goes back to a Review with the fee of today's coins
+                    if error is SendFeeChangedError { feeRefresh += 1 }
                 }
             }
         }
@@ -1705,8 +1745,22 @@ struct CoinControlView: View {
         "\(utxo.outpoint.transactionId):\(utxo.outpoint.index)"
     }
 
+    /// Why a send can't spend this coin, nil when it can. The same coins the send leaves out
+    /// (`ChatService.withdrawalSpendable`): listed greyed out, never picked, so a selection can't
+    /// be made of coins the send would refuse.
+    private func unavailableReason(_ utxo: UTXO) -> LocalizedStringKey? {
+        if utxo.isCoinbase { return "Mining reward, not spendable here" }
+        if utxo.blockDaaScore == 0 { return "Not confirmed yet" }
+        if ChatService.shared.unreservedUtxos([utxo]).isEmpty { return "Just spent by a move or send" }
+        return nil
+    }
+
+    private var availableUtxos: [UTXO] {
+        utxos.filter { unavailableReason($0) == nil }
+    }
+
     private var selectedTotalSompi: UInt64 {
-        utxos.filter { selectedKeys.contains(key($0)) }.reduce(0) { $0 + $1.amount }
+        availableUtxos.filter { selectedKeys.contains(key($0)) }.reduce(0) { $0 + $1.amount }
     }
 
     var body: some View {
@@ -1732,6 +1786,7 @@ struct CoinControlView: View {
                         ForEach(Array(utxos.enumerated()), id: \.offset) { _, utxo in
                             let k = key(utxo)
                             let isSelected = selectedKeys.contains(k)
+                            let unavailable = unavailableReason(utxo)
                             Button {
                                 if isSelected {
                                     selectedKeys.remove(k)
@@ -1756,12 +1811,19 @@ struct CoinControlView: View {
                                         Text("\(utxo.outpoint.transactionId.prefix(10))...:\(utxo.outpoint.index)")
                                             .font(.system(.caption2, design: .monospaced))
                                             .foregroundColor(.secondary)
+                                        if let unavailable {
+                                            Text(unavailable)
+                                                .font(.caption2)
+                                                .foregroundColor(.orange)
+                                        }
                                     }
                                     Spacer()
                                 }
                                 .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
+                            .disabled(unavailable != nil)
+                            .opacity(unavailable == nil ? 1 : 0.5)
                         }
                     } footer: {
                         if !selectedKeys.isEmpty {
@@ -1778,7 +1840,7 @@ struct CoinControlView: View {
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Menu {
-                        Button("Select All") { selectedKeys = Set(utxos.map(key)) }
+                        Button("Select All") { selectedKeys = Set(availableUtxos.map(key)) }
                         Button("Automatic (Clear Selection)") { selectedKeys.removeAll() }
                     } label: {
                         Image(systemName: "ellipsis.circle")
@@ -1787,7 +1849,7 @@ struct CoinControlView: View {
             }
             .safeAreaInset(edge: .bottom) {
                 Button {
-                    let selected = utxos.filter { selectedKeys.contains(key($0)) }
+                    let selected = availableUtxos.filter { selectedKeys.contains(key($0)) }
                     onDone(selected.isEmpty ? nil : selected)
                     dismiss()
                 } label: {
@@ -1805,7 +1867,9 @@ struct CoinControlView: View {
                 utxoLabels = WalletManager.shared.loadSpendingUtxoLabels(address: fromAddress)
                 await loadUtxos()
                 if let initialSelection {
-                    selectedKeys = Set(initialSelection.map(key))
+                    // coins spent since they were picked drop out of the selection
+                    let available = Set(availableUtxos.map(key))
+                    selectedKeys = Set(initialSelection.map(key)).intersection(available)
                 }
             }
         }

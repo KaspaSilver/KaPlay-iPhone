@@ -20,6 +20,9 @@ final class ChessBotGame: ObservableObject {
         case sending
         case stamped
         case failed(String)
+        /// A node may have taken it and never answered: it may be on chain. No Retry - a second
+        /// stamp of the same game.
+        case unconfirmed(String)
     }
 
     let bot: ChessBot
@@ -145,15 +148,26 @@ final class ChessBotGame: ObservableObject {
     // MARK: - On chain
 
     /// Goes on even if the player leaves the screen: the task holds the game until it is done.
+    /// Never twice for one game: not while one is going out, once one went out, or once one may
+    /// have (`unconfirmed`).
     private func sendStamp() {
-        guard let result, stamp != .sending, stamp != .stamped else { return }
+        guard let result else { return }
+        switch stamp {
+        case .none, .failed: break
+        case .sending, .stamped, .unconfirmed: return
+        }
         stamp = .sending
         let message = ChessBotCodec.result(
             id: id, bot: bot, playerColor: playerColor, result: result, moves: moves.map(\.move)
         )
         Task {
-            if let error = await send(message) {
+            switch await send(message) {
+            case .sent: break
+            case .failed(let error):
                 stamp = .failed(error)
+                return
+            case .unknown:
+                stamp = .unconfirmed(SendOutcomeUnknownError.message)
                 return
             }
             stamp = .stamped
@@ -168,7 +182,14 @@ final class ChessBotGame: ObservableObject {
     /// is retried: no KAS on the chatting address, or a send whose outcome is unknown (a second
     /// stamp of the same game), fails at once. Never deferred to a background retry, so nil -
     /// "stamped" - means the transaction really went out. Returns the error to show otherwise.
-    private func send(_ message: ChessBotMessage) async -> String? {
+    private enum SendResult {
+        case sent
+        case failed(String)
+        /// `SendOutcomeUnknownError`: it may have gone through.
+        case unknown
+    }
+
+    private func send(_ message: ChessBotMessage) async -> SendResult {
         let content = ChessBotCodec.encode(message)
         var attempt = 0
         while true {
@@ -176,12 +197,16 @@ final class ChessBotGame: ObservableObject {
                 let txId = try await PublicChatService.shared.sendPublicChat(
                     channel: ChessBotCodec.channel, content: content, deferNoInputRetry: false
                 )
-                return txId == nil ? "The result was not sent." : nil
+                return txId == nil ? .failed("The result was not sent.") : .sent
             } catch {
+                if error is SendOutcomeUnknownError {
+                    AppLog.log("[Chess] Bot game stamp outcome unknown")
+                    return .unknown
+                }
                 attempt += 1
                 if attempt > 5 || !PublicChatService.isRetryableSendError(error) {
                     AppLog.log("[Chess] Bot game stamp failed: %@", error.localizedDescription)
-                    return PublicChatService.friendlySendErrorMessage(for: error)
+                    return .failed(PublicChatService.friendlySendErrorMessage(for: error))
                 }
                 try? await Task.sleep(nanoseconds: 1_200_000_000)
             }

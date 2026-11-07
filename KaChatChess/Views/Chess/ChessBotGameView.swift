@@ -331,12 +331,18 @@ private struct ChessBotMatchView: View {
         }
     }
 
+    private var isUnconfirmed: Bool {
+        if case .unconfirmed = game.stamp { return true }
+        return false
+    }
+
     /// Share to KaPost, once the win is on chain: what the post shows off can be looked up.
     private var shareButton: some View {
         let title: String = {
             switch game.stamp {
             case .stamped: return "Share to KaPost"
             case .failed: return "Retry the stamp"
+            case .unconfirmed: return "Not confirmed"
             case .none, .sending: return "Stamping the result…"
             }
         }()
@@ -347,7 +353,7 @@ private struct ChessBotMatchView: View {
                 ChessBotLinks.shareToKaPost(bot: bot, moves: game.playerMoveCount, gameId: game.id)
             case .failed:
                 game.retry()
-            case .none, .sending:
+            case .none, .sending, .unconfirmed:
                 break
             }
         } label: {
@@ -360,7 +366,7 @@ private struct ChessBotMatchView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 12))
         }
         .buttonStyle(.plain)
-        .disabled(game.stamp == .sending || game.stamp == .none)
+        .disabled(game.stamp == .sending || game.stamp == .none || isUnconfirmed)
     }
 
     // MARK: - Resign
@@ -439,12 +445,21 @@ private struct ChessBotMatchView: View {
                 case .failed:
                     Button("Retry") { game.retry() }
                         .font(.caption.weight(.bold))
+                case .unconfirmed:
+                    Image(systemName: "questionmark.circle.fill")
+                        .foregroundColor(.orange)
                 }
             }
             if case .failed(let error) = game.stamp {
                 Text(error)
                     .font(.caption2)
                     .foregroundColor(.red)
+                    .lineLimit(3)
+            }
+            if case .unconfirmed(let note) = game.stamp {
+                Text(note)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
                     .lineLimit(3)
             }
         }
@@ -458,6 +473,7 @@ private struct ChessBotMatchView: View {
         case .sending: return "Stamping the result on Kaspa…"
         case .stamped: return "Result stamped on Kaspa"
         case .failed: return "Couldn't stamp the result on Kaspa"
+        case .unconfirmed: return "The stamp may have gone through"
         }
     }
 

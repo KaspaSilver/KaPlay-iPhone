@@ -41,16 +41,30 @@ final class ChessTournamentService: ObservableObject {
     /// The app claims by itself only for a flag this recent: an old game both players walked
     /// away from is not paid for on every launch. The board's Claim button covers the rest.
     private static let autoClaimWindowMs: Int64 = 30 * 60_000
-    /// When each pending move was sent (wall ms): one the chain has not shown after
-    /// `pendingMoveTimeoutMs` (dropped by the network, never mined) can be played again.
+    /// When each pending move was sent (wall ms): one the reducer still has not applied after
+    /// `pendingMoveTimeoutMs` stops showing as sending. (One the network dropped is applied from
+    /// its local row until `dropUnconfirmedRowsIfDue` takes it out.)
     private var pendingMoveSentAt: [String: Int64] = [:]
     private static let pendingMoveTimeoutMs: Int64 = 25_000
+    /// Games whose claim is being sent right now: the board's Claim win does nothing while one is.
+    @Published private(set) var claimsInFlight: Set<String> = []
+    /// Taps on Claim win closer together than this are one claim.
+    private static let claimTapGapMs: Int64 = 5_000
+    /// An own arena transaction the chain has not shown this long after it was sent is looked up,
+    /// and dropped when the network has never seen it (`PublicChatService.checkUnconfirmedServiceRows`).
+    /// Blocks come ten a second and the indexer is polled every 2-8 s, so a transaction that
+    /// landed is normally back in well under 10 s; 60 s also covers a slow indexer or an
+    /// orphan waiting on its parent, and still leaves most of a five-minute clock to play the
+    /// move again. One the network cannot be asked about is given up after five minutes.
+    private static let unconfirmedRowMs: Int64 = 60_000
+    private static let unconfirmedGiveUpMs: Int64 = 5 * 60_000
     /// The account the per-account state below belongs to.
     private var stateAddress: String?
-    /// Newest reduce started / applied: the replay runs off the main thread, and an older one
-    /// finishing late must not overwrite a newer one.
-    private var reduceGeneration = 0
-    private var appliedReduceGeneration = 0
+    /// One replay at a time: asks that come in while one runs are served by a single replay
+    /// after it (`reduceArena`).
+    private var reduceTask: Task<Void, Never>?
+    private var requestedReduce = 0
+    private var appliedReduce = 0
 
     private init() {
         PublicChatService.shared.$messagesByChannel
@@ -119,6 +133,7 @@ final class ChessTournamentService: ObservableObject {
                 guard let self else { return }
                 self.now = Int64(Date().timeIntervalSince1970 * 1000)
                 self.expirePendingMoves()
+                self.dropUnconfirmedRowsIfDue()
                 self.claimTimeoutsIfDue()
                 // The 1st of the month (UTC) came while a chess screen was up: a new month board.
                 if self.boardsMonthStart != 0, ChessTournamentEngine.utcMonthStartMs(self.now) != self.boardsMonthStart {
@@ -150,30 +165,44 @@ final class ChessTournamentService: ObservableObject {
         fastPollTask = nil
     }
 
-    /// Replays the arena as it stands when the replay starts - the newest rows, whichever
-    /// change asked for it - so the newest replay to start is the one that lands.
+    /// Asks for a replay of the arena and returns once one that started after the ask has
+    /// landed. Every change, not only a change in row COUNT: our own sends replace a pending
+    /// row in place when the transaction lands, so the count stays the same - and a count guard
+    /// here left a player's own leave (and moves) unapplied until the next unrelated row or a
+    /// relaunch. The publisher already drops identical arrays.
     private func reduceArena() async {
-        // Every change, not only a change in row COUNT: our own sends replace a pending row in
-        // place when the transaction lands, so the count stays the same - and a count guard
-        // here left a player's own leave (and moves) unapplied until the next unrelated row or
-        // a relaunch. The publisher already drops identical arrays.
-        // The replay of the whole 30-day arena runs off the main thread: it is pure (value
-        // types and static rules), and on the main thread it froze the clocks and the board
-        // for as long as it took on every move.
-        reduceGeneration += 1
-        let generation = reduceGeneration
-        let rows = PublicChatService.shared.messages(forChannel: ChessTournamentCodec.arenaChannel)
-        let localStamps = PublicChatService.shared.locallyStampedTxIds
-        let reduced = await Task.detached(priority: .userInitiated) { () -> [String: ChessTournament] in
-            let events: [ChessArenaEvent] = rows.compactMap { row in
-                guard row.deliveryStatus == .sent, !row.id.hasPrefix("pending_"),
-                      let message = ChessTournamentCodec.decode(row.content) else { return nil }
-                return ChessArenaEvent(txId: row.id, sender: row.senderAddress, blockTime: row.blockTime, message: message)
-            }
-            return ChessTournamentEngine.reduce(ChessTournamentService.orderingLocalStamps(events, localStamps: localStamps))
-        }.value
-        guard generation > appliedReduceGeneration else { return }
-        appliedReduceGeneration = generation
+        requestedReduce += 1
+        let wanted = requestedReduce
+        if reduceTask == nil {
+            reduceTask = Task { [weak self] in await self?.runReduces() }
+        }
+        while appliedReduce < wanted, let task = reduceTask { await task.value }
+    }
+
+    /// The replay of the whole 30-day arena runs off the main thread: it is pure (value types
+    /// and static rules), and on the main thread it froze the clocks and the board for as long
+    /// as it took on every move. Never two at once: rows that change while one runs get one
+    /// more replay after it, of the rows as they stand then.
+    private func runReduces() async {
+        while appliedReduce < requestedReduce {
+            let target = requestedReduce
+            let rows = PublicChatService.shared.messages(forChannel: ChessTournamentCodec.arenaChannel)
+            let localStamps = PublicChatService.shared.locallyStampedTxIds
+            let reduced = await Task.detached(priority: .userInitiated) { () -> [String: ChessTournament] in
+                let events: [ChessArenaEvent] = rows.compactMap { row in
+                    guard row.deliveryStatus == .sent, !row.id.hasPrefix("pending_"),
+                          let message = ChessTournamentCodec.decode(row.content) else { return nil }
+                    return ChessArenaEvent(txId: row.id, sender: row.senderAddress, blockTime: row.blockTime, message: message)
+                }
+                return ChessTournamentEngine.reduce(ChessTournamentService.orderingLocalStamps(events, localStamps: localStamps))
+            }.value
+            appliedReduce = target
+            apply(reduced)
+        }
+        reduceTask = nil
+    }
+
+    private func apply(_ reduced: [String: ChessTournament]) {
         tournaments = reduced
         recomputeLocalBoards()
         resolveNames(for: Set(reduced.values.flatMap(\.players)))
@@ -223,13 +252,34 @@ final class ChessTournamentService: ObservableObject {
         }
     }
 
-    /// A move the chain never showed (the network dropped it): the board offers the move
-    /// again instead of "Sending your move…" until the clock runs out.
+    /// Own arena transactions the network never took (`unconfirmedRowMs`) stop counting on this
+    /// phone: the reducer drops them and the board is the chain's again - a dropped move is the
+    /// player's to play again, and a timeout claim the board was waiting on goes out after all.
+    /// Only once the arena's history is in, so a row the chain showed while the app was closed
+    /// is found there first.
+    private func dropUnconfirmedRowsIfDue() {
+        guard historyReady else { return }
+        Task {
+            let dropped = await PublicChatService.shared.checkUnconfirmedServiceRows(
+                olderThan: Self.unconfirmedRowMs, giveUpAfter: Self.unconfirmedGiveUpMs
+            )
+            guard !dropped.isEmpty else { return }
+            let wasMove = tournaments.values.contains { tournament in
+                tournament.games.values.contains { game in game.moves.contains { dropped.contains($0.txId) } }
+            }
+            lastError = wasMove
+                ? "Your move didn't reach the network. Play it again."
+                : "That didn't reach the network. Try again."
+        }
+    }
+
+    /// A move the reducer never applied (it came too late for the clock, say): the board stops
+    /// saying "Sending your move…".
     private func expirePendingMoves() {
         for (key, sentAt) in pendingMoveSentAt where now - sentAt > Self.pendingMoveTimeoutMs {
             pendingMoveSentAt[key] = nil
             pendingMoveGames.remove(key)
-            lastError = "Your move didn't reach the network. Play it again."
+            lastError = "Your move didn't count. Check the board."
         }
     }
 
@@ -328,6 +378,22 @@ final class ChessTournamentService: ObservableObject {
             .filter { $0.isStillPlaying(me, at: now) || ($0.status == .open && $0.isSeated(me, at: now)) }
             .sorted { $0.createdAt > $1.createdAt }
             .first
+    }
+
+    /// Too busy online for a challenge link to open a bot screen: the rooms are still loading
+    /// (a game in play may not be known yet), the player is seated or playing, or a game of
+    /// theirs was decided on the clock lately with the claim not on chain yet - its winner is
+    /// still on the board to claim it.
+    var isBusyOnline: Bool {
+        guard historyReady else { return true }
+        if myActiveTournament != nil { return true }
+        guard let me = myAddress else { return false }
+        return tournaments.values.contains { tournament in
+            tournament.status == .live && tournament.games.values.contains { game in
+                guard game.color(of: me) != nil, let flagAt = game.flagAt else { return false }
+                return now - flagAt < Self.autoClaimWindowMs
+            }
+        }
     }
 
     // MARK: - Leaderboards
@@ -512,8 +578,9 @@ final class ChessTournamentService: ObservableObject {
             return
         }
         queuedPublicRoomId = id
-        // A join that did not go out queues nothing: the next room must not be joined for it.
-        if !(await send(ChessTournamentCodec.join(id: id))) { queuedPublicRoomId = nil }
+        // A join that did not go out queues nothing: the next room must not be joined for it -
+        // unless the queue has already moved on to another room while it was being sent.
+        if !(await send(ChessTournamentCodec.join(id: id))), queuedPublicRoomId == id { queuedPublicRoomId = nil }
     }
 
     /// The room this player asked to join and is waiting to appear in.
@@ -584,7 +651,8 @@ final class ChessTournamentService: ObservableObject {
     /// Plays a move if it is ours to make and legal; the board shows it as pending until the
     /// chain returns it.
     func play(_ move: ChessMove, in tournament: ChessTournament, game: ChessTournamentGame) async {
-        guard let me = myAddress, game.playerToMove == me, !game.isOver,
+        // Not once the clock has decided it: a move after the flag is void on chain.
+        guard let me = myAddress, game.playerToMove == me, !game.isDecided(at: now),
               !pendingMoveGames.contains("\(tournament.id)|\(game.id)"),
               ChessEngine.isLegal(move, in: game.board) else { return }
         let normalized = ChessEngine.normalizingPromotion(move, in: game.board)
@@ -605,9 +673,12 @@ final class ChessTournamentService: ObservableObject {
         }
     }
 
-    func resign(_ tournament: ChessTournament, game: ChessTournamentGame) async {
-        guard let me = myAddress, game.color(of: me) != nil, !game.isOver else { return }
-        _ = await send(ChessTournamentCodec.resign(id: tournament.id, game: game.id))
+    /// True when the resignation went out; false (with `lastError`) when it did not, and the
+    /// game goes on - the board must keep the player.
+    @discardableResult
+    func resign(_ tournament: ChessTournament, game: ChessTournamentGame) async -> Bool {
+        guard let me = myAddress, game.color(of: me) != nil, !game.isOver else { return false }
+        return await send(ChessTournamentCodec.resign(id: tournament.id, game: game.id))
     }
 
     /// The opponent flagged in one of our games, lately: post the claim. Runs on every tick;
@@ -631,16 +702,29 @@ final class ChessTournamentService: ObservableObject {
 
     /// The board's Claim, for a game the opponent has lost on time with no claim on chain yet -
     /// the way off the board for its winner that is not Resign.
+    /// Repeated taps are one claim: nothing while one is being sent or within a few seconds of
+    /// the last.
     func claimWin(_ tournament: ChessTournament, game: ChessTournamentGame) {
         guard let me = myAddress, game.decidedWinner(at: now) == me, !game.isOver else { return }
+        let key = "\(tournament.id)|\(game.id)"
+        if let at = claimedGames[key], now - at < Self.claimTapGapMs { return }
         postClaim(tournament, game: game, force: true)
     }
 
     private func postClaim(_ tournament: ChessTournament, game: ChessTournamentGame, force: Bool = false) {
         let key = "\(tournament.id)|\(game.id)"
+        guard !claimsInFlight.contains(key) else { return }
         if !force, let at = claimedGames[key], now - at < Self.claimRetryMs { return }
         claimedGames[key] = now
-        Task { _ = await self.send(ChessTournamentCodec.claim(id: tournament.id, game: game.id)) }
+        claimsInFlight.insert(key)
+        Task {
+            _ = await self.send(ChessTournamentCodec.claim(id: tournament.id, game: game.id))
+            self.claimsInFlight.remove(key)
+        }
+    }
+
+    func isClaiming(_ tournament: ChessTournament, game: ChessTournamentGame) -> Bool {
+        claimsInFlight.contains("\(tournament.id)|\(game.id)")
     }
 
     /// One public chat transaction, with the retries a fast sequence of sends needs: the change

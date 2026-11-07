@@ -28,8 +28,9 @@ struct ChessTournamentGameView: View {
     private var game: ChessTournamentGame? { tournament?.games[gameId] }
     private var me: String? { walletManager.currentWallet?.publicAddress }
     private var myColor: ChessColor? { me.flatMap { game?.color(of: $0) } }
+    /// Not once the clock has decided the game: a move after the flag is void on chain.
     private var isMyTurn: Bool {
-        guard let game, let myColor, !game.isOver else { return false }
+        guard let game, let myColor, !game.isDecided(at: service.now) else { return false }
         return game.sideToMove == myColor && !service.pendingMoveGames.contains("\(tournamentId)|\(gameId)")
     }
     /// The board is drawn from the viewer's side: black players see black at the bottom.
@@ -47,6 +48,11 @@ struct ChessTournamentGameView: View {
     private var canClaimWin: Bool {
         guard let game, let me, !game.isOver else { return false }
         return game.decidedWinner(at: service.now) == me
+    }
+
+    private var isClaiming: Bool {
+        guard let tournament, let game else { return false }
+        return service.isClaiming(tournament, game: game)
     }
 
     var body: some View {
@@ -86,9 +92,10 @@ struct ChessTournamentGameView: View {
                     Button {
                         if let tournament, let game { service.claimWin(tournament, game: game) }
                     } label: {
-                        Text("Claim win")
+                        Text(isClaiming ? "Claiming…" : "Claim win")
                             .font(.subheadline.weight(.semibold))
                     }
+                    .disabled(isClaiming)
                 }
             }
         }
@@ -228,8 +235,9 @@ struct ChessTournamentGameView: View {
                     showResignConfirm = false
                     showLeaveWarning = false
                     Task {
-                        await service.resign(tournament, game: game)
-                        if leaving { dismiss() }
+                        // A resignation that did not go out leaves the game on: the player stays
+                        // on the board, and the error shows.
+                        if await service.resign(tournament, game: game), leaving { dismiss() }
                     }
                 } label: {
                     Text(leaving ? "Resign and leave" : "Resign")

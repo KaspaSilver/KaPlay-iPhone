@@ -104,7 +104,15 @@ final class PublicChatService: ObservableObject {
     /// this phone's own clock: the chain's time has not reached us yet. The arena's reducer
     /// orders these by the moves around them, never by the local stamp (see
     /// `ChessTournamentService.reduce`).
-    private(set) var locallyStampedTxIds: Set<String> = []
+    var locallyStampedTxIds: Set<String> { Set(localStampSentAt.keys) }
+    /// The same rows, by when this phone started waiting for them (wall ms). Kept across
+    /// launches, so a row the network dropped before a relaunch is still found out
+    /// (`checkUnconfirmedServiceRows`); a relaunch restarts the wait, as the chain's answer may
+    /// have come while the app was closed.
+    private var localStampSentAt: [String: Int64] = PublicChatService.loadLocalStamps() {
+        didSet { Self.saveLocalStamps(localStampSentAt) }
+    }
+    private var isCheckingLocalStamps = false
     /// Set when a public chat-room notification is tapped, so the chat list can navigate to that
     /// room - mirrors `ChatService.pendingChatNavigation`'s cold-start handling.
     @Published var pendingPublicChatNavigation: String?
@@ -202,6 +210,11 @@ final class PublicChatService: ObservableObject {
             sweptChannels = []
             // Each wallet has its own store: what one applied says nothing about the other's.
             appliedIndexerRows = [:]
+            // What was fetched and backfilled was the other wallet's store: this one's rooms
+            // start from nothing.
+            deepBackfilledChannels = []
+            deepBackfillResume = [:]
+            indexerFetchedChannels = []
         }
         if tearingDownOtherWallet { liveViewRefCounts = [:] }
         loadReadState()
@@ -317,20 +330,27 @@ final class PublicChatService: ObservableObject {
             let fresh = rows.filter { !known.contains($0.id) }
             let firstPass = !sweptChannels.contains(channel)
             sweptChannels.insert(channel)
+            var changed = false
             if Self.serviceChannels.contains(channel) {
                 // Our own arena rows take the chain's block time - see processPublicChatHits.
-                var changed = false
                 for row in rows {
-                    locallyStampedTxIds.remove(row.id)
+                    confirmLocalStamp(row.id)
                     if store.updateBlockTime(id: row.id, blockTime: row.blockTime) { changed = true }
                 }
-                if changed { loadMessages(for: channel) }
             }
-            guard !fresh.isEmpty else { return true }
+            // Awaited, not a deferred reload: the arena picks a room right after this returns
+            // (`ChessTournamentService.joinPublicRoom`) and must read the rows just merged.
+            guard !fresh.isEmpty else {
+                if changed { await reloadMessagesNow(for: channel) }
+                return true
+            }
             let inserted = await store.insertMessages(fresh)
-            guard !inserted.isEmpty else { return true }
+            guard !inserted.isEmpty else {
+                if changed { await reloadMessagesNow(for: channel) }
+                return true
+            }
             await store.pruneExpiredMessages()
-            loadMessages(for: channel)
+            await reloadMessagesNow(for: channel)
             guard !firstPass else { return true }
             let cutoff = Int64(Date().timeIntervalSince1970 * 1000) - Self.sweepBannerWindowMs
             for row in fresh where row.blockTime > cutoff {
@@ -849,7 +869,7 @@ final class PublicChatService: ObservableObject {
             // Rows this phone sent carry its own clock until the chain's time reaches us -
             // see processPublicChatHits.
             for row in rows {
-                locallyStampedTxIds.remove(row.id)
+                confirmLocalStamp(row.id)
                 let key = "\(row.id)@\(row.blockTime)"
                 guard !wasApplied(key, channel: channel) else { continue }
                 if store.updateBlockTime(id: row.id, blockTime: row.blockTime) {
@@ -1034,12 +1054,22 @@ final class PublicChatService: ObservableObject {
         }
     }
 
-    private func reloadMessages(for channel: String) async {
+    /// Reloads until the reload that publishes is one started here: a newer reload already
+    /// in flight would otherwise win and publish later, after the caller has read the rows.
+    private func reloadMessagesNow(for channel: String) async {
+        for _ in 0..<3 {
+            if await reloadMessages(for: channel) { return }
+        }
+    }
+
+    /// False when a newer reload of the channel took over before this one published.
+    @discardableResult
+    private func reloadMessages(for channel: String) async -> Bool {
         let generation = (messageLoadGeneration[channel] ?? 0) + 1
         messageLoadGeneration[channel] = generation
         let limit = windowSize(for: channel)
         let rows = await store.messages(forChannel: channel, newestLimit: limit)
-        guard messageLoadGeneration[channel] == generation else { return }
+        guard messageLoadGeneration[channel] == generation else { return false }
         if let limit {
             if rows.count < limit { windowExhausted.insert(channel) } else { windowExhausted.remove(channel) }
         }
@@ -1056,12 +1086,13 @@ final class PublicChatService: ObservableObject {
                     && MessageReactionCodec.parse($0.content) == nil && MessageEditCodec.parse($0.content) == nil
             }
         }.value
-        guard messageLoadGeneration[channel] == generation else { return }
+        guard messageLoadGeneration[channel] == generation else { return false }
         // Only actually publish when the content changed: `@Published` fires on every
         // assignment regardless of equality, and an unconditional assignment re-rendered the
         // whole message list - including an open avatar menu - even when nothing had changed.
-        guard messagesByChannel[channel] != fresh else { return }
+        guard messagesByChannel[channel] != fresh else { return true }
         messagesByChannel[channel] = fresh
+        return true
     }
 
     /// Prunes expired messages across all joined channels and refreshes the given channel's
@@ -1361,6 +1392,107 @@ final class PublicChatService: ObservableObject {
         }
     }
 
+    // MARK: - Own arena rows the chain has not shown yet
+
+    /// When a due row may next be looked up (wall ms): one still in a mempool, or one the REST
+    /// API could not answer for, is asked about again later, not on every tick.
+    private var localStampNextCheck: [String: Int64] = [:]
+    private nonisolated static let localStampsKey = "publicChatLocalStampSentAt"
+
+    private func trackLocalStamp(_ txId: String) {
+        localStampSentAt[txId] = Int64(Date().timeIntervalSince1970 * 1000)
+    }
+
+    /// The chain (a scanned block or the indexer) showed the row: it carries the chain's time now.
+    private func confirmLocalStamp(_ txId: String) {
+        guard localStampSentAt[txId] != nil else { return }
+        localStampSentAt[txId] = nil
+        localStampNextCheck[txId] = nil
+    }
+
+    private nonisolated static func loadLocalStamps() -> [String: Int64] {
+        guard let data = UserDefaults.standard.data(forKey: localStampsKey),
+              let saved = try? JSONDecoder().decode([String: Int64].self, from: data) else { return [:] }
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        return saved.mapValues { _ in now }
+    }
+
+    private nonisolated static func saveLocalStamps(_ stamps: [String: Int64]) {
+        guard let data = try? JSONEncoder().encode(stamps) else { return }
+        UserDefaults.standard.set(data, forKey: localStampsKey)
+    }
+
+    /// Own arena rows the chain has not shown `bound` ms after they were sent. Each is looked up:
+    /// accepted (REST API), it takes the block's time there; in a mempool, it waits another
+    /// round; found nowhere, it is marked failed, so the arena's reducer stops applying it and
+    /// the board is the chain's again (a move is the player's to play again). A row the network
+    /// cannot be asked about is given up after `giveUp` ms. A failed row the chain shows later
+    /// takes its block time and counts again (`PublicChatStore.updateBlockTime`). Returns the
+    /// ids marked failed.
+    func checkUnconfirmedServiceRows(olderThan bound: Int64, giveUpAfter giveUp: Int64) async -> Set<String> {
+        guard !isCheckingLocalStamps else { return [] }
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let due = localStampSentAt.filter { now - $0.value > bound && (localStampNextCheck[$0.key] ?? 0) <= now }
+        guard !due.isEmpty else { return [] }
+        isCheckingLocalStamps = true
+        defer { isCheckingLocalStamps = false }
+        var failed: Set<String> = []
+        var changed = false
+        for (txId, sentAt) in due {
+            let lookup = await Self.lookUpTransaction(txId: txId)
+            // The chain showed it while the lookup ran.
+            guard localStampSentAt[txId] != nil else { continue }
+            let later = Int64(Date().timeIntervalSince1970 * 1000) + 15_000
+            switch lookup {
+            case .accepted(let blockTime):
+                confirmLocalStamp(txId)
+                if let blockTime, store.updateBlockTime(id: txId, blockTime: blockTime) { changed = true }
+                continue
+            case .unanswered where now - sentAt <= giveUp:
+                localStampNextCheck[txId] = later
+                continue
+            case .notAccepted:
+                if await NodePoolService.shared.getMempoolEntry(txId: txId) != nil {
+                    localStampNextCheck[txId] = later
+                    continue
+                }
+            case .unanswered:
+                break
+            }
+            AppLog.log("[PublicChatService] Own arena tx %@ never reached the chain: dropped", String(txId.prefix(12)))
+            localStampSentAt[txId] = nil
+            localStampNextCheck[txId] = nil
+            store.updateMessageStatus(id: txId, status: .failed)
+            failed.insert(txId)
+            changed = true
+        }
+        if changed {
+            for channel in Self.serviceChannels { loadMessages(for: channel) }
+        }
+        return failed
+    }
+
+    private enum TransactionLookup {
+        case accepted(blockTime: Int64?)
+        case notAccepted
+        case unanswered
+    }
+
+    /// The REST API's view of a transaction: accepted (with its block's time), unknown or not
+    /// accepted, or no answer.
+    private static func lookUpTransaction(txId: String) async -> TransactionLookup {
+        let base = AppSettings.load().kaspaRestAPIURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: "\(base.hasSuffix("/") ? String(base.dropLast()) : base)/transactions/\(txId)?inputs=false&outputs=false&resolve_previous_outpoints=no") else { return .unanswered }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 8
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let status = (response as? HTTPURLResponse)?.statusCode else { return .unanswered }
+        if status == 404 { return .notAccepted }
+        guard status == 200, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return .unanswered }
+        guard (json["is_accepted"] as? Bool) == true else { return .notAccepted }
+        return .accepted(blockTime: (json["block_time"] as? NSNumber)?.int64Value)
+    }
+
     /// What a chess send should say when the chatting address has no coins at all - not the
     /// "wait for confirmations" of a change output still being mined, which retries.
     static var notEnoughKasMessage: String {
@@ -1413,6 +1545,9 @@ final class PublicChatService: ObservableObject {
         // typing their next message.
         let surfaced = KasiaError.networkError(Self.friendlySendErrorMessage(for: error))
         lastSendError = surfaced
+        // Kept as itself: a caller must be able to tell "may have gone through" from a failure
+        // (a bot stamp offers no Retry for it - a second stamp of the same game).
+        if error is SendOutcomeUnknownError { throw error }
         throw surfaced
     }
 
@@ -1556,10 +1691,27 @@ final class PublicChatService: ObservableObject {
             }
             chatService.clearNoInputRetryState(for: pendingId)
             let blockTime = Int64(Date().timeIntervalSince1970 * 1000)
-            if Self.serviceChannels.contains(channel) { locallyStampedTxIds.insert(txId) }
+            if Self.serviceChannels.contains(channel) { trackLocalStamp(txId) }
             store.resolvePendingMessage(pendingId: pendingId, realId: txId, blockTime: blockTime)
             loadMessages(for: channel)
             return txId
+        } catch let unknown as SendOutcomeUnknownError {
+            // A node may hold it: its coins stay reserved (the reservation runs out by itself if
+            // it never lands), or the next send would spend them again. An arena row is kept as
+            // sent - a move's ply stays taken - and the unconfirmed-row check below settles it
+            // (`checkUnconfirmedServiceRows`): the chain shows it, or it is dropped. Elsewhere the
+            // send fails with "may have gone through", never offering a blind resend.
+            chatService.reserveMessageOutpoints(spentUtxos)
+            chatService.consumePendingUtxos(spentUtxos)
+            if let senderScriptPubKey = KaspaAddress.scriptPublicKey(from: walletAddress) {
+                chatService.addPendingOutputs(from: tx, txId: unknown.txId, senderScriptPubKey: senderScriptPubKey)
+            }
+            guard Self.serviceChannels.contains(channel) else { throw unknown }
+            chatService.clearNoInputRetryState(for: pendingId)
+            trackLocalStamp(unknown.txId)
+            store.resolvePendingMessage(pendingId: pendingId, realId: unknown.txId, blockTime: Int64(Date().timeIntervalSince1970 * 1000))
+            loadMessages(for: channel)
+            return unknown.txId
         } catch {
             chatService.releaseMessageOutpoints()
             throw error
@@ -1775,7 +1927,7 @@ final class PublicChatService: ObservableObject {
                 (id: $0.txId, channel: $0.channel, senderAddress: $0.senderAddress, content: $0.content, blockTime: $0.blockTime)
             })
             for hit in messageHits {
-                if Self.serviceChannels.contains(hit.channel) { locallyStampedTxIds.remove(hit.txId) }
+                if Self.serviceChannels.contains(hit.channel) { confirmLocalStamp(hit.txId) }
                 if inserted.contains(hit.txId) {
                     touchedChannels.insert(hit.channel)
                     notifyIfEnabled(channel: hit.channel, senderAddress: hit.senderAddress, content: hit.content, txId: hit.txId)
