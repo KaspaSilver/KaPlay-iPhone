@@ -1773,3 +1773,4 @@
 "Dislikes" = "Дизлайки";
 "Reposts" = "Репосты";
 "Quotes" = "Цитаты";
+"Couldn't look up %@ right now. Try again in a moment." = "Сейчас не удалось проверить %@. Повторите чуть позже.";

@@ -132,14 +132,12 @@ struct ChessWalletView: View {
     /// lists (in grace and lapsed included). 0 where the registry isn't launched.
     @State private var kachatOwnedCount = 0
     @ObservedObject private var kachatRegistry = KachatNamesRegistry.shared
-    @State private var showMoreProfileInfo = false
     @State private var spendingAddressBalanceSompi: UInt64?
     @State private var isLoadingSpendingBalance = false
     /// Every spending address together, for the balance card and the top bar.
     @ObservedObject private var hotWallet = HotWalletBalance.shared
     /// The pending coalesced refresh - see `scheduleBalanceRefresh`.
     @State private var balanceRefreshTask: Task<Void, Never>?
-    @State private var showAvatarPreview = false
     @State private var showKachatSetupGuide = false
     @ObservedObject private var backupStatus = AccountBackupStatus.shared
     @State private var showBackupHygiene = false
@@ -331,8 +329,12 @@ struct ChessWalletView: View {
                 case .send:
                     // From is picked on the send's own step: the chatting address or any other.
                     if let wallet = walletManager.currentWallet {
-                        WithdrawKaspaView(fromAddress: wallet.publicAddress, availableBalanceSompi: wallet.balanceSompi)
-                            .sendKaspaSheetSizing()
+                        // A send from a spending address raises no live event here (only the
+                        // chatting address is watched), so Total and Spending refresh on Done.
+                        WithdrawKaspaView(fromAddress: wallet.publicAddress, availableBalanceSompi: wallet.balanceSompi) {
+                            scheduleBalanceRefresh()
+                        }
+                        .sendKaspaSheetSizing()
                     }
                 case .receive:
                     NavigationStack {
@@ -365,13 +367,6 @@ struct ChessWalletView: View {
                             await setPrimaryDomain(domain)
                         }
                     },
-                    onInscribeComplete: { result in
-                        Haptics.success()
-                        showToast(localizedFormat("Inscribe submitted for %@.", result.domain))
-                        Task {
-                            await refreshKNSData(for: target.info.address)
-                        }
-                    },
                     onTransferComplete: { result in
                         Haptics.success()
                         let message = result.verified
@@ -394,13 +389,6 @@ struct ChessWalletView: View {
                         }
                     })
                 }
-            }
-            .fullScreenCover(isPresented: $showAvatarPreview) {
-                KNSAvatarFullscreenView(
-                    avatarURLString: knsProfileInfo?.avatarURL,
-                    fallbackText: editedAlias,
-                    title: knsProfileInfo?.domainName ?? editedAlias
-                )
             }
             .fullScreenCover(isPresented: $showKachatSetupGuide) {
                 KachatSetupGuideView { showKachatSetupGuide = false }
@@ -503,11 +491,6 @@ struct ChessWalletView: View {
                     setPrimaryError: $setPrimaryMessage,
                     onSetPrimary: { domain in
                         Task { await setPrimaryDomain(domain) }
-                    },
-                    onInscribeComplete: { result in
-                        Haptics.success()
-                        showToast(localizedFormat("Inscribe submitted for %@.", result.domain))
-                        Task { await refreshKNSData(for: walletAddress) }
                     },
                     onTransferComplete: { result in
                         Haptics.success()
@@ -710,55 +693,6 @@ struct ChessWalletView: View {
         }
     }
 
-    /// Narrow gate for the collapsible "More Info" section — deliberately excludes
-    /// avatarUrl/bannerUrl since those are already shown elsewhere in the card.
-    private func hasMoreProfileInfo(_ profileInfo: KNSAddressProfileInfo) -> Bool {
-        guard let profile = profileInfo.profile else { return false }
-        return [profile.x, profile.website, profile.telegram, profile.discord, profile.contactEmail, profile.github, profile.redirectUrl]
-            .contains { !($0 ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-    }
-
-    @ViewBuilder
-    private func moreInfoRows(_ profileInfo: KNSAddressProfileInfo) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if let x = profileInfo.profile?.x, !x.isEmpty {
-                LabeledContent("X") {
-                    profileLinkView(text: x, url: KNSProfileLinkBuilder.xURL(from: x), fieldName: "X")
-                }
-            }
-            if let website = profileInfo.profile?.website, !website.isEmpty {
-                LabeledContent("Website") {
-                    profileLinkView(text: website, url: KNSProfileLinkBuilder.websiteURL(from: website), fieldName: "Website")
-                }
-            }
-            if let telegram = profileInfo.profile?.telegram, !telegram.isEmpty {
-                LabeledContent("Telegram") {
-                    profileLinkView(text: telegram, url: KNSProfileLinkBuilder.telegramURL(from: telegram), fieldName: "Telegram")
-                }
-            }
-            if let discord = profileInfo.profile?.discord, !discord.isEmpty {
-                LabeledContent("Discord") {
-                    profileLinkView(text: discord, url: KNSProfileLinkBuilder.discordURL(from: discord), fieldName: "Discord")
-                }
-            }
-            if let contactEmail = profileInfo.profile?.contactEmail, !contactEmail.isEmpty {
-                LabeledContent("Email") {
-                    profileLinkView(text: contactEmail, url: KNSProfileLinkBuilder.emailURL(from: contactEmail), fieldName: "Email")
-                }
-            }
-            if let github = profileInfo.profile?.github, !github.isEmpty {
-                LabeledContent("GitHub") {
-                    profileLinkView(text: github, url: KNSProfileLinkBuilder.githubURL(from: github), fieldName: "GitHub")
-                }
-            }
-            if let redirectUrl = profileInfo.profile?.redirectUrl, !redirectUrl.isEmpty {
-                LabeledContent("Redirect") {
-                    profileLinkView(text: redirectUrl, url: KNSProfileLinkBuilder.websiteURL(from: redirectUrl), fieldName: "Redirect")
-                }
-            }
-        }
-    }
-
     // MARK: - QR buttons row (Accept Kaspa / Chatting Address)
 
     /// Resolves a fresh receive address before drawing the QR, so the code on screen is never
@@ -797,7 +731,7 @@ struct ChessWalletView: View {
                 // Warmed on Profile's appear - when it is there this screen draws immediately,
                 // and the check below is a no-op re-confirmation rather than something the user
                 // waits behind.
-                if let warmed = ReceiveAddressWarmCache.address {
+                if let warmed = ReceiveAddressWarmCache.address(for: walletManager.currentWallet?.publicAddress) {
                     address = warmed
                     resolving = false
                 }
@@ -807,7 +741,7 @@ struct ChessWalletView: View {
                 // scanned the instant it appears, so it must not change under a pointed camera
                 // for any lesser reason.
                 if resolved != address { address = resolved }
-                ReceiveAddressWarmCache.address = resolved
+                ReceiveAddressWarmCache.store(resolved, for: walletManager.currentWallet?.publicAddress)
                 resolving = false
                 guard let resolved else { return }
                 // A failed lookup leaves the balance unknown (nothing shown) rather than 0 KAS.
@@ -932,7 +866,7 @@ struct ChessWalletView: View {
     /// opening the sheet is a read rather than a round trip.
     private func warmReceiveAddress() async {
         guard let address = await walletManager.freshReceiveAddress() else { return }
-        ReceiveAddressWarmCache.address = address
+        ReceiveAddressWarmCache.store(address, for: walletManager.currentWallet?.publicAddress)
         ProfileQRCodeCache.preload(address: address, completion: nil)
     }
 
@@ -998,39 +932,6 @@ struct ChessWalletView: View {
     /// Consumed by that tap; cleared on its own shortly after, so a hold whose finger slid
     /// away doesn't swallow a later, deliberate tap.
     @State private var suppressNextLinkOpen = false
-
-    @ViewBuilder
-    private func profileLinkView(text: String, url: URL?, fieldName: String) -> some View {
-        if let url {
-            Button {
-                guard !suppressNextLinkOpen else {
-                    suppressNextLinkOpen = false
-                    return
-                }
-                UIApplication.shared.open(url)
-            } label: {
-                Text(text)
-                    .foregroundColor(.accentColor)
-            }
-            .buttonStyle(.plain)
-            .simultaneousGesture(
-                LongPressGesture(minimumDuration: 0.45).onEnded { _ in
-                    copyProfileFieldValue(text, fieldName: fieldName)
-                    suppressNextLinkOpen = true
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 2_500_000_000)
-                        suppressNextLinkOpen = false
-                    }
-                }
-            )
-        } else {
-            Text(text)
-                .foregroundColor(.secondary)
-                .onLongPressGesture(minimumDuration: 0.45) {
-                    copyProfileFieldValue(text, fieldName: fieldName)
-                }
-        }
-    }
 
     private func copyProfileFieldValue(_ value: String, fieldName: String) {
         UIPasteboard.general.string = value
@@ -1565,7 +1466,19 @@ struct ChessWalletView: View {
 /// before its first frame. Process-lifetime only - it is a head start, never a source of truth,
 /// and `freshReceiveAddress` re-confirms it on every open.
 enum ReceiveAddressWarmCache {
-    @MainActor static var address: String?
+    @MainActor private static var account: String?
+    @MainActor private static var warmed: String?
+
+    /// The warmed address, only for the account it was decided for.
+    @MainActor static func address(for account: String?) -> String? {
+        guard let account, account == Self.account else { return nil }
+        return warmed
+    }
+
+    @MainActor static func store(_ address: String?, for account: String?) {
+        Self.account = account
+        warmed = address
+    }
 }
 
 private struct KNSProfileEditorSubmission {
@@ -1627,7 +1540,6 @@ private struct KNSProfileEditorSheet: View {
     @Binding var settingPrimaryDomainId: String?
     @Binding var setPrimaryMessage: KNSSetPrimaryMessage?
     let onSetPrimary: (KNSDomain) -> Void
-    let onInscribeComplete: (KNSDomainInscribeResult) -> Void
     let onTransferComplete: (KNSDomainTransferResult) -> Void
     let onRefreshDomains: () async -> Void
 
@@ -1674,7 +1586,6 @@ private struct KNSProfileEditorSheet: View {
         settingPrimaryDomainId: Binding<String?>,
         setPrimaryMessage: Binding<KNSSetPrimaryMessage?>,
         onSetPrimary: @escaping (KNSDomain) -> Void,
-        onInscribeComplete: @escaping (KNSDomainInscribeResult) -> Void,
         onTransferComplete: @escaping (KNSDomainTransferResult) -> Void,
         onRefreshDomains: @escaping () async -> Void,
         onSave: @escaping (KNSProfileEditorSubmission) -> Void
@@ -1685,7 +1596,6 @@ private struct KNSProfileEditorSheet: View {
         self._settingPrimaryDomainId = settingPrimaryDomainId
         self._setPrimaryMessage = setPrimaryMessage
         self.onSetPrimary = onSetPrimary
-        self.onInscribeComplete = onInscribeComplete
         self.onTransferComplete = onTransferComplete
         self.onRefreshDomains = onRefreshDomains
         self.onSave = onSave
@@ -2160,7 +2070,6 @@ private struct KNSDomainsListView: View {
     /// Success needs no message: the star moves to the new primary as soon as the write lands.
     @Binding var setPrimaryError: KNSSetPrimaryMessage?
     let onSetPrimary: (KNSDomain) -> Void
-    let onInscribeComplete: (KNSDomainInscribeResult) -> Void
     let onTransferComplete: (KNSDomainTransferResult) -> Void
     let onRefresh: () async -> Void
     var onCustomizeProfile: ((KNSDomain) -> Void)? = nil
@@ -2230,7 +2139,8 @@ private struct KNSDomainsListView: View {
            let own = try? await KachatNamesActions.shared.ownNamesAndOffers(heldOnly: true) {
             kachatCount = own.names.count
         } else if let key = KachatNamesRegistry.keyOf(walletAddress) {
-            kachatCount = (try? await kachatRegistry.heldNames(owner: key))?.count
+            // a failed read keeps what's shown
+            if let held = try? await kachatRegistry.heldNames(owner: key) { kachatCount = held.count }
         } else {
             kachatCount = 0
         }
@@ -2518,7 +2428,10 @@ struct KNSDomainDetailView: View {
                     } else if isSetPrimaryAllowed {
                         Divider().padding(.leading, 16)
                         Button {
-                            onSetPrimary(domain)
+                            // pays a fee from the chatting address, like any send
+                            DeviceAuth.authenticate(reason: AppLocalization.string("Confirm setting your primary domain"), onSuccess: {
+                                onSetPrimary(domain)
+                            })
                         } label: {
                             HStack {
                                 Text("Set as Primary")
@@ -2953,7 +2866,8 @@ struct KNSDomainSendView: View {
     private func commitCustomFee() {
         defer { isEditingFee = false }
         guard let sompi = KaspaUnit.sompi(fromUserText: customFeeText) else { return }
-        customFeeSompi = sompi
+        // the reveal pays this out of the commit: never more than it can cover
+        customFeeSompi = min(sompi, KNSDomainTransferService.maxPriorityFeeSompi)
     }
 
     private func send() {
@@ -3099,25 +3013,7 @@ struct ChattingAddressManageView: View {
             .padding(.top, 12)
 
 
-            // What used to be two unlabelled glyphs in the navigation bar. A pair of icons has
-            // room for no words at all, so neither said what it did, and there was nowhere to put
-            // a third thing. Same button and same sheet as Manage Addresses' own Address Actions.
-            Button {
-                Haptics.impact(.light)
-                showAddressActions = true
-            } label: {
-                Text("Address Actions")
-                    .font(.subheadline)
-                    .fontWeight(.bold)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                    .foregroundColor(.black)
-                    .background(Capsule().fill(Color.accentColor))
-            }
-            .buttonStyle(.plain)
-            .padding(.horizontal)
-            .padding(.top, 12)
-            .padding(.bottom, 8)
+            Color.clear.frame(height: 8)
 
             // Right above what it switches.
             UnderlineTabBar(
@@ -3136,13 +3032,33 @@ struct ChattingAddressManageView: View {
         }
         .navigationTitle("Chatting Address")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                AddressOptionsButton { showAddressActions = true }
+            }
+        }
         .sheet(isPresented: $showAddressActions, onDismiss: presentAddressActionChoice) {
-            addressActionsSheet
-                .presentationDetents([.height(330)])
+            let sheet = AddressActionsSheet(
+                explorerURL: settingsViewModel.settings.kaspaExplorer.addressURL(for: address),
+                onViewPrivateKey: {
+                    addressActionChoice = .privateKey
+                    showAddressActions = false
+                },
+                onViewPublicKey: {
+                    addressActionChoice = .publicKey
+                    showAddressActions = false
+                },
+                onViewInExplorer: { url in
+                    showAddressActions = false
+                    UIApplication.shared.open(url)
+                }
+            )
+            sheet
+                .presentationDetents([.height(sheet.height)])
                 .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $showPublicKeySheet) {
-            ChattingAddressPublicKeyView(address: address)
+            AddressPublicKeyView(address: address, note: "This is the public half of your chatting address. It identifies you and cannot spend anything.")
         }
         .safeAreaInset(edge: .bottom) {
             HStack(spacing: 12) {
@@ -3250,51 +3166,6 @@ struct ChattingAddressManageView: View {
         case nil:
             break
         }
-    }
-
-    /// The half sheet behind "Address Actions". Same shape as Manage Addresses' and Cold
-    /// Storage's sheets of the same name, so all three read as the same object.
-    private var addressActionsSheet: some View {
-        VStack(spacing: 0) {
-            Text("Address Actions")
-                .font(.headline)
-                .padding(.top, 20)
-                .padding(.bottom, 16)
-
-            VStack(spacing: 12) {
-                ActionSheetRow(
-                    title: "View Private Key",
-                    subtitle: "The key that spends this address. Never share it.",
-                    systemImage: "key.fill"
-                ) {
-                    addressActionChoice = .privateKey
-                    showAddressActions = false
-                }
-                ActionSheetRow(
-                    title: "View Public Key",
-                    subtitle: "The public half of this address, for anyone who asks for it.",
-                    systemImage: "number"
-                ) {
-                    addressActionChoice = .publicKey
-                    showAddressActions = false
-                }
-                if let url = settingsViewModel.settings.kaspaExplorer.addressURL(for: address) {
-                    ActionSheetRow(
-                        title: "View in Explorer",
-                        subtitle: "Opens this address on your chosen block explorer.",
-                        systemImage: "globe"
-                    ) {
-                        showAddressActions = false
-                        UIApplication.shared.open(url)
-                    }
-                }
-            }
-            .padding(.horizontal, 20)
-
-            Spacer(minLength: 0)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .padding(.bottom, 20)
     }
 
     private var transactionsList: some View {
@@ -3638,13 +3509,14 @@ private struct ChattingAddressPrivateKeyView: View {
     }
 }
 
-/// The chatting address's public key, from the Address Actions sheet.
+/// An address's public key, from the Address Actions sheet.
 ///
 /// Nothing is derived or unlocked to show this: a Kaspa P2PK address IS its public key in bech32,
 /// so this decodes the address the screen already has. No reveal gate and no clipboard expiry
 /// either - unlike the private key alongside it, this is a value you hand out on purpose.
-private struct ChattingAddressPublicKeyView: View {
+struct AddressPublicKeyView: View {
     let address: String
+    let note: LocalizedStringKey
     @Environment(\.dismiss) private var dismiss
 
     @State private var toastMessage: String?
@@ -3663,7 +3535,7 @@ private struct ChattingAddressPublicKeyView: View {
                     Label("Safe to share", systemImage: "checkmark.seal.fill")
                         .font(.headline)
                         .foregroundColor(.accentColor)
-                    Text("This is the public half of your chatting address. It identifies you and cannot spend anything.")
+                    Text(note)
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                 }
@@ -4585,6 +4457,9 @@ struct WithdrawKaspaView: View {
     /// Fills in a payment request: the address (locked), the exact amount and the memo.
     private func apply(_ request: PaymentRequest) {
         activeRequest = request
+        // a Max from before this request must not replace its amount on the next fee change
+        usedMax = false
+        maxCapped = false
         addressInput = request.address
         isValidAddress = KaspaAddress.isValidOnActiveNetwork(request.address)
         // the exact amount is what's sent; the field shows it in whichever unit it is in

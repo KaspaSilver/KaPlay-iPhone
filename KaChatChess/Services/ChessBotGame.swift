@@ -161,13 +161,21 @@ final class ChessBotGame: ObservableObject {
             id: id, bot: bot, playerColor: playerColor, result: result, moves: moves.map(\.move)
         )
         Task {
+            let txId: String
             switch await send(message) {
-            case .sent: break
+            case .sent(let id):
+                txId = id
             case .failed(let error):
                 stamp = .failed(error)
                 return
             case .unknown:
                 stamp = .unconfirmed(SendOutcomeUnknownError.message)
+                return
+            }
+            // A node taking it is not the chain showing it: "stamped", and a win counting on the
+            // board, wait for that. No Retry if it doesn't show: it may yet land.
+            guard await landed(txId) else {
+                stamp = .unconfirmed(AppLocalization.string("Sent, but Kaspa hasn't confirmed it yet."))
                 return
             }
             stamp = .stamped
@@ -177,13 +185,25 @@ final class ChessBotGame: ObservableObject {
         }
     }
 
+    private static let confirmChecks = 20
+    private static let confirmCheckGapNanos: UInt64 = 4_000_000_000
+
+    /// Whether the REST API shows the stamp accepted, within a little over a minute.
+    private func landed(_ txId: String) async -> Bool {
+        for _ in 0..<Self.confirmChecks {
+            try? await Task.sleep(nanoseconds: Self.confirmCheckGapNanos)
+            if await PublicChatService.shared.isTransactionAccepted(txId: txId) { return true }
+        }
+        return false
+    }
+
     /// One broadcast transaction, with the retries a send needs while the change of the last
     /// transaction is not spendable yet (the arena's sends do the same). Only that kind of error
     /// is retried: no KAS on the chatting address, or a send whose outcome is unknown (a second
     /// stamp of the same game), fails at once. Never deferred to a background retry, so nil -
     /// "stamped" - means the transaction really went out. Returns the error to show otherwise.
     private enum SendResult {
-        case sent
+        case sent(String)
         case failed(String)
         /// `SendOutcomeUnknownError`: it may have gone through.
         case unknown
@@ -197,7 +217,8 @@ final class ChessBotGame: ObservableObject {
                 let txId = try await PublicChatService.shared.sendPublicChat(
                     channel: ChessBotCodec.channel, content: content, deferNoInputRetry: false
                 )
-                return txId == nil ? .failed("The result was not sent.") : .sent
+                if let txId { return .sent(txId) }
+                return .failed("The result was not sent.")
             } catch {
                 if error is SendOutcomeUnknownError {
                     AppLog.log("[Chess] Bot game stamp outcome unknown")

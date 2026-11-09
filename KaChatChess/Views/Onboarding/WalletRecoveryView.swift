@@ -76,6 +76,10 @@ struct WalletRecoveryView: View {
                 .padding(.bottom, 24)
             }
             .background(Color(.systemBackground).ignoresSafeArea())
+            // Opened while the phone was locked: its saved keys can be read now.
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.protectedDataDidBecomeAvailableNotification)) { _ in
+                Task { await walletManager.loadWallet() }
+            }
             .navigationDestination(isPresented: $showImport) {
                 // The same flow onboarding uses: pick the source wallet, then enter the seed.
                 // A successful import sets the current wallet and the app opens by itself.

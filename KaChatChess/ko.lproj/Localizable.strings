@@ -1773,3 +1773,4 @@
 "Dislikes" = "싫어요";
 "Reposts" = "리포스트";
 "Quotes" = "인용";
+"Couldn't look up %@ right now. Try again in a moment." = "지금은 %@을(를) 조회할 수 없습니다. 잠시 후 다시 시도하세요.";

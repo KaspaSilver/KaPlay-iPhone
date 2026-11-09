@@ -50,6 +50,8 @@ struct PendingRequest {
     let sentAt: Date
     let timeout: TimeInterval
     let timeoutTask: Task<Void, Never>
+    /// `connectionGeneration` it was sent on: a late answer can only come on that same stream.
+    let generation: Int
 
     var isExpired: Bool {
         Date().timeIntervalSince(sentAt) > timeout
@@ -338,7 +340,18 @@ actor GRPCStreamConnection {
     /// status a smaller/personal node can send under load) gets breathing room instead of being
     /// hammered with a new attempt every ~100ms-1s indefinitely, which risks perpetuating
     /// exactly the resource pressure causing the rejections in the first place.
+    /// Reset by an actual message from the node (`handleResponse`), never by `connect()`
+    /// returning: the channel connects lazily, so that returns at once even for a node that is
+    /// refusing us, and the backoff would never grow.
     private var reconnectAttempts: Int = 0
+
+    /// `disconnect()` was asked for and no `connect()` since: an auto-reconnect already waiting
+    /// out its backoff must not bring the connection back.
+    private var closedDeliberately = false
+
+    /// How long a request that timed out keeps its place in its type's queue, to swallow its late
+    /// answer. See `handleTimeout`.
+    private static let lateAnswerWindow: TimeInterval = 10
 
     // MARK: - Initialization
 
@@ -391,6 +404,7 @@ actor GRPCStreamConnection {
         }
 
         state = .connecting
+        closedDeliberately = false
         let task = Task { try await self.connectWithTimeout() }
         connectingTask = task
         defer { if connectingTask == task { connectingTask = nil } }
@@ -422,7 +436,6 @@ actor GRPCStreamConnection {
             connectionGeneration += 1
             lastActivityAt = Date()
             circuitBreaker.reset()
-            reconnectAttempts = 0
 
             // Suppress noisy connection logs
 
@@ -471,18 +484,20 @@ actor GRPCStreamConnection {
         }
         self.stream = stream
 
-        // Monitor stream status to detect when server closes connection
+        // Monitor stream status to detect when server closes connection. The generation this
+        // stream will have once connected, so a late report about it can't close a newer one.
+        let generation = connectionGeneration + 1
         stream.status.whenComplete { [weak self] result in
             Task {
-                await self?.handleStreamClosed(result: result)
+                await self?.handleStreamClosed(result: result, generation: generation)
             }
         }
     }
 
     /// Handle stream being closed (by server or error)
-    private func handleStreamClosed(result: Result<GRPCStatus, Error>) {
-        // Only process if we think we're connected
-        guard state == .connected else { return }
+    private func handleStreamClosed(result: Result<GRPCStatus, Error>, generation: Int) {
+        // Only process if we think we're connected, on this stream
+        guard state == .connected, generation == connectionGeneration else { return }
 
         switch result {
         case .success(let status):
@@ -500,6 +515,14 @@ actor GRPCStreamConnection {
         state = .disconnected
         connectedAt = nil
         stream = nil
+
+        // Requests that timed out and were waiting for a late answer: this stream can't bring it.
+        for (type, queue) in requestQueues {
+            let live = queue.filter { pendingRequests[$0] != nil }
+            guard live.count != queue.count else { continue }
+            requestQueues[type] = live.isEmpty ? nil : live
+            releaseTypeSlot(type)
+        }
 
         // ClientConnection (unlike `stream`, the bidi RPC layered on top of it) is a
         // persistent, self-reconnecting abstraction - grpc-swift keeps retrying to
@@ -549,14 +572,23 @@ actor GRPCStreamConnection {
                 delaySeconds = backoff + Double.random(in: 0...0.3) * backoff
             }
             try? await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
-            guard await self.state == .disconnected else { return }
+            guard await self.state == .disconnected, await !self.closedDeliberately else { return }
             try? await self.connect()
         }
     }
 
     /// Disconnect from the endpoint
     func disconnect() async {
+        closedDeliberately = true
         guard state != .disconnected else { return }
+
+        // Before anything that suspends: the stream's status callback can run during the close
+        // below, and while this still read `.connected` it took the close for an unexpected drop
+        // and reconnected. `channel` is cleared here for the same reason: a `connect()` during
+        // the close sets its own, which must not be wiped afterwards.
+        state = .disconnected
+        connectedAt = nil
+        reconnectAttempts = 0
 
         // Cancel all pending requests
         for (_, pending) in pendingRequests {
@@ -572,14 +604,11 @@ actor GRPCStreamConnection {
         stream = nil
 
         // Properly close the channel and wait for completion to prevent leaks
-        if let ch = channel {
-            _ = try? await ch.close().get()
-        }
+        let closing = channel
         channel = nil
-
-        state = .disconnected
-        connectedAt = nil
-        reconnectAttempts = 0
+        if let closing {
+            _ = try? await closing.close().get()
+        }
 
         AppLog.log("[GRPCStream] Disconnected from %@", endpoint.key)
     }
@@ -667,7 +696,8 @@ actor GRPCStreamConnection {
                     continuation: continuation,
                     sentAt: startTime,
                     timeout: timeout,
-                    timeoutTask: timeoutTask
+                    timeoutTask: timeoutTask,
+                    generation: connectionGeneration
                 )
                 pendingRequests[requestId] = pending
 
@@ -709,6 +739,9 @@ actor GRPCStreamConnection {
 
     /// Handle incoming response
     private func handleResponse(_ message: Protowire_KaspadMessage) {
+        // The node really is talking to us: the reconnect backoff can start over.
+        reconnectAttempts = 0
+
         // Check for notifications first
         if let payload = message.payload {
             switch payload {
@@ -765,8 +798,10 @@ actor GRPCStreamConnection {
         // Let the next same-type caller through, before the early return below.
         releaseTypeSlot(type)
 
-        // Get pending request
+        // Get pending request. None: the late answer to a request that timed out, which is
+        // dropped here (`handleTimeout`) and still shows the node is responsive.
         guard let pending = pendingRequests.removeValue(forKey: requestId) else {
+            circuitBreaker.recordSuccess()
             return
         }
 
@@ -787,22 +822,27 @@ actor GRPCStreamConnection {
         pending.continuation?.resume(returning: message)
     }
 
-    /// Handle request timeout
+    /// Handle request timeout. The caller fails now, but the node may still answer, and answers
+    /// are matched by type alone: with the entry gone, that late answer would be handed to the
+    /// next request of this type. So on a live stream the id stays at the head of its type's
+    /// queue with no pending request behind it. It holds the type's slot, `handleResponse` drops
+    /// the answer against it, and the next request goes out only after that. If no answer comes
+    /// inside `lateAnswerWindow`, `lateAnswerWindowEnded` replaces the stream, since one could
+    /// still arrive at any later moment.
     private func handleTimeout(requestId: UInt64) {
         guard let pending = pendingRequests.removeValue(forKey: requestId) else {
             return
         }
 
-        // Remove from type queue
-        if var queue = requestQueues[pending.type] {
-            queue.removeAll { $0 == requestId }
-            if queue.isEmpty {
-                requestQueues.removeValue(forKey: pending.type)
-            } else {
-                requestQueues[pending.type] = queue
+        if pending.generation == connectionGeneration, state == .connected {
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(Self.lateAnswerWindow * 1_000_000_000))
+                self.lateAnswerWindowEnded(requestId: requestId, type: pending.type, generation: pending.generation)
             }
+        } else {
+            // sent on a stream that is gone: no answer can come
+            removeFromTypeQueue(requestId, type: pending.type)
         }
-        releaseTypeSlot(pending.type)
 
         // Track this type as recently timed out (to silently ignore late responses)
         recentlyTimedOutTypes.insert(pending.type)
@@ -822,6 +862,29 @@ actor GRPCStreamConnection {
 
         AppLog.log("[GRPCStream] Request timeout on %@ (type: %@)",
               endpoint.key, String(describing: pending.type))
+    }
+
+    /// Takes a request out of its type's queue and lets the next caller of that type through.
+    private func removeFromTypeQueue(_ requestId: UInt64, type: KaspaRequestType) {
+        if var queue = requestQueues[type] {
+            queue.removeAll { $0 == requestId }
+            requestQueues[type] = queue.isEmpty ? nil : queue
+        }
+        releaseTypeSlot(type)
+    }
+
+    /// A timed-out request's late answer never came. Still in the queue means unanswered on this
+    /// stream, so the only way to be sure it can never answer a newer request is a new stream.
+    private func lateAnswerWindowEnded(requestId: UInt64, type: KaspaRequestType, generation: Int) {
+        guard requestQueues[type]?.contains(requestId) == true else { return }
+        guard generation == connectionGeneration, state == .connected else {
+            removeFromTypeQueue(requestId, type: type)
+            return
+        }
+        AppLog.log("[GRPCStream] No late answer on %@ (type: %@) - replacing the stream",
+              endpoint.key, String(describing: type))
+        markDisconnected()
+        scheduleAutoReconnect()
     }
 
     /// Handle send failure

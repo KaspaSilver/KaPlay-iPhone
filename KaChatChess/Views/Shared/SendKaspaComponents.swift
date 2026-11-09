@@ -1036,136 +1036,6 @@ private struct KaspaKeypadKeyStyle: ButtonStyle {
 
 // MARK: - Send button
 
-/// The send button: slide the knob to the right end to send, so a payment can't go out on a
-/// stray touch. Letting go before the end springs it back; after a send that didn't go through
-/// (an error, the small-amount question) it resets by itself. VoiceOver gets a plain activate
-/// action. With `requiresSlide: false` it's an ordinary tap in the same look, for a step that
-/// moves nothing by itself.
-struct SendActionButton: View {
-    let title: LocalizedStringKey
-    let isBusy: Bool
-    let isEnabled: Bool
-    var requiresSlide = true
-    let action: () -> Void
-
-    @State private var offset: CGFloat = 0
-    @State private var reachedEnd = false
-    private let height: CGFloat = 56
-    private let inset: CGFloat = 4
-
-    private var active: Bool { isEnabled && !isBusy }
-
-    var body: some View {
-        Group {
-            if requiresSlide {
-                slider
-            } else {
-                track(progress: 0)
-                    .overlay {
-                        label.frame(maxWidth: .infinity)
-                    }
-                    .onTapGesture {
-                        guard active else { return }
-                        action()
-                    }
-            }
-        }
-        .frame(height: height)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(Text(title))
-        .accessibilityAddTraits(.isButton)
-        .accessibilityAction {
-            guard active else { return }
-            action()
-        }
-        .onChange(of: isBusy) { busy in
-            if !busy { reset() }
-        }
-    }
-
-    private var slider: some View {
-        GeometryReader { geometry in
-            let knob = height - inset * 2
-            let maxOffset = max(1, geometry.size.width - knob - inset * 2)
-            let progress = min(1, offset / maxOffset)
-            ZStack(alignment: .leading) {
-                track(progress: progress, knob: knob)
-                label
-                    .opacity(isBusy ? 1 : Double(1 - progress))
-                    .frame(maxWidth: .infinity)
-                if !isBusy {
-                    Circle()
-                        .fill(Color.white)
-                        .frame(width: knob, height: knob)
-                        .overlay(
-                            Image(systemName: "chevron.right.2")
-                                .font(.headline.weight(.bold))
-                                .foregroundColor(Color.accentColor)
-                        )
-                        .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
-                        .offset(x: inset + offset)
-                        .gesture(
-                            DragGesture(minimumDistance: 0)
-                                .onChanged { value in
-                                    guard active else { return }
-                                    if offset == 0 && value.translation.width > 0 { Haptics.impact(.light) }
-                                    offset = min(max(0, value.translation.width), maxOffset)
-                                    if offset >= maxOffset && !reachedEnd {
-                                        reachedEnd = true
-                                        Haptics.impact(.medium)
-                                    } else if offset < maxOffset {
-                                        reachedEnd = false
-                                    }
-                                }
-                                .onEnded { _ in
-                                    guard active else { return }
-                                    if offset >= maxOffset * 0.95 {
-                                        offset = maxOffset
-                                        action()
-                                        // A send that didn't start (dust question, a validation
-                                        // error) leaves it not busy: put the knob back.
-                                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                                            if !isBusy { reset() }
-                                        }
-                                    } else {
-                                        reset()
-                                    }
-                                }
-                        )
-                }
-            }
-        }
-    }
-
-    private func track(progress: CGFloat, knob: CGFloat = 0) -> some View {
-        ZStack(alignment: .leading) {
-            Capsule()
-                .fill(Color.accentColor.opacity(isEnabled || isBusy ? 1 : 0.4))
-            if knob > 0 {
-                Capsule()
-                    .fill(Color.white.opacity(0.25))
-                    .frame(width: inset * 2 + knob + offset)
-            }
-        }
-    }
-
-    private var label: some View {
-        HStack(spacing: 8) {
-            if isBusy {
-                ProgressView().tint(.black)
-            } else {
-                Text(title).font(.headline)
-            }
-        }
-        .foregroundColor(.black)
-    }
-
-    private func reset() {
-        reachedEnd = false
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) { offset = 0 }
-    }
-}
-
 // MARK: - Testing a failed send
 
 /// Debug builds only: launched with `KACHAT_FAIL_SEND=1` in the environment (in the Simulator:
@@ -1836,6 +1706,8 @@ struct OwnAddressList: View {
     let onPick: (SendSource) -> Void
     @State private var entries: [SpendingAddressEntry]?
     @State private var used: [String: Bool] = [:]
+    /// False when the balances couldn't be read: rows show none rather than a wrong figure.
+    @State private var balancesRead = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1848,7 +1720,7 @@ struct OwnAddressList: View {
                 .padding(.top, 8)
             if let entries {
                 ForEach(entries) { entry in
-                    row(title: entry.displayLabel, address: entry.address, balance: entry.balanceSompi) {
+                    row(title: entry.displayLabel, address: entry.address, balance: balancesRead ? entry.balanceSompi : nil) {
                         .spending(index: entry.index, address: entry.address, label: entry.displayLabel)
                     }
                 }
@@ -1858,7 +1730,8 @@ struct OwnAddressList: View {
             }
         }
         .task {
-            let all = await WalletManager.shared.getSpendingAddressList()
+            let (all, read) = await WalletManager.shared.readSpendingAddressList()
+            balancesRead = read
             let shown = all
                 .filter { !$0.hidden || $0.balanceSompi > 0 }
                 .filter { !excludeQuantum || !$0.isQuantum }

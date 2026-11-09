@@ -729,6 +729,10 @@ final class NodePoolService: ObservableObject {
     /// twice, a moment apart, since a just-accepted transaction may not have propagated yet.
     /// `afterRejection`: a node turned the transaction down, so a REST server typed into Settings
     /// isn't enough to call it sent - only a mempool, or the built-in REST server (as in KaPay).
+    func networkHasTransaction(_ txId: String) async -> Bool {
+        await isTransactionKnown(txId: txId)
+    }
+
     private func isTransactionKnown(txId: String, afterRejection: Bool = false) async -> Bool {
         for attempt in 0..<2 {
             if attempt > 0 { try? await Task.sleep(nanoseconds: 1_500_000_000) }

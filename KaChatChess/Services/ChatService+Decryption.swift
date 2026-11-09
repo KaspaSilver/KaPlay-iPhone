@@ -188,75 +188,6 @@ extension ChatService {
         return alias
     }
 
-    func decryptPaymentPayloadFromSealedHex(_ payload: String?, privateKey: Data) async -> PaymentPayload? {
-        guard let payload = payload else { return nil }
-        return await Task.detached(priority: .userInitiated) {
-            Self.decryptPaymentPayloadFromSealedHexSync(payload, privateKey: privateKey)
-        }.value
-    }
-
-    nonisolated static func decryptPaymentPayloadFromSealedHexSync(_ payload: String, privateKey: Data) -> PaymentPayload? {
-        do {
-            let decrypted = try KasiaCipher.decryptHex(payload, privateKey: privateKey)
-            if let data = decrypted.data(using: .utf8),
-               let json = try? JSONDecoder().decode(PaymentPayload.self, from: data) {
-                return json
-            }
-        } catch {
-            return nil
-        }
-        return nil
-    }
-
-    func decryptPaymentPayloadFromRawPayload(_ payload: String?, privateKey: Data) async -> PaymentPayload? {
-        guard let payload = payload else { return nil }
-        return await Task.detached(priority: .userInitiated) {
-            Self.decryptPaymentPayloadFromRawPayloadSync(payload, privateKey: privateKey)
-        }.value
-    }
-
-    nonisolated static func decryptPaymentPayloadFromRawPayloadSync(_ payload: String, privateKey: Data) -> PaymentPayload? {
-        guard let payloadData = hexStringToData(payload) else {
-            AppLog.log("[ChatService] Raw payload: failed to decode hex for payment")
-            return nil
-        }
-
-        // Dual-read: new `kchat:1:pay:` root and the two legacy `ciph_msg:` roots - and a KaPosts
-        // tip (`kchat:1:tip:`), whose sealed record is the same, as hex in its last field.
-        let prefixNew = Data("kchat:1:pay:".utf8)
-        let prefixV1 = Data("ciph_msg:1:pay:".utf8)
-        let prefixLegacy = Data("ciph_msg:pay:".utf8)
-        let encryptedBytes: Data
-
-        if let sealed = tipSealedBytes(payloadData) {
-            encryptedBytes = sealed
-        } else if payloadData.starts(with: prefixNew) {
-            encryptedBytes = Data(payloadData.dropFirst(prefixNew.count))
-        } else if payloadData.starts(with: prefixV1) {
-            encryptedBytes = Data(payloadData.dropFirst(prefixV1.count))
-        } else if payloadData.starts(with: prefixLegacy) {
-            encryptedBytes = Data(payloadData.dropFirst(prefixLegacy.count))
-        } else {
-            return nil
-        }
-
-        guard let encryptedMessage = KasiaCipher.EncryptedMessage(fromBytes: encryptedBytes) else {
-            return nil
-        }
-
-        do {
-            let decrypted = try KasiaCipher.decrypt(encryptedMessage, privateKey: privateKey)
-            if let data = decrypted.data(using: .utf8),
-               let json = try? JSONDecoder().decode(PaymentPayload.self, from: data) {
-                return json
-            }
-        } catch {
-            return nil
-        }
-
-        return nil
-    }
-
     nonisolated static func isPaymentRawPayload(_ payload: String) -> Bool {
         guard let payloadData = hexStringToData(payload) else { return false }
         let prefixNew = Data("kchat:1:pay:".utf8)
@@ -269,21 +200,6 @@ extension ChatService {
     /// A KaPosts tip: `kchat:1:tip:<pubkey>:<signature>:<post_id>:<author_pubkey>:<sealed_hex>`
     /// (KAPOSTS_INDEXER.md 5.11) - a chat payment to the post's author that names the post.
     nonisolated static let tipPrefix = "kchat:1:tip:"
-
-    /// The tip's parts, or nil when `payloadData` isn't a well-formed tip.
-    nonisolated static func tipParts(_ payloadData: Data) -> (pubkey: String, postId: String, authorPubkey: String, sealedHex: String)? {
-        guard payloadData.starts(with: Data(tipPrefix.utf8)),
-              let text = String(data: payloadData, encoding: .utf8) else { return nil }
-        let fields = text.dropFirst(tipPrefix.count).split(separator: ":", omittingEmptySubsequences: false).map(String.init)
-        guard fields.count == 5, !fields[4].isEmpty else { return nil }
-        return (fields[0], fields[2], fields[3], fields[4])
-    }
-
-    /// The sealed payment record inside a tip, as bytes.
-    nonisolated static func tipSealedBytes(_ payloadData: Data) -> Data? {
-        guard let parts = tipParts(payloadData) else { return nil }
-        return hexStringToData(parts.sealedHex)
-    }
 
     /// Decrypt self-stash on background thread
     func decryptSelfStash(_ stashedData: String, privateKey: Data) async -> SavedHandshakeData? {

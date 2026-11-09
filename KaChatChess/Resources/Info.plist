@@ -19,12 +19,10 @@
 	<string>$(KACHAT_BUILD_NUMBER)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
-	<key>KaChatBuildNumber</key>
-	<string>$(KACHAT_BUILD_NUMBER)</string>
 	<key>KaChatIsRelease</key>
 	<string>$(KACHAT_IS_RELEASE)</string>
 	<key>NFCReaderUsageDescription</key>
-	<string>KaPlay uses NFC to save and restore an encrypted backup of your seed phrase on your smart card.</string>
+	<string>KaPlay uses NFC to save and restore an encrypted backup of your 12 or 24 words on your smart card.</string>
 	<!-- KaChat-NFC's applet first, then the card manager, which only tells a card that hasn't been
 	     loaded yet from one that isn't a smart card. iOS only reports a card as an ISO 7816 tag
 	     when it answers one of these. See NFCCard.swift. -->
@@ -36,7 +34,7 @@
 	<key>NSCameraUsageDescription</key>
 	<string>KaPlay uses the camera to scan a Kaspa address QR code when you send KAS.</string>
 	<key>NSFaceIDUsageDescription</key>
-	<string>Face ID is used to unlock your seed phrase and sign back in, when enabled in Settings.</string>
+	<string>Face ID confirms sends and deleting an account. When enabled in Settings, it also unlocks your 12 or 24 words and signs you back in.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>KaPlay connects to a Kaspa node on your local network only if you set one up in Settings &gt; Connection.</string>
 	<key>UIApplicationSceneManifest</key>

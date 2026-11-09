@@ -23,17 +23,18 @@ Fresh Address or Choose an Address), Backup Hygiene when due, the Manage Address
 (`Views/Wallet/ManageAddressesView.swift`: spending addresses numbered from #1 with
 `WalletManager.addressNumber`, Discover Addresses, Address Visibility, each address's history,
 UTXOs, Domains, Send, compound and private key; its Chatting Address row opens
-`ChattingAddressManageView` with Address Actions for the keys and explorer, and Compound under UTXOs)
+`ChattingAddressManageView`, with `AddressOptionsButton` top right opening `AddressActionsSheet` for the keys and explorer, as every single-address page has, and Compound under UTXOs)
 and the Chatting Address square (its QR), then Your Domains (`KNSDomainsListView`: .kachat, .kas,
 .k, .kaspa; a .kas domain's detail has Set as Primary, Customize Profile (`KNSProfileEditorSheet`)
 and Send (`KNSDomainSendView`); .kachat names open `KachatLiveNameDetail`, `Views/Ecosystem/`),
 and Help (`ProfileHelpView`, the .kachat names guide). Left out from KaPay: Portfolio, Cold Storage,
-the .kachat marketplace (so Your Domains > .kachat has no Inscribe, and transactions open the
-explorer with no Add to Portfolio) and Contacts (owner's call, 2026-11-07: someone who wants saved
+the .kachat marketplace (so Your Domains > .kachat has no Inscribe, a name's detail has no Buy,
+Offer or List for Sale, and transactions open the explorer with no Add to Portfolio) and Contacts (owner's call, 2026-11-07: someone who wants saved
 contacts uses KaChat or KaPay, so KaPlay has no Address Book, Contacts pill or contact photos).
 
-Account removal clears the bell and .kachat reminders
-(`WalletManager.removeWalletTabData`). The bell (`GlobalNotificationCenter`) lists .kachat news
+Account removal clears what the app keeps per account, on both networks' addresses: the bell and
+what it compares against, .kachat reminders and saved names, the balance cache, added date, address
+choice and bot games (`WalletManager.removeWalletTabData`), and the spending data. The bell (`GlobalNotificationCenter`) lists .kachat news
 (`KachatNamesNotifier`) and Kaspa received on the chatting address from someone else
 (`WalletReceiptNotifier`, fed each live UTXO batch; KaPlay's subscription is the chatting address
 only, so spending addresses get no Received rows). A row opens the address
@@ -56,10 +57,28 @@ button opens KaPlay (`ChessBotLinks`, ONLINE_CHESS.md §7.2).
 Online moves, joins, claims and bot stamps never wait in a silent background retry
 (`PublicChatService.sendPublicChat(deferNoInputRetry: false)`): no coins on the chatting address says
 "Not enough KAS on your Chatting Address", and only "change not mined yet" is retried, a few times.
-A move the chain hasn't shown in 25 s can be played again. A timeout claim is retried every 30 s
-until the chain decides the game, the board offers Claim win, and a decided game can be left
-without resigning. Per-account arena state (queued join, pending moves, claims) clears when the
+A move, join or claim the chain never shows is looked up after 60 s and dropped if it didn't land,
+so it can be played again. A timeout claim that doesn't take is retried automatically at most 4
+times per flag, 30 s apart, paging the arena again first (`maxAutoClaims`); after that the board's
+Claim win is still there. A decided game can be left without resigning. Per-account arena state (queued join, pending moves, claims) clears when the
 account changes. The 30-day replay runs off the main thread (`reduceArena`).
+
+## When the chess server is down
+
+The arena's indexer is watched by `PublicChatIndexerClient.arenaHealth` (`arenaServerDown` on the
+screens, `ChessServerDownNote`; one request a minute checks whether it's back). Live moves come from
+the block stream, on cellular too while it's down. The player's own live games are also read every
+10 s from that game's two players' addresses on the Kaspa REST API (`readArenaFromChain`), which fills gaps
+but can't find rooms or joiners, since a channel has no address: the arena's history can't be
+rebuilt without the indexer. So public rooms aren't joinable without its answer, and a timeout claim
+needs a read of the chain newer than the flag (`flagIsConfirmed`). When it's back the arena is paged
+in again and the indexer's block times replace the stream's.
+
+The .kachat registry has its own outage rule: it moves to the chain after 3 failed indexer requests
+within 2 minutes, failures under 5 s apart counting as one (`KachatNamesRegistry.indexerOutageConfirmed`).
+A .kachat name resolved to an address always has its record checked live on chain
+(`confirmOnChain`), and the chain copy only answers while its last full check is under 3 minutes old
+(`chainCopyIsCurrent`).
 
 ## Nothing players type reaches other players
 
@@ -84,10 +103,16 @@ first screen shows `AccountBackupBanner` above its title (`fixedScreenTitle(_:sh
 red once the chatting address holds funds; the dock has no badge) and the Delete Account warning
 leads with Back Up Account; deleting is never blocked. The words are called "12 or 24 words" everywhere people read,
 as in KaChat. Imported and older accounts are never owed one. Finishing the steps or importing, by
-typing the words or from a card, starts a six-month timer, and a changed chatting address keeps the
-status (`AccountBackupStatus.moveStatus`). When it runs out the Wallet tab shows `BackupHygieneCard`
+typing the words or from a card, starts a six-month timer. When it runs out the Wallet tab shows `BackupHygieneCard`
 in the same place, and `BackupHygieneView` asks for five random words, then the passphrase if there
 is one.
+
+The signed-in account's seed, private key and record are three Keychain writes, so
+`WalletManager.writeActiveSlot` files a `SlotWriteIntent` around them and the next load finishes a
+write the app was killed in, from the account's snapshot. Importing the words of an account already
+saved here keeps its data. The recovery screen's Remove refuses while a snapshot can't be read.
+Delete Account stops polling and the UTXO subscription first and removes the keys next; only once
+they're gone does the per-account data go, so a failed delete leaves the account signed in and whole.
 
 **NFC card backup** (`Services/NFCCard.swift`, in App Store builds too since 2026-11-06, as in
 KaChat; `NFCCard.isAvailable` hides it where NFC can't read these cards, such as iPad): an extra copy of the words of a seed phrase

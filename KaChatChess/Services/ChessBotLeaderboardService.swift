@@ -39,8 +39,23 @@ final class ChessBotLeaderboardService: ObservableObject {
     /// Period -> level -> board.
     @Published private var boards: [ChessLeaderboardPeriod: [Int: Board]] = [:]
 
+    /// The last refresh got no board at all: what's shown is what the phone already had.
+    @Published private(set) var serverUnreachable = false
+
     private var lastFetch: Date?
     private var task: Task<Void, Never>?
+    private var availabilityObserver: NSObjectProtocol?
+
+    init() {
+        // The chess server came back: the boards too, without waiting for a pull.
+        availabilityObserver = NotificationCenter.default.addObserver(forName: .indexerAvailabilityChanged, object: nil, queue: .main) { [weak self] note in
+            guard (note.userInfo?["down"] as? Bool) == false else { return }
+            Task { @MainActor [weak self] in
+                self?.serverUnreachable = false
+                self?.refresh(force: true)
+            }
+        }
+    }
 
     /// At most every 20 s unless forced.
     func refresh(force: Bool = false) {
@@ -51,6 +66,8 @@ final class ChessBotLeaderboardService: ObservableObject {
         lastFetch = Date()
         task?.cancel()
         task = Task { [weak self] in
+            var answered = false
+            defer { if !Task.isCancelled { self?.serverUnreachable = !answered } }
             for period in ChessLeaderboardPeriod.allCases {
                 guard var components = URLComponents(string: "\(base)/chess/bots/leaderboard") else { return }
                 components.queryItems = [
@@ -65,6 +82,7 @@ final class ChessBotLeaderboardService: ObservableObject {
                       let decoded = try? JSONDecoder().decode(Response.self, from: data),
                       decoded.period == period.rawValue else { continue }
                 guard !Task.isCancelled, let self else { return }
+                answered = true
                 var levels: [Int: Board] = [:]
                 for bot in decoded.bots {
                     levels[bot.level] = Board(
@@ -91,7 +109,7 @@ final class ChessBotLeaderboardService: ObservableObject {
                 rows.append(own)
             }
         }
-        return rows.sorted { ($0.moves, $0.at) < ($1.moves, $1.at) }
+        return rows.sorted { ($0.moves, $0.at, $0.address) < ($1.moves, $1.at, $1.address) }
     }
 
     /// Has anyone played this bot, as far as this phone can tell?

@@ -29,10 +29,6 @@ enum SharedFormatting {
     static let iso8601 = ISO8601DateFormatter()
 }
 
-enum SharedDetectors {
-    static let link = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
-}
-
 private struct DynamicCodingKey: CodingKey {
     var stringValue: String
     var intValue: Int?
@@ -320,37 +316,6 @@ struct Contact: Codable, Identifiable, Equatable, Hashable {
         let body = parts[1]
         guard body.count > 12 else { return "\(prefix):\(body)" }
         return "\(prefix):\(body.prefix(4))....\(body.suffix(4))"
-    }
-}
-
-/// One saved Kaspa address in the Address Book (Kaspa Hub > Address Book). Kept per wallet,
-/// on this device and in the chat backup - never in the phone's Contacts.
-struct AddressBookEntry: Codable, Identifiable, Equatable, Hashable {
-    var id: UUID
-    var address: String
-    /// May be empty: the person removed the name they gave, and the address goes by who it is on
-    /// chain again (its .kachat name, else the address). Read it through `customName`.
-    var name: String
-
-    /// The name the person gave this address, or nil when it has none.
-    var customName: String? {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-    var note: String
-    var createdAt: Date
-    var updatedAt: Date
-    /// The assigned photo as base64 JPEG - only in the backup archive. In the app it is a file
-    /// (`AddressBookManager.photo(for:)`), so this stays nil everywhere else.
-    var photo: String? = nil
-
-    init(id: UUID = UUID(), address: String, name: String, note: String = "", createdAt: Date = Date(), updatedAt: Date = Date()) {
-        self.id = id
-        self.address = address
-        self.name = name
-        self.note = note
-        self.createdAt = createdAt
-        self.updatedAt = updatedAt
     }
 }
 
@@ -1182,14 +1147,6 @@ extension ChatMessage {
     }
 }
 
-extension GroupMessage {
-    /// See `ChatMessage.replacingContent`.
-    func replacingContent(_ newContent: String) -> GroupMessage {
-        GroupMessage(id: id, groupId: groupId, txId: txId, senderAddress: senderAddress, senderIdHex: senderIdHex, content: newContent,
-                     timestamp: timestamp, blockTime: blockTime, isOutgoing: isOutgoing, deliveryStatus: deliveryStatus)
-    }
-}
-
 // MARK: - Fresh-address payment pools
 
 /// A batch of the SENDER's own fresh receive addresses, shared so the recipient can pay them
@@ -1326,7 +1283,7 @@ struct ChessResignContent: Codable, Equatable {
     var reason: String? = nil
 }
 
-/// Any one of the four chess envelope shapes, parsed generically - `ChessGameService` uses this
+/// Any one of the four chess envelope shapes, parsed generically,
 /// to scan a conversation's messages for everything belonging to a given game without knowing
 /// each shape's exact fields up front.
 enum ChessEnvelope {
@@ -2355,17 +2312,6 @@ enum NotificationMode: String, Codable, CaseIterable {
 
 // MARK: - Mentions
 
-/// @mentions are built on .kas (KNS) names - the autocomplete offers a person's primary .kas
-/// domain, KaPosts resolves `@name.kas` to its owner, groups swap it for their address. 5.2 turns
-/// them off app-wide until they are rebuilt on KaChat's own .kachat names. Every mention entry
-/// point checks this; flipping it back on restores them as they were. While off: no @
-/// suggestions, no mentions sent (posts carry none, group text is not encoded), no mention
-/// links in posts, and no "only notify if I'm mentioned" (a stored choice is kept, not applied).
-/// Mentions other clients already sent still display.
-enum MentionsFeature {
-    static let enabled = false
-}
-
 // MARK: - Settings Models
 
 struct AppSettings: Codable {
@@ -3138,11 +3084,11 @@ enum KasiaError: LocalizedError {
         case .walletNotFound:
             return "Account not found. Please create or import an account."
         case .invalidSeedPhrase:
-            return "Invalid seed phrase. Please enter 12 or 24 words."
+            return "These words aren't valid. Please enter your 12 or 24 words."
         case .seedPhraseParsingFailed(let wordCount):
-            return "Seed phrase parsing failed. Detected \(wordCount) words (expected 12 or 24)."
+            return "\(wordCount) words were entered. Please enter 12 or 24 words."
         case .mnemonicValidationFailed(let reason):
-            return "Mnemonic validation failed: \(reason)"
+            return "These words aren't valid: \(reason)"
         case .invalidAddress:
             return "Invalid Kaspa address format."
         case .ownAccountAddress:
@@ -3497,17 +3443,6 @@ struct GrpcEndpoint: Codable, Identifiable, Equatable {
 // Keychain only (never synced anywhere); non-secret roster/message metadata lives in
 // GroupStore's local-only Core Data store (mirrors PublicChatStore's pattern).
 
-/// A member of a group chat.
-struct GroupMember: Codable, Identifiable, Equatable, Hashable {
-    var id: String { address }
-    let address: String
-    /// Hex-encoded 32-byte x-only secp256k1 pubkey, used for gcomm signature verification
-    /// and blinded_group_id derivation.
-    let xOnlyPubKeyHex: String
-    var isAdmin: Bool
-    var displayName: String?
-}
-
 /// Local secret+state bag for a group, persisted in Keychain (device-specific, SE-wrapped,
 /// never synced anywhere) - mirrors the reference implementation's `GroupBag` schema.
 struct GroupBag: Codable, Sendable {
@@ -3616,31 +3551,3 @@ struct GroupBag: Codable, Sendable {
     }
 }
 
-/// Non-secret group metadata - the in-memory/view-facing model backed by GroupStore.
-struct GroupChat: Identifiable, Equatable, Hashable {
-    let id: String                   // groupId, hex
-    var name: String
-    var adminAddress: String
-    var adminXOnlyPubKeyHex: String
-    var members: [GroupMember]
-    var currentEpoch: UInt64
-    var createdAt: Date
-    /// True if the local wallet is this group's admin (i.e. this device holds groupSeed).
-    var isAdmin: Bool
-}
-
-/// A decrypted group chat message (mirrors ChatMessage's shape for reuse in UI/bubble views).
-struct GroupMessage: Identifiable, Equatable, Sendable {
-    let id: UUID
-    let groupId: String
-    let txId: String
-    /// Resolved from senderId against the roster; nil if the sender isn't a known member
-    /// (e.g. a stale roster mid-epoch-rotation).
-    let senderAddress: String?
-    let senderIdHex: String
-    let content: String
-    let timestamp: Date
-    let blockTime: Int64
-    let isOutgoing: Bool
-    var deliveryStatus: ChatMessage.DeliveryStatus
-}

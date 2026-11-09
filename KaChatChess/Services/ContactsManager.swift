@@ -146,88 +146,6 @@ final class ContactsManager: ObservableObject {
     /// itself - hundreds of addresses each checked and re-published - from happening at all.
     private static let fullKNSSweepInterval: TimeInterval = 5 * 60
 
-    /// Fetch KNS domains for all contacts.
-    ///
-    /// Guarded twice, because this walks EVERY contact through two KNS passes and is called from
-    /// screens that open often - the chat list, and both KaPosts composers.
-    ///
-    /// `isFetchingKNS` was being set and never read, so two callers (opening the composer while
-    /// the chat list had one running, or the two composer views together) each started their own
-    /// full sweep over the same addresses. And nothing remembered a sweep had just finished, so
-    /// every composer open started another walk: with a large contact list that is hundreds of
-    /// requests, and hundreds of profile-cache publishes into an `@ObservedObject` the composer
-    /// is watching, which is a re-render of the editor per landing profile. Reported as the app
-    /// freezing on opening the KaPosts composer, with a burst of KNS profile calls before it.
-    ///
-    /// `force` is for the pull-to-refresh paths, where the user has explicitly asked.
-    func fetchKNSDomainsForAllContacts(network: NetworkType = .mainnet, force: Bool = false) async {
-        // Every result of this sweep is a .kas name to show for a contact, which 5.2 stopped
-        // doing (`KNSService.showsDomainNamesAsIdentity`), so it no longer asks KNS at all.
-        guard KNSService.showsDomainNamesAsIdentity else { return }
-        guard !contacts.isEmpty else { return }
-        guard !isFetchingKNS else { return }
-        if !force, let last = lastFullKNSSweepAt,
-           Date().timeIntervalSince(last) < Self.fullKNSSweepInterval {
-            return
-        }
-
-        isFetchingKNS = true
-        defer {
-            isFetchingKNS = false
-            lastFullKNSSweepAt = Date()
-        }
-
-        let addresses = contacts.map { $0.address }
-        await knsService.refreshIfNeeded(for: addresses, network: network)
-        await knsService.refreshProfilesIfNeeded(for: addresses, network: network)
-
-        // Keeps an existing domain-based name fresh. Nothing here NAMES a contact - an
-        // unnamed one stays unnamed and resolves through `displayName(for:)` instead.
-        for contact in contacts {
-            if let knsInfo = knsService.domainCache[contact.address],
-               let primaryDomain = knsInfo.primaryDomain {
-                // An unnamed contact is deliberately left unnamed: `displayName(for:)` shows
-                // their KNS domain, so baking it into the alias would only freeze a name the
-                // user never chose - and leave it stale once the domain moves.
-                if contact.assignedName == nil {
-                    continue
-                }
-                if contact.alias.lowercased().hasSuffix(".kas") && contact.alias != primaryDomain {
-                    // Keep KNS domain fresh when alias is domain-based
-                    var updatedContact = contact
-                    updatedContact.alias = primaryDomain
-                    updateContact(updatedContact)
-                }
-            }
-        }
-    }
-
-    /// Get KNS info for a contact
-    func getKNSInfo(for contact: Contact) -> KNSAddressInfo? {
-        knsService.identityInfo(for: contact.address)
-    }
-
-    /// Get KNS domains for a contact
-    func getKNSDomains(for contact: Contact) -> [KNSDomain] {
-        knsService.identityInfo(for: contact.address)?.allDomains ?? []
-    }
-
-    /// Get selected KNS profile for a contact address (primary domain if available).
-    func getKNSProfile(for contact: Contact) -> KNSAddressProfileInfo? {
-        knsService.profileCache[contact.address]
-    }
-
-    /// Fetch KNS info for a specific contact
-    func fetchKNSInfo(for contact: Contact, network: NetworkType = .mainnet) async -> KNSAddressInfo? {
-        guard KNSService.showsDomainNamesAsIdentity else { return nil }
-        return await knsService.fetchInfo(for: contact.address, network: network)
-    }
-
-    /// Fetch selected KNS profile for a specific contact.
-    func fetchKNSProfile(for contact: Contact, network: NetworkType = .mainnet) async -> KNSAddressProfileInfo? {
-        await knsService.fetchProfile(for: contact.address, network: network)
-    }
-
     func balanceSompi(for address: String) -> UInt64? {
         contactBalances[address]
     }
@@ -405,120 +323,11 @@ final class ContactsManager: ObservableObject {
         return cleared
     }
 
-    func addContact(address: String, alias: String = "", isAutoAdded: Bool = false) throws -> Contact {
-        // Validate address format
-        guard isValidKaspaAddress(address) else {
-            throw KasiaError.invalidAddress
-        }
-        // A deliberate add is of the network the app runs on: a chat with the other network's
-        // address is never read and is dropped on the next launch (IOS-063).
-        guard isAutoAdded || KaspaAddress.isValidOnActiveNetwork(address) else {
-            throw KasiaError.invalidAddress
-        }
-
-        // Never the account itself - there is no one to talk to. Another of the user's OWN
-        // accounts is refused only for the auto-add paths: tipping or opening a KaPost written
-        // from your second account would otherwise add its author silently, which is how a
-        // blank account turned up among the contacts of a real one, reading as a stranger.
-        // A deliberate add is different: chatting between your own accounts is a real thing
-        // to do (moving funds, trying the app from a fresh account), and the person typing the
-        // address knows whose it is.
-        let refused = isAutoAdded ? isOwnAccountAddress(address) : isActiveWalletAddress(address)
-        guard !refused else {
-            // Its own error, not `invalidAddress`: the address is perfectly valid, and telling
-            // someone their own address is malformed sends them looking for a typo that is not
-            // there. The auto-add callers use `try?`, so for them this is simply a silent skip.
-            throw KasiaError.ownAccountAddress
-        }
-
-        // A deliberate (non-auto) add explicitly un-does a prior permanent delete's tombstone -
-        // the block on auto-recreation is only meant to stop silent resurrection from incoming
-        // activity, not to stop the user from choosing to message this address again.
-        if !isAutoAdded, deletedAddresses.contains(address) || deletedAtByAddress[address] != nil {
-            deletedAddresses.remove(address)
-            deletedAtByAddress.removeValue(forKey: address)
-            deletedTxIdsByAddress.removeValue(forKey: address)
-            saveDeletedAddresses()
-        }
-
-        // Check for duplicates
-        if let existingIndex = contacts.firstIndex(where: { $0.address == address }) {
-            if !isAutoAdded && contacts[existingIndex].isAutoAdded {
-                contacts[existingIndex].isAutoAdded = false
-                let trimmedAlias = alias.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmedAlias.isEmpty {
-                    contacts[existingIndex].alias = trimmedAlias
-                }
-                saveContacts(publishContacts: true)
-            }
-            return contacts[existingIndex]
-        }
-
-        let contact = Contact(
-            address: address,
-            alias: alias,
-            addedAt: Date(),
-            isAutoAdded: isAutoAdded
-        )
-
-        contacts.append(contact)
-        saveContacts()
-
-        return contact
-    }
-
-    func updateContact(_ contact: Contact) {
-        if let index = contacts.firstIndex(where: { $0.id == contact.id }) {
-            contacts[index] = contact
-            saveContacts()
-        }
-    }
-
     func updateContactLastMessage(_ contactId: UUID, at date: Date) {
         if let index = contacts.firstIndex(where: { $0.id == contactId }) {
             contacts[index].lastMessageAt = date
             scheduleLastMessageSave()
         }
-    }
-
-    /// Permanently deletes a contact: purges every local message with them and tombstones their
-    /// address so a future incoming message or handshake can't silently recreate the conversation.
-    /// Matches Android's `ChatRepository.deleteChat` - not reversible, unlike the old archive.
-    func deleteContact(_ contact: Contact) {
-        // Your own address is your chat with yourself, which cannot be deleted (see
-        // `ChatService.ensureSelfConversation`). A backstop behind the UI, which never offers it.
-        if let mine = WalletManager.shared.currentWallet?.publicAddress,
-           contact.address.lowercased() == mine.lowercased() {
-            return
-        }
-        deletedAddresses.insert(contact.address)
-        // Stamped in the indexer's BLOCK-TIME clock, not the wall clock, and the two are not
-        // interchangeable. Mixing them is what Android hit first: a device whose clock runs ahead
-        // of the chain stamps a tombstone in the future, and a genuinely new re-handshake arriving
-        // before the clocks converge gets dropped as history. So the stamp is the newest block
-        // time actually seen in this conversation, and the wall clock is only the fallback for a
-        // conversation with nothing in it - where there is no history to suppress anyway.
-        let conversationMessages = ChatService.shared.conversations
-            .first(where: { $0.contact.address == contact.address })?
-            .messages ?? []
-        let newestSeen = conversationMessages.map { Int64($0.blockTime) }.max() ?? 0
-        let deletedAt = newestSeen > 0 ? newestSeen : Int64(Date().timeIntervalSince1970 * 1000)
-        deletedAtByAddress[contact.address] = deletedAt
-        // The ids already ours at that instant, so a new transaction sharing it is recognisable.
-        deletedTxIdsByAddress[contact.address] = Set(
-            conversationMessages.filter { Int64($0.blockTime) == deletedAt }.map(\.txId).filter { !$0.isEmpty }
-        )
-        saveDeletedAddresses()
-        // A deleted chat is no longer one you accepted: if they start a new one, it's a Message
-        // Request like any stranger's.
-        ChatService.shared.forgetChatAcceptance(contact.address)
-        // The contact leaves the list immediately; the store delete runs off the main thread. The
-        // `deletedAtByAddress` marker above is what keeps the old history from being re-fetched
-        // in the meantime, so nothing depends on the delete having finished first.
-        let address = contact.address
-        Task { await MessageStore.shared.deleteConversation(contactAddress: address) }
-        contacts.removeAll { $0.id == contact.id }
-        saveContacts()
     }
 
     func deleteAllContacts() {
@@ -577,31 +386,6 @@ final class ContactsManager: ObservableObject {
         return Contact.generateDefaultAlias(from: address)
     }
 
-    /// The accepted/established-contact predicate shared by the stranger-gating features:
-    /// true for contacts the user added themselves, or ones the user has ever sent a message
-    /// to (which includes accepting their handshake - the handshake response IS an outgoing
-    /// message). False only for auto-added, never-replied-to strangers. Used by the photo
-    /// auto-display gate below and by link-preview auto-fetch gating (Decision 5A).
-    func isAcceptedContact(_ contact: Contact) -> Bool {
-        !contact.isAutoAdded || contact.hasSentOutgoingMessage
-    }
-
-    /// Whether photo bubbles from this contact should auto-decode and render, vs. staying
-    /// hidden behind a "Show Photo" tap. Defaults to trusting contacts you added yourself or
-    /// have ever messaged; untrusted (auto-added, never-replied-to) contacts are hidden by
-    /// default until the user overrides it in Chat Info or disables the setting globally.
-    func shouldAutoDisplayPhotos(for contact: Contact, settings: AppSettings) -> Bool {
-        switch contact.photoAutoDisplayOverride {
-        case .alwaysShow:
-            return true
-        case .alwaysHide:
-            return false
-        case .automatic, nil:
-            guard settings.requirePhotoApprovalForNewContacts else { return true }
-            return isAcceptedContact(contact)
-        }
-    }
-
     /// Marks that the user has sent at least one outgoing message to this contact, which
     /// establishes trust for features like photo auto-display even if they were auto-added.
     func markHasSentOutgoingMessage(address: String) {
@@ -646,16 +430,6 @@ final class ContactsManager: ObservableObject {
         return contact
     }
 
-    func searchContacts(_ query: String) -> [Contact] {
-        guard !query.isEmpty else { return contacts }
-
-        let lowercasedQuery = query.lowercased()
-        return contacts.filter {
-            $0.alias.lowercased().contains(lowercasedQuery) ||
-            $0.address.lowercased().contains(lowercasedQuery)
-        }
-    }
-
     // MARK: - Validation
 
     func isValidKaspaAddress(_ address: String) -> Bool {
@@ -689,27 +463,6 @@ final class ContactsManager: ObservableObject {
         if updatePush {
             schedulePushUpdate()
         }
-    }
-
-    /// True when this address belongs to the user themselves: the wallet in use, or any account
-    /// saved on this device.
-    ///
-    /// Both halves matter. The active wallet is the obvious one; the saved list is the one that
-    /// was missing, and it is the one that leaks - a second account is still "you", and adding it
-    /// as a contact both clutters the list and invites messaging yourself by a route the app does
-    /// not otherwise offer.
-    private func isOwnAccountAddress(_ address: String) -> Bool {
-        guard let normalized = normalizeWalletAddress(address) else { return false }
-        if let activeWalletAddress, activeWalletAddress == normalized { return true }
-        return WalletManager.shared.savedAccounts.contains {
-            normalizeWalletAddress($0.publicAddress) == normalized
-        }
-    }
-
-    /// The account in use right now - the one address that can never be a contact of itself.
-    private func isActiveWalletAddress(_ address: String) -> Bool {
-        guard let normalized = normalizeWalletAddress(address), let activeWalletAddress else { return false }
-        return activeWalletAddress == normalized
     }
 
     private var activeContactsKey: String? {

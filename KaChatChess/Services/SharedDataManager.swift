@@ -488,23 +488,6 @@ struct SharedContact: Codable {
     let notificationModeOverride: ContactNotificationMode?
 }
 
-/// Group roster info shared with notification extension (see `syncGroupsForExtension`).
-struct SharedGroup: Codable {
-    let groupId: String
-    let name: String
-    let adminAddress: String
-    let members: [SharedGroupMember]
-}
-
-struct SharedGroupMember: Codable {
-    let address: String
-    let xOnlyPubKeyHex: String
-    /// Snapshot of whoever added this member's own contact alias for them at add-time (see
-    /// `GroupMember.displayName`) - lets the notification extension show a real name for the
-    /// sender of a group message instead of falling back to their raw address.
-    let displayName: String?
-}
-
 /// Recent conversation entry shared with the Share Extension (see `recordRecentConversation`).
 struct SharedRecentConversation: Codable {
     let address: String

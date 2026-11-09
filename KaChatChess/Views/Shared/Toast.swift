@@ -31,7 +31,9 @@ struct ToastBanner: View {
         HStack(spacing: 8) {
             Image(systemName: style.iconName)
                 .foregroundColor(style.iconColor)
-            Text(message)
+            // Looked up by hand: `Text` shows a String variable as it is. Verbatim after that, so
+            // text that isn't a key (an address, a node's error) can't be read as Markdown.
+            Text(verbatim: AppLocalization.string(message))
                 .font(.subheadline)
                 .foregroundColor(.primary)
         }

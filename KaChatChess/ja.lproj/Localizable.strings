@@ -1773,3 +1773,4 @@
 "Dislikes" = "よくないね";
 "Reposts" = "リポスト";
 "Quotes" = "引用";
+"Couldn't look up %@ right now. Try again in a moment." = "現在 %@ を確認できません。しばらくしてからもう一度お試しください。";

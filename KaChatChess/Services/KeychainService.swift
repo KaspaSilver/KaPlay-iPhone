@@ -19,6 +19,11 @@ final class KeychainService {
     /// Device identifier derived from SE public key hash (cached)
     private var cachedDeviceId: String?
 
+    /// When an unwrapped item was last tried for wrapping (`rewrapIfDue`), by key name.
+    private var rewrapAttemptedAt: [String: Date] = [:]
+    private let rewrapLock = NSLock()
+    private static let rewrapRetryInterval: TimeInterval = 300
+
     private enum KeychainKey: String {
         case seedPhrase = "kachat_seed_phrase"
         case wallet = "kachat_wallet"
@@ -471,10 +476,7 @@ final class KeychainService {
         guard let data = try loadSensitiveDataRaw(keyName: keyName) else {
             return nil
         }
-        if data.starts(with: secureEnclaveHeader) {
-            return try unwrapPrivateKey(data)
-        }
-        return data
+        return try openSensitiveData(data, keyName: keyName)
     }
 
     private func deleteSensitiveDataForGroup(baseKey: KeychainKey, groupId: String) throws {
@@ -494,12 +496,13 @@ final class KeychainService {
         let deviceId = try deviceIdentifier()
         let keyName = "\(baseKey.rawValue).\(deviceId)"
 
-        // Wrap with Secure Enclave
+        // Wrap with Secure Enclave. When that fails the data is still saved, protected by the
+        // Keychain alone: failing the save could lose the seed, which is worse. The failure is
+        // logged in `tryWrapPrivateKey`, and a later read wraps it (`openSensitiveData`).
         let wrapped: Data
         if let wrappedData = tryWrapPrivateKey(data) {
             wrapped = wrappedData
         } else {
-            // Fallback to raw storage if SE unavailable
             wrapped = data
         }
 
@@ -515,11 +518,53 @@ final class KeychainService {
             return nil
         }
 
+        return try openSensitiveData(data, keyName: keyName)
+    }
+
+    /// A stored item as plain bytes: unwrapped, or, for one saved during a wrap failure, wrapped
+    /// now if the Secure Enclave works again.
+    private func openSensitiveData(_ data: Data, keyName: String) throws -> Data {
         if data.starts(with: secureEnclaveHeader) {
             return try unwrapPrivateKey(data)
         }
-
+        rewrapIfDue(data, keyName: keyName)
         return data
+    }
+
+    /// Replaces an unwrapped item with its wrapped form. In place, and only after the wrapped copy
+    /// has been read back: this runs on the seed itself, so it must never delete first. Tried at
+    /// most every few minutes per item, since reads can be frequent and each try is an Enclave call.
+    private func rewrapIfDue(_ data: Data, keyName: String) {
+        guard SecureEnclave.isAvailable else { return }
+        let now = Date()
+        let isDue: Bool = rewrapLock.withLock {
+            if let last = rewrapAttemptedAt[keyName], now.timeIntervalSince(last) < Self.rewrapRetryInterval { return false }
+            rewrapAttemptedAt[keyName] = now
+            return true
+        }
+        guard isDue, let wrapped = tryWrapPrivateKey(data) else { return }
+        guard (try? unwrapPrivateKey(wrapped)) == data else {
+            AppLog.log("%@", "[Keychain] A re-wrapped item didn't read back; keeping it as it was")
+            return
+        }
+        if replaceSensitiveDataRaw(wrapped, keyName: keyName) {
+            rewrapLock.withLock { _ = rewrapAttemptedAt.removeValue(forKey: keyName) }
+            AppLog.log("%@", "[Keychain] Wrapped an item that was saved without the Secure Enclave")
+        } else {
+            AppLog.log("%@", "[Keychain] Couldn't replace an item with its wrapped form; keeping it as it was")
+        }
+    }
+
+    /// Writes new bytes over an existing item, wherever it lives (with or without the access group).
+    private func replaceSensitiveDataRaw(_ data: Data, keyName: String) -> Bool {
+        let attributes = [kSecValueData as String: data] as CFDictionary
+        for includeAccessGroup in [true, false] {
+            let query = genericPasswordQueryForKey(keyName, includeAccessGroup: includeAccessGroup)
+            let status = SecItemUpdate(query as CFDictionary, attributes)
+            if status == errSecSuccess { return true }
+            guard status == errSecItemNotFound || status == errSecMissingEntitlement else { return false }
+        }
+        return false
     }
 
     /// Deletes sensitive data from device-specific storage
@@ -532,6 +577,7 @@ final class KeychainService {
     private func saveSensitiveDataForAccount(_ data: Data, baseKey: KeychainKey, publicAddress: String) throws {
         let keyName = try accountScopedKeyName(baseKey: baseKey, publicAddress: publicAddress)
 
+        // As in `saveSensitiveData`: saved even if wrapping fails, since losing the seed is worse.
         let wrapped: Data
         if let wrappedData = tryWrapPrivateKey(data) {
             wrapped = wrappedData
@@ -569,10 +615,7 @@ final class KeychainService {
         guard let data = try loadSensitiveDataRaw(keyName: keyName) else {
             return nil
         }
-        if data.starts(with: secureEnclaveHeader) {
-            return try unwrapPrivateKey(data)
-        }
-        return data
+        return try openSensitiveData(data, keyName: keyName)
     }
 
     private func deleteSensitiveDataForAccount(baseKey: KeychainKey, publicAddress: String) throws {
@@ -808,6 +851,7 @@ final class KeychainService {
         do {
             return try wrapPrivateKey(privateKey)
         } catch {
+            AppLog.log("[Keychain] Secure Enclave wrap failed (%@); the item stays protected by the Keychain alone", error.localizedDescription)
             return nil
         }
     }

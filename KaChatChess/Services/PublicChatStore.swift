@@ -64,6 +64,9 @@ final class PublicChatStore {
     var isReady: Bool { isLoaded }
     /// See `MessageStore.loadGeneration`.
     private var loadGeneration = 0
+    /// Stores `clearAll` was called on while they were still opening: emptied when they open, or
+    /// their file removed if the wallet has already moved on (`load`).
+    private var pendingClearURLs: Set<URL> = []
 
     private static let indexSpecs: [CoreDataIndexBuilder.Spec] = [
         .init(entityName: CDPublicChatMessage.entityName, attributes: ["channelName", "blockTime"]),
@@ -119,6 +122,11 @@ final class PublicChatStore {
             }
             guard generation == self.loadGeneration else {
                 CoreDataStoreLoader.detachStore(at: description.url, from: self.container)
+                // Removing an account opens its store, clears it and moves straight on, so the
+                // load is overtaken: the file goes instead of the rows.
+                if let url = description.url, self.pendingClearURLs.remove(url) != nil {
+                    CoreDataStoreLoader.destroyStore(at: url, in: self.container)
+                }
                 completion?()
                 return
             }
@@ -138,6 +146,9 @@ final class PublicChatStore {
             self.isLoaded = true
             self.container.viewContext.automaticallyMergesChangesFromParent = true
             self.container.viewContext.mergePolicy = NSMergeByPropertyStoreTrumpMergePolicy
+            if let url = description.url, self.pendingClearURLs.remove(url) != nil {
+                self.deleteAllRows()
+            }
             completion?()
         }
     }
@@ -911,8 +922,19 @@ final class PublicChatStore {
     }
 
     /// Clear all local public chat data for the current wallet (e.g. on wallet reset).
+    /// The store opens off the main thread, so right after `setCurrentWallet` it may not be open
+    /// yet: the clear is then carried out by `load`, whichever way that load ends up.
     func clearAll() {
-        guard isLoaded else { return }
+        guard isLoaded else {
+            if let currentWalletAddress {
+                pendingClearURLs.insert(storeURL(forWallet: currentWalletAddress))
+            }
+            return
+        }
+        deleteAllRows()
+    }
+
+    private func deleteAllRows() {
         let context = viewContext
         context.performAndWait {
             for entityName in [CDPublicChatMessage.entityName, CDPublicChatChannel.entityName, CDHiddenPublicChatSender.entityName, CDPublicChatReaction.entityName] {

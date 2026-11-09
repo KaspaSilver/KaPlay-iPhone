@@ -81,36 +81,6 @@ enum WalletSourceFamily: String, Codable, CaseIterable {
     }
 }
 
-/// One scanned identity-chain slot from `WalletManager.scanChattingAddressCandidates` - the
-/// import wizard's "Change Chatting Address" picker lists the interesting ones (balance or
-/// domains), always including index 0.
-struct ChattingAddressCandidate: Identifiable, Equatable {
-    let index: Int
-    let address: String
-    let balanceSompi: UInt64
-    let domains: [KNSDomain]
-    let primaryDomain: String?
-    /// Names on the other services (.k, .kaspa).
-    var otherNames: [OwnedServiceName] = []
-    /// .kachat names (active or in grace) where the registry is live - listed first.
-    var kachatNames: [OwnedServiceName] = []
-
-    var id: Int { index }
-
-    var nameCount: Int { kachatNames.count + domains.count + otherNames.count }
-
-    /// The one name to show on the row when there is exactly one.
-    var onlyName: String? {
-        guard nameCount == 1 else { return nil }
-        return kachatNames.first?.display ?? domains.first?.fullName ?? otherNames.first?.display
-    }
-
-    var shortAddress: String {
-        guard address.count > 16 else { return address }
-        return "\(address.prefix(10))...\(address.suffix(6))"
-    }
-}
-
 /// An address the import's passphrase step found on the identity chain.
 struct FoundChattingAddress: Identifiable, Equatable {
     let index: Int
@@ -153,68 +123,10 @@ final class WalletManager: ObservableObject {
     func clearSignInFailure() { signInFailureMessage = nil }
     @Published private(set) var isLoggedOut = false
     @Published private(set) var savedAccounts: [SavedAccountSummary] = []
-    /// Set by `CreateWalletView` once the user has reviewed their seed phrase and checked "I have
-    /// written down my seed phrase...", and by `ImportWalletView` when importing an existing
-    /// account - lets the main app show the Welcome Guide automatically after onboarding, whether
-    /// the account was freshly created or imported. Deliberately NOT set by
-    /// `WalletManager.createWallet` itself, which returns well before the seed phrase has actually
-    /// been shown/acknowledged - setting it there would let the guide launch before the user has
-    /// had a chance to write anything down. The onboarding views set it *before* the commit call
-    /// (see `CreateWalletView`/`ImportWalletView`) so it's already true when `MainTabView` first
-    /// appears. Transient/in-memory only (not persisted): the first view to notice it
-    /// (`MainTabView`) is expected to flip it back to `false` immediately after presenting the
-    /// guide, so this is a one-shot signal, not a flag.
-    @Published var justCreatedNewWallet = false
-
-    /// True from the moment `createWallet` starts generating a brand-new wallet until
-    /// `CreateWalletView`'s "Continue to App" button clears it (after the user confirms they've
-    /// written down the seed phrase) - `ContentView`/`LaunchRouter` treat this as "stay on
-    /// onboarding" even though `currentWallet` is already non-nil by then, closing the race where
-    /// `currentWallet` (set inside `importWallet`, well before the seed-phrase screen is shown or
-    /// confirmed) would otherwise let top-level routing jump straight to `MainTabView` and tear
-    /// down the seed-phrase screen before the user ever saw it. Never set for `importWallet`
-    /// (typing in an existing phrase needs no review step). Transient/in-memory only, like
-    /// `justCreatedNewWallet`.
-    @Published var isAwaitingSeedPhraseConfirmation = false
-
-    /// True only when the current session began with a seed IMPORT (`ImportWalletView`), never a
-    /// brand-new create - unlike `justCreatedNewWallet`, which both flows set. The Welcome Guide
-    /// uses it to offer "Change Chatting Address" on the funding step: an imported seed may hold
-    /// its real identity (KNS domains, funded chatting balance) at a nonzero derivation index,
-    /// which is meaningless for a freshly generated seed. Set by `ImportWalletView` right before
-    /// the import commits, cleared when the guide finishes (or the import fails). Transient/
-    /// in-memory only, like `justCreatedNewWallet` - an app kill mid-wizard loses it, which just
-    /// hides the option on the resumed run.
-    @Published var justImportedWallet = false
-
-    /// Per-wallet ("account") toggle for whether the "Setup Guide" re-entry points (the Profile
-    /// tab's "Welcome Guide" row and the "Edit KaChat Profile" screen's "Setup Guide" button) are
-    /// shown - scoped to `currentWallet?.publicAddress` rather than global `AppSettings`, mirroring
-    /// `spendingDefaultsKey` in `WalletManager+SpendingAddresses.swift`, so switching to a
-    /// different account on the same device doesn't carry the choice over. Defaults to `true`
-    /// (unset key) to match pre-existing behavior for anyone who had these guides visible before
-    /// this toggle existed.
-    var showSetupGuides: Bool {
-        get {
-            guard let key = showSetupGuidesDefaultsKey else { return true }
-            return UserDefaults.standard.object(forKey: key) as? Bool ?? true
-        }
-        set {
-            guard let key = showSetupGuidesDefaultsKey else { return }
-            UserDefaults.standard.set(newValue, forKey: key)
-            objectWillChange.send()
-        }
-    }
-
-    private var showSetupGuidesDefaultsKey: String? {
-        guard let address = currentWallet?.publicAddress else { return nil }
-        return "kachat_show_setup_guides_\(address)"
-    }
 
     private let keychainService = KeychainService.shared
     private let bip39 = BIP39.shared
     private let nodePool = NodePoolService.shared
-    private let balanceCachePrefix = "kachat_balance_cache_"
     private let logoutFlagKey = "kachat_session_logged_out"
     private let savedAccountsKey = "kachat_saved_accounts"
 
@@ -283,6 +195,8 @@ final class WalletManager: ObservableObject {
         defer { isLoading = false }
 
         do {
+            // A kill part-way through writing the active slot left it mixed: finished first.
+            finishInterruptedSlotWrite()
             LaunchTrace.mark("loadWallet: reading wallet record")
             // Try to load from keychain first
             if let storedWallet = try keychainService.loadWallet() {
@@ -308,7 +222,7 @@ final class WalletManager: ObservableObject {
                 // A readable snapshot of this account (filed on this phone) puts its keys back
                 // first: the recovery screen is only for keys that are really gone, and its
                 // Remove would erase a snapshot that could still have restored them.
-                if case .missing = keychainService.keyMaterialStatus(), !restoreKeysFromSnapshot(for: wallet) {
+                if case .missing = keychainService.keyMaterialStatus(), restoreKeysFromSnapshot(for: wallet) != .restored {
                     // The record survived but the keys did not (an iPhone restore, typically).
                     // Opening the app with an address that cannot sign or decrypt looked like a
                     // working wallet in which everything silently failed.
@@ -374,12 +288,6 @@ final class WalletManager: ObservableObject {
         }
     }
 
-    /// Does NOT set `justCreatedNewWallet` - that fires later, once the caller (`CreateWalletView`)
-    /// confirms the user has actually reviewed and acknowledged their seed phrase, not the instant
-    /// the wallet is generated (which happens before the seed-phrase screen is even shown). Sets
-    /// `isAwaitingSeedPhraseConfirmation` *before* `importWallet` runs (rather than after it
-    /// returns) so there's no window where `currentWallet` is already non-nil but the routing
-    /// guard isn't up yet - see that property's doc comment.
     /// Generates a fresh mnemonic for the create-account flow WITHOUT deriving keys or persisting
     /// anything. The wallet is only committed later via `commitCreatedWallet(...)`, once the user
     /// has backed up the phrase and chosen whether to add a BIP39 passphrase. Deferring derivation
@@ -427,9 +335,8 @@ final class WalletManager: ObservableObject {
 
     /// - Parameter chattingAddressIndex: derivation index on the identity chain
     ///   (m/44'/111111'/0'/0/<index>) the chatting address should live at. 0 (the default) is the
-    ///   standard identity every fresh import/create starts from; a nonzero value is only ever
-    ///   passed by `setChattingAddress(index:)` when the user picks a different identity index
-    ///   during the import wizard. Persisted per derived address so key-repair and
+    ///   standard identity every fresh import/create starts from; a nonzero value comes from
+    ///   the passphrase step's address search or an NFC card's backup. Persisted per derived address so key-repair and
     ///   seed-fallback paths re-derive the same identity.
     /// - Parameter family: identity derivation-path family of the wallet this seed comes from
     ///   (the KasWare-style source-wallet selection in the import flow). `.kaspaStandard` for
@@ -471,7 +378,10 @@ final class WalletManager: ObservableObject {
         let previousAddress = currentWallet?.publicAddress ?? existingStoredAddress
         // Compared as an account: the same words entered on the other network are the same
         // account, and must not reset it or delete its contacts.
-        let isNewWallet = previousAddress.map { !Self.isSameAccount($0, publicAddress) } ?? true
+        let isSwitchingAccount = previousAddress.map { !Self.isSameAccount($0, publicAddress) } ?? true
+        // Read before this import files it: the words of an account already saved here (signed
+        // out, or with its keys lost) bring that account back with what it has on this phone.
+        let isAlreadySaved = savedAccounts.contains { Self.isSameAccount($0.publicAddress, publicAddress) }
 
         let wallet = Wallet(
             publicAddress: publicAddress,
@@ -522,15 +432,16 @@ final class WalletManager: ObservableObject {
 
         // Reset chat and contacts data when importing a new/different wallet
         // This ensures lastPollTime=0 so all historical messages are fetched
-        if isNewWallet {
-            AppLog.log("%@", "[WalletManager] Importing new wallet, resetting chat and contacts data")
+        if isSwitchingAccount {
+            AppLog.log("%@", "[WalletManager] Importing a different wallet, resetting chat state")
             // Stamp the import moment BEFORE any sync starts: everything mined earlier is
             // history the initial sync backfills, and it must land read and silent (no unread
             // badges, no notifications). See ChatService.walletImportBaselineMs.
-            ChatService.shared.recordWalletImportBaseline(address: wallet.publicAddress)
+            if !isAlreadySaved { ChatService.shared.recordWalletImportBaseline(address: wallet.publicAddress) }
             // Pass skipStoreClear=true since the new wallet's store is already empty
             ChatService.shared.resetForNewWallet(skipStoreClear: true)
-            ContactsManager.shared.deleteAllContacts()
+            // the active account's list, which for a saved account is its own
+            if !isAlreadySaved { ContactsManager.shared.deleteAllContacts() }
         }
 
         // Your chat with yourself is the first chat of every account, before any sync has
@@ -585,12 +496,23 @@ final class WalletManager: ObservableObject {
                 walletNeedingKeyRecovery = nil
                 throw KasiaError.keychainError(AppLocalization.string("This account's keys are on this phone again, so nothing was removed."))
             }
+            // Asked again now: a launch while the phone was locked can't read a snapshot, and
+            // Remove would erase one that restores the account.
+            switch restoreKeysFromSnapshot(for: stale) {
+            case .restored:
+                walletNeedingKeyRecovery = nil
+                throw KasiaError.keychainError(AppLocalization.string("This account's keys are on this phone again, so nothing was removed."))
+            case .unreadable:
+                throw KasiaError.keychainError(AppLocalization.string("This account's saved keys can't be read right now, so nothing was removed. Unlock this iPhone and try again."))
+            case .noSnapshot:
+                break
+            }
         }
         // the wallet being deleted: the active one, or the one stuck on the recovery screen
         let walletAddressToDelete = (currentWallet ?? walletNeedingKeyRecovery)?.publicAddress
-        walletNeedingKeyRecovery = nil
 
-        // Unregister from push notifications before clearing wallet
+        // As Log Out does: nothing goes on watching this account or writing for it while it goes.
+        ChatService.shared.stopPolling()
 
         // Clear shared data (App Group)
         SharedDataManager.clearAllSharedData()
@@ -610,16 +532,8 @@ final class WalletManager: ObservableObject {
                 await MessageStore.shared.setCurrentWallet(address)
                 MessageStore.shared.clearAll()
                 await MessageStore.shared.destroyLocalStoreFiles()
-                PublicChatService.shared.setCurrentWallet(address)
-                PublicChatStore.shared.clearAll()
             }
-        }
-        if let walletAddressToDelete {
-            AccountBackupStatus.shared.forget(walletAddressToDelete)
-            for address in Self.accountAddressVariants(walletAddressToDelete) { Self.removeSpendingData(forAccount: address) }
-            // its .kachat reminders would keep firing for names this phone no longer holds - on
-            // both networks' addresses - and its contacts and bell go with it, as in KaPay
-            await Self.removeWalletTabData(forAccount: walletAddressToDelete)
+            if let walletAddressToDelete { await clearPublicChatStores(forAccount: walletAddressToDelete) }
         }
 
         // The Secure Enclave key wraps every saved account's snapshot (and the device id, the
@@ -631,14 +545,23 @@ final class WalletManager: ObservableObject {
         }
         let otherAccountsRemain = savedAccounts.contains { isOther($0.publicAddress) }
             || keychainService.accountSnapshotAddresses().contains(where: isOther)
-        if otherAccountsRemain {
-            for address in walletAddressToDelete.map(Self.accountAddressVariants) ?? [] {
-                try? keychainService.deleteAccountSnapshot(publicAddress: address)
+        do {
+            if otherAccountsRemain {
+                for address in walletAddressToDelete.map(Self.accountAddressVariants) ?? [] {
+                    try? keychainService.deleteAccountSnapshot(publicAddress: address)
+                }
+                try keychainService.clearCurrentAccountData()
+            } else {
+                try keychainService.clearAll()
             }
-            try keychainService.clearCurrentAccountData()
-        } else {
-            try keychainService.clearAll()
+        } catch {
+            // Still signed in: back to watching this account, on its own stores.
+            await MessageStore.shared.setCurrentWallet(currentWallet?.publicAddress)
+            PublicChatService.shared.setCurrentWallet(currentWallet?.publicAddress)
+            if currentWallet != nil { ChatService.shared.startPolling() }
+            throw error
         }
+        walletNeedingKeyRecovery = nil
         // The last account too, or the sign-in screen kept listing an account with no keys.
         if let walletAddressToDelete {
             savedAccounts.removeAll { Self.isSameAccount($0.publicAddress, walletAddressToDelete) }
@@ -648,6 +571,7 @@ final class WalletManager: ObservableObject {
                 persistSavedAccountsToStorage()
             }
         }
+        resetInMemoryChatStateForAccountSwitch()
         currentWallet = nil
         // the deleted account's key must not outlive it in memory
         cachedPrivateKey = nil
@@ -657,6 +581,13 @@ final class WalletManager: ObservableObject {
         isBalanceRefreshing = false
         UserDefaults.standard.removeObject(forKey: logoutFlagKey)
         if let walletAddressToDelete {
+            // After the keys are gone: a failed delete leaves the account as it was, its chatting
+            // index and family included. After `currentWallet` too, so nothing rewrites it.
+            AccountBackupStatus.shared.forget(walletAddressToDelete)
+            for address in Self.accountAddressVariants(walletAddressToDelete) { Self.removeSpendingData(forAccount: address) }
+            // its .kachat reminders would keep firing for names this phone no longer holds - on
+            // both networks' addresses - and its contacts and bell go with it, as in KaPay
+            await Self.removeWalletTabData(forAccount: walletAddressToDelete)
             ChatListSnapshotStore.clear(walletAddress: walletAddressToDelete)
             ContactsManager.shared.deletePersistedContacts(forWalletAddress: walletAddressToDelete)
         }
@@ -756,9 +687,7 @@ final class WalletManager: ObservableObject {
             // Keys first, record last: a record with no keys behind it is the broken state the
             // recovery screen exists for, so it is never written ahead of them.
             previousSlot = activeSlotContents()
-            try keychainService.saveSeedPhrase(snapshot.seedPhrase)
-            try keychainService.savePrivateKey(snapshot.privateKey)
-            try keychainService.saveWallet(wallet)
+            try writeActiveSlot(wallet, seedPhrase: snapshot.seedPhrase, privateKey: snapshot.privateKey, replacing: previousSlot?.wallet)
             previousSlot = nil
 
             resetInMemoryChatStateForAccountSwitch()
@@ -815,10 +744,9 @@ final class WalletManager: ObservableObject {
                     await MessageStore.shared.setCurrentWallet(address)
                     MessageStore.shared.clearAll()
                     await MessageStore.shared.destroyLocalStoreFiles()
-                    PublicChatService.shared.setCurrentWallet(address)
-                    PublicChatStore.shared.clearAll()
                     ChatListSnapshotStore.clear(walletAddress: address)
                 }
+                await clearPublicChatStores(forAccount: account.publicAddress)
                 await MessageStore.shared.setCurrentWallet(currentWallet?.publicAddress)
                 PublicChatService.shared.setCurrentWallet(currentWallet?.publicAddress)
                 removeSavedAccountFromStorage(account)
@@ -838,9 +766,8 @@ final class WalletManager: ObservableObject {
             await MessageStore.shared.setCurrentWallet(address)
             MessageStore.shared.clearAll()
             await MessageStore.shared.destroyLocalStoreFiles()
-            PublicChatService.shared.setCurrentWallet(address)
-            PublicChatStore.shared.clearAll()
         }
+        await clearPublicChatStores(forAccount: account.publicAddress)
 
         do {
             for address in Self.accountAddressVariants(account.publicAddress) {
@@ -1187,7 +1114,7 @@ final class WalletManager: ObservableObject {
     /// creation date currently stored for it - the best evidence available - and keeps that from
     /// then on rather than resetting again on the next switch.
     private func accountAddedDate(for address: String) -> Date {
-        let key = "kachat_account_added_at.\(address)"
+        let key = Self.accountAddedAtKey(for: address)
         if let stored = UserDefaults.standard.object(forKey: key) as? Date {
             return stored
         }
@@ -1212,6 +1139,8 @@ final class WalletManager: ObservableObject {
     /// account's keys exist nowhere else. Nothing to protect (no stored keys, or the same
     /// account coming back) is not an error.
     private func snapshotStoredWallet(beforeReplacingWith newAddress: String?) throws {
+        // An unfinished write means the slot may hold two accounts' keys: never filed as one.
+        guard !hasInterruptedSlotWrite else { return }
         guard let wallet = try keychainService.loadWallet(),
               let seedPhrase = try keychainService.loadSeedPhrase(),
               let privateKey = try keychainService.loadPrivateKey() else {
@@ -1280,12 +1209,16 @@ final class WalletManager: ObservableObject {
         isBalanceRefreshing = false
     }
 
-    private func balanceCacheKey(for address: String) -> String {
-        "\(balanceCachePrefix)\(address)"
+    private static func balanceCacheKey(for address: String) -> String {
+        "kachat_balance_cache_\(address)"
+    }
+
+    private static func accountAddedAtKey(for address: String) -> String {
+        "kachat_account_added_at.\(address)"
     }
 
     private func loadCachedBalance(for address: String) -> UInt64? {
-        let key = balanceCacheKey(for: address)
+        let key = Self.balanceCacheKey(for: address)
         if let number = UserDefaults.standard.object(forKey: key) as? NSNumber {
             return number.uint64Value
         }
@@ -1296,7 +1229,7 @@ final class WalletManager: ObservableObject {
     }
 
     private func storeCachedBalance(_ sompi: UInt64, for address: String) {
-        let key = balanceCacheKey(for: address)
+        let key = Self.balanceCacheKey(for: address)
         UserDefaults.standard.set(NSNumber(value: sompi), forKey: key)
     }
 
@@ -1651,7 +1584,7 @@ final class WalletManager: ObservableObject {
     // 0', legacy 972, Chainge's single 0' leaf, OneKey's tweaked account-0' keys) can ever
     // collide with them.
 
-    private func chattingIndexKey(for address: String) -> String {
+    private static func chattingIndexKey(for address: String) -> String {
         "kachat_chatting_address_index_\(address)"
     }
 
@@ -1660,7 +1593,7 @@ final class WalletManager: ObservableObject {
     /// saved with, and after a mainnet/testnet switch the running address is the other one.
     func chattingAddressIndex(for address: String) -> Int {
         for variant in Self.accountAddressVariants(address) {
-            if let index = UserDefaults.standard.object(forKey: chattingIndexKey(for: variant)) as? Int {
+            if let index = UserDefaults.standard.object(forKey: Self.chattingIndexKey(for: variant)) as? Int {
                 return index
             }
         }
@@ -1677,16 +1610,16 @@ final class WalletManager: ObservableObject {
     private func persistChattingAddressIndex(_ index: Int, for address: String) {
         for variant in Self.accountAddressVariants(address) {
             if index == 0 {
-                UserDefaults.standard.removeObject(forKey: chattingIndexKey(for: variant))
+                UserDefaults.standard.removeObject(forKey: Self.chattingIndexKey(for: variant))
             } else {
-                UserDefaults.standard.set(index, forKey: chattingIndexKey(for: variant))
+                UserDefaults.standard.set(index, forKey: Self.chattingIndexKey(for: variant))
             }
         }
     }
 
     // MARK: - Source-wallet family persistence (same pattern as the chatting index)
 
-    private func walletSourceFamilyKey(for address: String) -> String {
+    private static func walletSourceFamilyKey(for address: String) -> String {
         "kachat_wallet_source_family_\(address)"
     }
 
@@ -1695,7 +1628,7 @@ final class WalletManager: ObservableObject {
     /// Read on either network's encoding of the address, like the chatting index.
     func walletSourceFamily(for address: String) -> WalletSourceFamily {
         for variant in Self.accountAddressVariants(address) {
-            if let raw = UserDefaults.standard.string(forKey: walletSourceFamilyKey(for: variant)),
+            if let raw = UserDefaults.standard.string(forKey: Self.walletSourceFamilyKey(for: variant)),
                let family = WalletSourceFamily(rawValue: raw) {
                 return family
             }
@@ -1712,23 +1645,11 @@ final class WalletManager: ObservableObject {
     private func persistWalletSourceFamily(_ family: WalletSourceFamily, for address: String) {
         for variant in Self.accountAddressVariants(address) {
             if family == .kaspaStandard {
-                UserDefaults.standard.removeObject(forKey: walletSourceFamilyKey(for: variant))
+                UserDefaults.standard.removeObject(forKey: Self.walletSourceFamilyKey(for: variant))
             } else {
-                UserDefaults.standard.set(family.rawValue, forKey: walletSourceFamilyKey(for: variant))
+                UserDefaults.standard.set(family.rawValue, forKey: Self.walletSourceFamilyKey(for: variant))
             }
         }
-    }
-
-    /// Shared identity base node for the ACTIVE wallet's family, derived once for a whole scan -
-    /// mirrors `spendingChangeKey()` in WalletManager+SpendingAddresses.swift (same reasoning:
-    /// the seed decrypt + PBKDF2 + hardened derivations dominate, and only the final per-index
-    /// step differs).
-    private func chattingScanBase() -> (node: (key: Data, chainCode: Data), family: WalletSourceFamily)? {
-        guard let seedPhrase = try? getSeedPhrase() else { return nil }
-        guard var seed = bip39.mnemonicToSeed(seedPhrase.phrase, passphrase: seedPhrase.passphrase ?? "") else { return nil }
-        defer { seed.zeroOut() }
-        let family = currentWalletSourceFamily
-        return (identityBaseNode(seed: seed, family: family), family)
     }
 
     private func chattingAddress(at index: Int, baseNode: (key: Data, chainCode: Data), family: WalletSourceFamily) -> String? {
@@ -1773,93 +1694,6 @@ final class WalletManager: ObservableObject {
         }
     }
 
-    /// Derives the given identity-chain index range and checks every address in BATCH for KAS
-    /// balance (one pooled `getUtxosByAddresses` call, gRPC with REST fallback) and KNS domains
-    /// (`KNSService.refreshIfNeeded`, the same capped/debounced batch lookup ContactsManager and
-    /// Manage Addresses use - never 50 raw requests). Returns ALL scanned candidates in index
-    /// order; the caller filters for interesting ones. Nil when derivation fails (no seed).
-    func scanChattingAddressCandidates(indices: Range<Int>) async -> [ChattingAddressCandidate]? {
-        guard !indices.isEmpty, let (baseNode, family) = chattingScanBase() else { return nil }
-
-        let derived = chattingAddresses(indices: indices, baseNode: baseNode, family: family)
-        guard !derived.isEmpty else { return nil }
-        let addresses = derived.map(\.address)
-
-        let utxos = (try? await NodePoolService.shared.getUtxosByAddresses(addresses)) ?? []
-        var balanceByAddress: [String: UInt64] = [:]
-        for utxo in utxos {
-            balanceByAddress[utxo.address, default: 0] += utxo.amount
-        }
-
-        let network = SettingsViewModel.loadSettings().networkType
-        await KNSService.shared.refreshIfNeeded(for: addresses, network: network)
-        // .k and .kaspa too: an identity can live at an address whose only trace is a name on
-        // one of them.
-        let otherNamesByAddress = await NameServicesClient.shared.ownedNames(of: addresses)
-        let kachatNamesByAddress = await NameServicesClient.shared.kachatNames(of: addresses)
-
-        return derived.map { entry in
-            let info = KNSService.shared.domainCache[entry.address]
-            return ChattingAddressCandidate(
-                index: entry.index,
-                address: entry.address,
-                balanceSompi: balanceByAddress[entry.address] ?? 0,
-                domains: info?.allDomains ?? [],
-                primaryDomain: info?.primaryDomain,
-                otherNames: otherNamesByAddress[entry.address] ?? [],
-                kachatNames: kachatNamesByAddress[entry.address] ?? []
-            )
-        }
-    }
-
-    /// Switches the wallet's identity to the chatting address at `index` on the identity chain.
-    ///
-    /// This is a CLEAN identity selection, not a migration: nothing is moved or deleted. If the
-    /// imported seed's current (index-0) identity already synced conversation history, that
-    /// history lives on-chain and in its own address-keyed storage scope (MessageStore SQLite
-    /// is keyed by wallet address) - switching simply parks it there, and the UI
-    /// confirms with the user first when any conversations exist (see
-    /// ChattingAddressDetailView). In-flight sync races are handled the same way any account
-    /// switch is: `importWallet` stops polling first, and ChatService's write-time
-    /// `isActiveWallet` guard drops anything that still slips through. It funnels through
-    /// `importWallet(from:alias:chattingAddressIndex:)` with the already-stored seed, so every
-    /// identity consumer switches exactly like an account import does: keychain wallet record +
-    /// private key (re-derived for the chosen index), `currentWallet`/`publicAddress`,
-    /// `getPrivateKey()` (handshakes/ECIES encryption), ContactsManager scope, MessageStore's
-    /// per-wallet SQLite (a fresh file keyed by the new address - the old address's store was
-    /// empty since no conversations existed), Public Chat/Group/ColdStorage/
-    /// Portfolio scopes, share-extension shared data, and ChatService polling + UTXO
-    /// subscriptions (restarted for the new address; push registration always reads
-    /// `currentWallet.publicAddress` live at register time).
-    func setChattingAddress(index: Int) async throws {
-        guard index >= 0 else {
-            throw KasiaError.apiError("Invalid chatting address index")
-        }
-        guard index != currentChattingAddressIndex else { return }
-        guard let seedPhrase = try keychainService.loadSeedPhrase() else {
-            throw KasiaError.walletNotFound
-        }
-
-        let alias = currentWallet?.alias ?? "My Account"
-        let previousAddress = currentWallet?.publicAddress
-        // Captured BEFORE the import switches currentWallet: the index moves WITHIN the wallet's
-        // source family (a Kaspanet Web seed keeps scanning/deriving on the 972 branch).
-        let family = currentWalletSourceFamily
-
-        _ = try await importWallet(from: seedPhrase, alias: alias, chattingAddressIndex: index, family: family)
-
-        // The old identity's saved-account entry and snapshot are stale the moment the switch
-        // lands - the account IS the same seed, now living at the new address. Without this the
-        // saved-accounts list keeps a dead index-0 row forever.
-        if let previousAddress, let newAddress = currentWallet?.publicAddress, previousAddress != newAddress {
-            AccountBackupStatus.shared.moveStatus(from: previousAddress, to: newAddress)
-            savedAccounts.removeAll { $0.publicAddress == previousAddress }
-            hasStoredWallet = !savedAccounts.isEmpty
-            persistSavedAccountsToStorage()
-            try? keychainService.deleteAccountSnapshot(publicAddress: previousAddress)
-        }
-    }
-
     // MARK: - Storage
 
     /// Keys first, the wallet record last. If key storage throws (a Secure Enclave that would
@@ -1871,26 +1705,87 @@ final class WalletManager: ObservableObject {
     /// account re-entered, and either way deleting left it with no keys.
     private func saveWallet(_ wallet: Wallet, seedPhrase: SeedPhrase, privateKey: Data) async throws {
         let previousSlot = activeSlotContents()
+        // A saved account's snapshot was its only copy before this import: never removed for it.
+        let wasSaved = savedAccounts.contains { Self.isSameAccount($0.publicAddress, wallet.publicAddress) }
         do {
-            try keychainService.saveSeedPhrase(seedPhrase)
+            // Filed before the slot is touched: a write killed part-way is finished from it.
+            try keychainService.saveAccountSnapshot(wallet: wallet, seedPhrase: seedPhrase, privateKey: privateKey)
             // Private key is derived once by the caller (deriveKeysFromSeed) and passed in, rather
             // than re-deriving it here (a second full PBKDF2 + BIP32 pass on the main actor).
-            try keychainService.savePrivateKey(privateKey)
-            try keychainService.saveAccountSnapshot(wallet: wallet, seedPhrase: seedPhrase, privateKey: privateKey)
-            try keychainService.saveWallet(wallet)
+            try writeActiveSlot(wallet, seedPhrase: seedPhrase, privateKey: privateKey, replacing: previousSlot?.wallet)
         } catch {
             if let previousSlot {
                 restoreActiveSlot(previousSlot)
-                if !Self.isSameAccount(previousSlot.wallet.publicAddress, wallet.publicAddress) {
+                if !wasSaved, !Self.isSameAccount(previousSlot.wallet.publicAddress, wallet.publicAddress) {
                     try? keychainService.deleteAccountSnapshot(publicAddress: wallet.publicAddress)
                 }
             } else {
                 try? keychainService.deleteSeedPhrase()
                 try? keychainService.deletePrivateKey()
-                try? keychainService.deleteAccountSnapshot(publicAddress: wallet.publicAddress)
+                if !wasSaved { try? keychainService.deleteAccountSnapshot(publicAddress: wallet.publicAddress) }
+                clearSlotWriteIntent()
             }
             throw error
         }
+    }
+
+    /// What is about to go into the active slot. The seed, private key and record are three
+    /// separate Keychain writes, and an app killed between them left one account's record over
+    /// another's keys. This is written first and cleared last, so the next launch finishes the job
+    /// from the target's snapshot, which every caller files first. It holds no secrets.
+    private struct SlotWriteIntent: Codable {
+        let target: Wallet
+        let previous: Wallet?
+    }
+
+    private static let slotWriteIntentKey = "kachat_active_slot_write_intent"
+
+    private var hasInterruptedSlotWrite: Bool {
+        UserDefaults.standard.data(forKey: Self.slotWriteIntentKey) != nil
+    }
+
+    private func clearSlotWriteIntent() {
+        UserDefaults.standard.removeObject(forKey: Self.slotWriteIntentKey)
+    }
+
+    /// Keys first, the record last, with `SlotWriteIntent` around them.
+    private func writeActiveSlot(_ wallet: Wallet, seedPhrase: SeedPhrase, privateKey: Data, replacing previous: Wallet?) throws {
+        if let intent = try? JSONEncoder().encode(SlotWriteIntent(target: wallet, previous: previous)) {
+            UserDefaults.standard.set(intent, forKey: Self.slotWriteIntentKey)
+            // on its way out of this process before the first Keychain write
+            UserDefaults.standard.synchronize()
+        }
+        try keychainService.saveSeedPhrase(seedPhrase)
+        try keychainService.savePrivateKey(privateKey)
+        try keychainService.saveWallet(wallet)
+        clearSlotWriteIntent()
+    }
+
+    /// Finishes a slot write a killed app left unfinished: the account it was writing, or the one
+    /// it was replacing if that account's snapshot is gone. A snapshot that can't be read yet (a
+    /// locked launch) leaves the intent for the next load.
+    private func finishInterruptedSlotWrite() {
+        guard let data = UserDefaults.standard.data(forKey: Self.slotWriteIntentKey) else { return }
+        guard let intent = try? JSONDecoder().decode(SlotWriteIntent.self, from: data) else {
+            clearSlotWriteIntent()
+            return
+        }
+        for wallet in [intent.target, intent.previous].compactMap({ $0 }) {
+            for address in Self.accountAddressVariants(wallet.publicAddress) {
+                do {
+                    guard let snapshot = try keychainService.loadAccountSnapshot(publicAddress: address) else { continue }
+                    try keychainService.saveSeedPhrase(snapshot.seedPhrase)
+                    try keychainService.savePrivateKey(snapshot.privateKey)
+                    try keychainService.saveWallet(wallet)
+                    clearSlotWriteIntent()
+                    AppLog.log("%@", "[WalletManager] Finished an interrupted write of the active account")
+                } catch {
+                    AppLog.log("[WalletManager] Couldn't finish an interrupted account write: %@", error.localizedDescription)
+                }
+                return
+            }
+        }
+        clearSlotWriteIntent()
     }
 
     /// The active keychain slot's record and keys, all three or nothing.
@@ -1907,28 +1802,58 @@ final class WalletManager: ObservableObject {
             try keychainService.saveSeedPhrase(slot.seedPhrase)
             try keychainService.savePrivateKey(slot.privateKey)
             try keychainService.saveWallet(slot.wallet)
+            clearSlotWriteIntent()
         } catch {
             AppLog.log("[WalletManager] Failed to restore the active account's keys: %@", error.localizedDescription)
         }
     }
 
+    private enum SnapshotRestore {
+        case restored
+        /// None was ever filed for this account on this phone.
+        case noSnapshot
+        /// One may exist but couldn't be read or written back, as on a launch while locked.
+        case unreadable
+    }
+
     /// The stored record has no keys behind it: puts them back from this account's snapshot, when
-    /// one filed on this phone can still be read. False when there is none.
-    private func restoreKeysFromSnapshot(for wallet: Wallet) -> Bool {
+    /// one filed on this phone can still be read.
+    private func restoreKeysFromSnapshot(for wallet: Wallet) -> SnapshotRestore {
+        var readFailed = false
         for address in Self.accountAddressVariants(wallet.publicAddress) {
-            guard let snapshot = try? keychainService.loadAccountSnapshot(publicAddress: address) else { continue }
+            let found: (seedPhrase: SeedPhrase, privateKey: Data)?
+            do {
+                found = try keychainService.loadAccountSnapshot(publicAddress: address)
+            } catch {
+                readFailed = true
+                continue
+            }
+            guard let snapshot = found else { continue }
             do {
                 try keychainService.saveSeedPhrase(snapshot.seedPhrase)
                 try keychainService.savePrivateKey(snapshot.privateKey)
                 AppLog.log("%@", "[WalletManager] Restored missing keys from this account's snapshot")
-                return true
+                return .restored
             } catch {
                 try? keychainService.deleteSeedPhrase()
                 try? keychainService.deletePrivateKey()
-                return false
+                return .unreadable
             }
         }
-        return false
+        return readFailed ? .unreadable : .noSnapshot
+    }
+
+    /// Empties one account's public chat stores, on both networks. Each store opens off the main
+    /// thread and `clearAll` needs it open, so each is waited for; the store is taken from the
+    /// service first, which each caller then points at whichever account is signed in.
+    private func clearPublicChatStores(forAccount address: String) async {
+        PublicChatService.shared.setCurrentWallet(nil)
+        for variant in Self.accountAddressVariants(address) {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                PublicChatStore.shared.setCurrentWallet(variant.lowercased()) { continuation.resume() }
+            }
+            PublicChatStore.shared.clearAll()
+        }
     }
 
     func saveWalletOnly(_ wallet: Wallet) async throws {
@@ -1996,13 +1921,26 @@ enum LaunchTrace {
 }
 
 extension WalletManager {
-    /// What the Wallet tab keeps for one account besides its spending data (KaPay's
-    /// `removeLocalData` takes the same, less contacts, which KaPlay has none of): its bell history
-    /// and its .kachat name reminders, on both networks' addresses.
+    /// What the app keeps for one account besides its spending data and stores, on both networks'
+    /// addresses: its bell and .kachat reminders, what the bell compares against, its saved names,
+    /// balance and added date, its address choice, and its bot games.
     static func removeWalletTabData(forAccount publicAddress: String) async {
-        for address in accountAddressVariants(publicAddress) {
+        let defaults = UserDefaults.standard
+        let variants = accountAddressVariants(publicAddress)
+        for address in variants {
             await KachatNameReminders.removeAll(forWallet: address)
             GlobalNotificationCenter.removeAllData(forWalletAddress: address)
+            // `KachatNamesNotifier.key` and `KachatOwnedNamesCache.key`, which file by lowercase
+            let lowercased = address.lowercased()
+            defaults.removeObject(forKey: "kachatNamesNotifier.\(lowercased)")
+            for network in ["mainnet", "testnet"] {
+                defaults.removeObject(forKey: "kachat_owned_names_\(network)_\(lowercased)")
+            }
+            defaults.removeObject(forKey: balanceCacheKey(for: address))
+            defaults.removeObject(forKey: accountAddedAtKey(for: address))
+            defaults.removeObject(forKey: chattingIndexKey(for: address))
+            defaults.removeObject(forKey: walletSourceFamilyKey(for: address))
         }
+        ChessBotProgress.shared.removeAll(forAddress: publicAddress)
     }
 }

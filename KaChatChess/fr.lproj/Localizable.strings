@@ -1774,3 +1774,4 @@
 "Dislikes" = "Je n'aime pas";
 "Reposts" = "Republications";
 "Quotes" = "Citations";
+"Couldn't look up %@ right now. Try again in a moment." = "Impossible de vérifier %@ pour le moment. Réessayez dans un instant.";

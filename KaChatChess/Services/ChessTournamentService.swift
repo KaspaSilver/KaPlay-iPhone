@@ -38,6 +38,20 @@ final class ChessTournamentService: ObservableObject {
     /// to send is posted again after `claimRetryMs`, while the game is still undecided on chain.
     private var claimedGames: [String: Int64] = [:]
     private static let claimRetryMs: Int64 = 30_000
+    /// The automatic claims of one flag. A claim that keeps not taking is going against a board
+    /// that's wrong, so each retry first pages the arena again, and after a few the app stops
+    /// paying for them: the board's Claim win is still there.
+    private struct AutoClaim {
+        let flagAt: Int64
+        var tries = 0
+        var repaged = false
+    }
+    private var autoClaims: [String: AutoClaim] = [:]
+    private static let maxAutoClaims = 4
+    /// One of this player's games has a later move than the board reached: at most this often
+    /// the arena is paged back to the game's start.
+    private static let gapRepageGapMs: Int64 = 30_000
+    private var lastGapRepageAt: Int64 = 0
     /// The app claims by itself only for a flag this recent: an old game both players walked
     /// away from is not paid for on every launch. The board's Claim button covers the rest.
     private static let autoClaimWindowMs: Int64 = 30 * 60_000
@@ -50,6 +64,18 @@ final class ChessTournamentService: ObservableObject {
     @Published private(set) var claimsInFlight: Set<String> = []
     /// Taps on Claim win closer together than this are one claim.
     private static let claimTapGapMs: Int64 = 5_000
+    /// True while the chess server (the arena's indexer) isn't answering: what's on screen is
+    /// what this phone has, plus what the block stream brings.
+    @Published private(set) var arenaServerDown = false
+    /// While the indexer is down, when each of this player's games last had all its players read
+    /// from the REST API (wall ms).
+    private var chainReadAt: [String: Int64] = [:]
+    private var nextChainRead: Int64 = 0
+    private static let chainReadIntervalMs: Int64 = 10_000
+    /// The REST API shows a move a few seconds after it lands: a read this long past the flag
+    /// has seen any move made before it.
+    private static let chainFlagMarginMs: Int64 = 5_000
+    private static let roomsUnconfirmedMessage = "The chess server is unreachable, so open rooms can't be confirmed. Try again when it's back."
     /// An own arena transaction the chain has not shown this long after it was sent is looked up,
     /// and dropped when the network has never seen it (`PublicChatService.checkUnconfirmedServiceRows`).
     /// Blocks come ten a second and the indexer is polled every 2-8 s, so a transaction that
@@ -83,6 +109,17 @@ final class ChessTournamentService: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] address in self?.accountChanged(to: address) }
             .store(in: &cancellables)
+        // Its current value too: this service can start after the indexer went down.
+        PublicChatService.shared.$arenaIndexerDown
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] down in
+                guard let self else { return }
+                let wasDown = self.arenaServerDown
+                self.arenaServerDown = down
+                if wasDown, !down { self.refreshIndexerLeaderboards(force: true) }
+            }
+            .store(in: &cancellables)
     }
 
     private func accountChanged(to address: String?) {
@@ -92,6 +129,11 @@ final class ChessTournamentService: ObservableObject {
         pendingMoveGames = []
         pendingMoveSentAt = [:]
         claimedGames = [:]
+        autoClaims = [:]
+        autoRejoinsLeft = 0
+        chainReadAt = [:]
+        nextChainRead = 0
+        lastGapRepageAt = 0
         lastError = nil
     }
 
@@ -104,6 +146,7 @@ final class ChessTournamentService: ObservableObject {
         refCount += 1
         guard refCount == 1 else { return }
         let publicChat = PublicChatService.shared
+        publicChat.resyncArenaIndexerIfUnset()
         if !arenaJoined, !publicChat.channels.contains(where: { $0.channelName == ChessTournamentCodec.arenaChannel }) {
             publicChat.joinChannel(ChessTournamentCodec.arenaChannel)
         }
@@ -119,6 +162,7 @@ final class ChessTournamentService: ObservableObject {
             let deadline = Date().addingTimeInterval(8)
             while Date() < deadline {
                 if PublicChatService.shared.indexerFetchedChannels.contains(ChessTournamentCodec.arenaChannel)
+                    || PublicChatService.shared.arenaIndexerDown
                     || PublicChatService.indexerBaseURL(forChannel: ChessTournamentCodec.arenaChannel).isEmpty { break }
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
@@ -147,9 +191,16 @@ final class ChessTournamentService: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: Self.fastPollIntervalNanos)
                 guard let self, !Task.isCancelled else { return }
-                // Only while it matters: a seat held or a game on. Idle in the lobby, the
-                // room's own poll is plenty.
-                guard self.myActiveTournament != nil else { continue }
+                PublicChatService.shared.resyncArenaIndexerIfUnset()
+                // With the indexer down the room's own poll checks when it's back; this phone's
+                // games are read by their players' addresses.
+                if PublicChatService.shared.arenaIndexerDown {
+                    await self.readMyGamesFromChainIfDue()
+                    continue
+                }
+                // Only while it matters: a seat held, a game on, or a flag waiting to be
+                // claimed. Idle in the lobby, the room's own poll is plenty.
+                guard self.isBusyOnline else { continue }
                 await PublicChatService.shared.refreshFromIndexerNow(channel: ChessTournamentCodec.arenaChannel)
             }
         }
@@ -163,6 +214,37 @@ final class ChessTournamentService: ObservableObject {
         clockTask = nil
         fastPollTask?.cancel()
         fastPollTask = nil
+    }
+
+    /// The indexer is down: this player's live games, and the ones just flagged, from the two
+    /// players' addresses. It fills in what the block stream missed (a reconnect, the app in the
+    /// background) and is what lets a timeout claim go out (`flagIsConfirmed`), which rests on
+    /// the opponent's address alone: their moves are what could be missing.
+    private func readMyGamesFromChainIfDue() async {
+        guard let me = myAddress, now >= nextChainRead else { return }
+        nextChainRead = now + Self.chainReadIntervalMs
+        for tournament in tournaments.values where tournament.status == .live {
+            for game in tournament.games.values {
+                guard let mine = game.color(of: me), let flagAt = game.flagAt,
+                      now - flagAt < Self.autoClaimWindowMs else { continue }
+                let askedAt = Int64(Date().timeIntervalSince1970 * 1000)
+                let answered = await PublicChatService.shared.readArenaFromChain(
+                    tournamentId: tournament.id, players: [game.address(of: mine.opposite)], since: game.startedAt
+                )
+                _ = await PublicChatService.shared.readArenaFromChain(
+                    tournamentId: tournament.id, players: [me], since: game.startedAt
+                )
+                if answered { chainReadAt["\(tournament.id)|\(game.id)"] = askedAt }
+            }
+        }
+    }
+
+    /// Whether the chain has been read since this flag: the moves on this phone can be behind
+    /// (just relaunched, or the indexer down), and a clock judged from those says nothing.
+    private func flagIsConfirmed(in tournament: ChessTournament, game: ChessTournamentGame, flagAt: Int64) -> Bool {
+        guard !PublicChatService.indexerBaseURL(forChannel: ChessTournamentCodec.arenaChannel).isEmpty else { return true }
+        if PublicChatService.shared.arenaIndexerAnsweredAt >= flagAt + 1_500 { return true }
+        return (chainReadAt["\(tournament.id)|\(game.id)"] ?? 0) >= flagAt + Self.chainFlagMarginMs
     }
 
     /// Asks for a replay of the arena and returns once one that started after the ask has
@@ -188,30 +270,58 @@ final class ChessTournamentService: ObservableObject {
             let target = requestedReduce
             let rows = PublicChatService.shared.messages(forChannel: ChessTournamentCodec.arenaChannel)
             let localStamps = PublicChatService.shared.locallyStampedTxIds
-            let reduced = await Task.detached(priority: .userInitiated) { () -> [String: ChessTournament] in
+            let me = myAddress
+            let wallNow = Int64(Date().timeIntervalSince1970 * 1000)
+            let result = await Task.detached(priority: .userInitiated) { () -> (tournaments: [String: ChessTournament], gapSince: Int64?) in
                 let events: [ChessArenaEvent] = rows.compactMap { row in
                     guard row.deliveryStatus == .sent, !row.id.hasPrefix("pending_"),
                           let message = ChessTournamentCodec.decode(row.content) else { return nil }
                     return ChessArenaEvent(txId: row.id, sender: row.senderAddress, blockTime: row.blockTime, message: message)
                 }
-                return ChessTournamentEngine.reduce(ChessTournamentService.orderingLocalStamps(events, localStamps: localStamps))
+                let tournaments = ChessTournamentEngine.reduce(ChessTournamentService.orderingLocalStamps(events, localStamps: localStamps))
+                let gapSince = me.flatMap { ChessTournamentService.earliestGap(events, in: tournaments, me: $0, now: wallNow) }
+                return (tournaments, gapSince)
             }.value
             appliedReduce = target
-            apply(reduced)
+            apply(result.tournaments)
+            if let since = result.gapSince, wallNow - lastGapRepageAt >= Self.gapRepageGapMs {
+                lastGapRepageAt = wallNow
+                PublicChatService.shared.repageArena(since: since)
+            }
         }
         reduceTask = nil
+    }
+
+    /// A game of `me`'s still undecided has a move from one of its players beyond the next ply:
+    /// a row before it is missing on this phone. Returns the earliest such game's start.
+    nonisolated private static func earliestGap(_ events: [ChessArenaEvent], in tournaments: [String: ChessTournament], me: String, now: Int64) -> Int64? {
+        var since: Int64?
+        for event in events where event.message.a == "move" {
+            guard let gameId = event.message.g, let ply = event.message.n,
+                  let game = tournaments[event.message.t]?.games[gameId],
+                  game.color(of: me) != nil, game.color(of: event.sender) != nil,
+                  ply > game.moves.count + 1, !game.isDecided(at: now) else { continue }
+            since = min(since ?? game.startedAt, game.startedAt)
+        }
+        return since
     }
 
     private func apply(_ reduced: [String: ChessTournament]) {
         tournaments = reduced
         recomputeLocalBoards()
         resolveNames(for: Set(reduced.values.flatMap(\.players)))
-        // Asked to join a public room that filled first: queue into the next one, once.
+        // Asked to join a public room that filled first: queue into the next one. Bounded per
+        // tap (`autoRejoinsLeft`), so a join can never turn into spending nobody asked for.
         if let queued = queuedPublicRoomId, let me = myAddress, let room = reduced[queued],
            room.isFull, !room.players.contains(me) {
             queuedPublicRoomId = nil
-            let wasDuel = ChessTournamentCodec.duelNumber(of: queued) != nil
-            Task { if wasDuel { await self.joinPublicDuelQueue() } else { await self.joinPublicQueue() } }
+            if autoRejoinsLeft > 0 {
+                autoRejoinsLeft -= 1
+                let wasDuel = ChessTournamentCodec.duelNumber(of: queued) != nil
+                Task { await self.joinPublicRoom(duel: wasDuel, automaticAfter: queued) }
+            } else {
+                lastError = Self.roomFilledMessage
+            }
         } else if let queued = queuedPublicRoomId, let me = myAddress, reduced[queued]?.players.contains(me) == true {
             queuedPublicRoomId = nil
         }
@@ -294,13 +404,13 @@ final class ChessTournamentService: ObservableObject {
     /// Its id exists before anyone has joined it (the first join creates it), so the lobby can
     /// always show "Public tournament #N" with its seats.
     var currentPublicRoomId: String {
-        ChessTournamentCodec.publicId(currentRoomNumber(numberOf: ChessTournamentCodec.publicNumber(of:)))
+        ChessTournamentCodec.publicId(currentRoomNumber(numberOf: ChessTournamentCodec.publicNumber(of:), idOf: ChessTournamentCodec.publicId))
     }
     var currentPublicRoom: ChessTournament? { tournaments[currentPublicRoomId] }
 
     /// The public 1v1 room taking players right now.
     var currentDuelRoomId: String {
-        ChessTournamentCodec.duelId(currentRoomNumber(numberOf: ChessTournamentCodec.duelNumber(of:)))
+        ChessTournamentCodec.duelId(currentRoomNumber(numberOf: ChessTournamentCodec.duelNumber(of:), idOf: ChessTournamentCodec.duelId))
     }
     var currentDuelRoom: ChessTournament? { tournaments[currentDuelRoomId] }
 
@@ -308,16 +418,30 @@ final class ChessTournamentService: ObservableObject {
     /// players; when none is, one past the highest room this phone knows. Every phone with the
     /// same recent history lands on the same number - and it does not need the history back to
     /// room 1 (see the engine's join rule).
-    private func currentRoomNumber(numberOf: (String) -> Int?) -> Int {
-        var open: Int?
-        var highest = 0
+    ///
+    /// Anyone can post a join naming any room, so this is the choice of a room to pick, never
+    /// the reducer's view of what rooms exist: only a room's canonical id counts (`duel-01` is
+    /// not room 1), nothing past `maxRoomNumber`, and of the runs of numbers near each other only
+    /// the longest (the real queue), so a stray `duel-900000` can't move it.
+    private func currentRoomNumber(numberOf: (String) -> Int?, idOf: (Int) -> String) -> Int {
+        var rooms: [(number: Int, isOpen: Bool)] = []
         for room in tournaments.values {
-            guard let number = numberOf(room.id) else { continue }
-            highest = max(highest, number)
-            if room.status == .open, !room.isFull { open = min(open ?? number, number) }
+            guard let number = numberOf(room.id), number <= Self.maxRoomNumber, idOf(number) == room.id else { continue }
+            rooms.append((number, room.status == .open && !room.isFull))
         }
-        return open ?? highest + 1
+        rooms.sort { $0.number < $1.number }
+        var best: ArraySlice<(number: Int, isOpen: Bool)> = []
+        var start = 0
+        for index in rooms.indices where index + 1 == rooms.count || rooms[index + 1].number - rooms[index].number > Self.maxRoomGap {
+            let run = rooms[start...index]
+            if run.count > best.count { best = run }
+            start = index + 1
+        }
+        return best.first(where: { $0.isOpen })?.number ?? ((best.last?.number ?? 0) + 1)
     }
+
+    private static let maxRoomNumber = 1_000_000_000
+    private static let maxRoomGap = 1_000
 
     /// True once the arena's history has come back from the indexer (or, without one, once the
     /// first rows arrived / a few seconds passed). A join before that would pick a room from an
@@ -343,7 +467,7 @@ final class ChessTournamentService: ObservableObject {
     var myPrivateDuels: [ChessTournament] {
         guard let me = myAddress else { return [] }
         return tournaments.values
-            .filter { !$0.isPublic && $0.isDuel && ($0.status == .open || $0.isInPlay(at: now)) && $0.players.contains(me) }
+            .filter { !$0.isPublic && $0.isDuel && ($0.status == .open || $0.isInPlay(at: now) || hasUnclaimedWin($0)) && $0.players.contains(me) }
             .sorted { $0.createdAt > $1.createdAt }
     }
 
@@ -351,8 +475,15 @@ final class ChessTournamentService: ObservableObject {
     var myPrivateTournaments: [ChessTournament] {
         guard let me = myAddress else { return [] }
         return tournaments.values
-            .filter { !$0.isPublic && !$0.isDuel && ($0.status == .open || $0.isInPlay(at: now)) && $0.players.contains(me) }
+            .filter { !$0.isPublic && !$0.isDuel && ($0.status == .open || $0.isInPlay(at: now) || hasUnclaimedWin($0)) && $0.players.contains(me) }
             .sorted { $0.createdAt > $1.createdAt }
+    }
+
+    /// A game here this player has won on the clock, with no claim on chain. Finished lists
+    /// public games only, so this keeps a private one reachable, for its Claim win.
+    func hasUnclaimedWin(_ tournament: ChessTournament) -> Bool {
+        guard let me = myAddress, tournament.status == .live else { return false }
+        return tournament.games.values.contains { !$0.isOver && $0.decidedWinner(at: now) == me }
     }
 
     var openTournaments: [ChessTournament] {
@@ -404,15 +535,28 @@ final class ChessTournamentService: ObservableObject {
     private var lastIndexerLeaderboardFetch: Date?
     private var indexerLeaderboardTask: Task<Void, Never>?
 
+    private var boardsGeneration = 0
+
+    /// Off the main thread, like the replay it follows; the newest ask is the one that lands.
     private func recomputeLocalBoards() {
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         boardsMonthStart = ChessTournamentEngine.utcMonthStartMs(nowMs)
+        boardsGeneration += 1
+        let generation = boardsGeneration
         let all = Array(tournaments.values)
-        for period in ChessLeaderboardPeriod.allCases {
-            localBoards[period] = ChessTournamentEngine.leaderboard(
-                from: all, since: ChessTournamentEngine.periodSinceMs(period, nowMs: nowMs))
+        Task { [weak self] in
+            let boards = await Task.detached(priority: .userInitiated) { () -> [ChessLeaderboardPeriod: [ChessLeaderboardRow]] in
+                var boards: [ChessLeaderboardPeriod: [ChessLeaderboardRow]] = [:]
+                for period in ChessLeaderboardPeriod.allCases {
+                    boards[period] = ChessTournamentEngine.leaderboard(
+                        from: all, since: ChessTournamentEngine.periodSinceMs(period, nowMs: nowMs))
+                }
+                return boards
+            }.value
+            guard let self, self.boardsGeneration == generation else { return }
+            self.localBoards = boards
+            self.publishBoards()
         }
-        publishBoards()
     }
 
     /// Per player, each figure is the larger of the two sources: both count the same window,
@@ -443,7 +587,8 @@ final class ChessTournamentService: ObservableObject {
             return rows.values.sorted {
                 if $0.wins != $1.wins { return $0.wins > $1.wins }
                 if $0.losses != $1.losses { return $0.losses < $1.losses }
-                return $0.lastPlayedAt > $1.lastPlayedAt
+                if $0.lastPlayedAt != $1.lastPlayedAt { return $0.lastPlayedAt > $1.lastPlayedAt }
+                return $0.address < $1.address
             }
         }
         let all = merged(.allTime)
@@ -557,18 +702,30 @@ final class ChessTournamentService: ObservableObject {
     /// The seat that ran out is still in `players` until the next join drops it (the engine
     /// judges that at the join's block time) - so "already in" means seated NOW, never the
     /// stale list, or a returning player's tap would do nothing at all.
-    private func joinPublicRoom(duel: Bool) async {
+    /// `automaticAfter`: this is the app moving on from a room that filled first, not a tap.
+    private func joinPublicRoom(duel: Bool, automaticAfter filledRoom: String? = nil) async {
         guard let me = myAddress else { return }
         guard historyReady else { lastError = "Still loading the rooms - try again in a moment."; return }
+        if filledRoom == nil { autoRejoinsLeft = Self.maxAutoRejoins }
         // The freshest shared view first: whatever the indexer holds this second is what every
         // other phone is choosing from. Only then pick the room. The subscription delivers the
         // merge on the next run-loop turn, so reduce the rows here and now instead of reading
         // a room number off the old state.
-        await PublicChatService.shared.refreshFromIndexerNow(channel: ChessTournamentCodec.arenaChannel)
+        // Without that view the room number and its seats are only what this phone last saw:
+        // nothing is sent. (No indexer configured at all: the block stream is all there is.)
+        guard await arenaViewIsConfirmed() else {
+            lastError = Self.roomsUnconfirmedMessage
+            return
+        }
         await reduceArena()
         // The account may have changed while the rooms loaded.
         guard myAddress == me else { return }
         let id = duel ? currentDuelRoomId : currentPublicRoomId
+        // Never a join the reducer would ignore: it can't take a seat, and it costs a fee.
+        guard id != filledRoom, tournaments[id].map({ $0.status == .open }) ?? true else {
+            lastError = Self.roomFilledMessage
+            return
+        }
         if let busy = myActiveTournament {
             lastError = busy.status == .open ? "You're already waiting in \(busy.name)." : "You're still playing in \(busy.name)."
             return
@@ -585,6 +742,33 @@ final class ChessTournamentService: ObservableObject {
 
     /// The room this player asked to join and is waiting to appear in.
     private var queuedPublicRoomId: String?
+    /// How many more rooms the app may try by itself before the player taps Join again.
+    private var autoRejoinsLeft = 0
+    private static let maxAutoRejoins = 2
+    private static let roomFilledMessage = "That room filled first. Tap Join to try the next one."
+
+    /// Whether the rooms on this phone are the indexer's as of just now, with any history still
+    /// owed paged in. One failed request isn't an outage: it's tried again, and an answer from
+    /// the last few seconds stands.
+    private func arenaViewIsConfirmed() async -> Bool {
+        let chat = PublicChatService.shared
+        let channel = ChessTournamentCodec.arenaChannel
+        guard !PublicChatService.indexerBaseURL(forChannel: channel).isEmpty else { return true }
+        var confirmed = await chat.refreshFromIndexerNow(channel: channel)
+        if !confirmed, !chat.arenaIndexerDown {
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            confirmed = await chat.refreshFromIndexerNow(channel: channel)
+        }
+        let wallNow = Int64(Date().timeIntervalSince1970 * 1000)
+        guard confirmed || wallNow - chat.arenaIndexerAnsweredAt < Self.recentAnswerMs else { return false }
+        // Past one poll interval: paging is done by the room's 8 s poll.
+        let deadline = Date().addingTimeInterval(12)
+        while !chat.arenaBackfillDone, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return chat.arenaBackfillDone
+    }
+    private static let recentAnswerMs: Int64 = 15_000
 
     /// Joins the public 1v1 room taking players now; same race handling as the tournaments.
     func joinPublicDuelQueue() async {
@@ -614,7 +798,9 @@ final class ChessTournamentService: ObservableObject {
     func joinPrivate(code raw: String) async -> Bool {
         let id = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard let tournament = tournaments[id], !tournament.isPublic else {
-            lastError = "No open tournament with that code. Codes are eight characters; the tournament must exist and still have seats."
+            lastError = arenaServerDown
+                ? "The chess server is unreachable, so that code can't be looked up. Try again when it's back."
+                : "No open tournament with that code. Codes are eight characters; the tournament must exist and still have seats."
             return false
         }
         guard tournament.status == .open else { lastError = "That tournament has already started."; return false }
@@ -629,6 +815,10 @@ final class ChessTournamentService: ObservableObject {
         if tournament.isSeated(me, at: now) { return true }
         if let busy = myActiveTournament, busy.id != tournament.id {
             lastError = busy.status == .open ? "You're already waiting in \(busy.name)." : "You're still playing in \(busy.name)."
+            return false
+        }
+        if tournament.isPublic, arenaServerDown {
+            lastError = Self.roomsUnconfirmedMessage
             return false
         }
         return await send(ChessTournamentCodec.join(id: tournament.id))
@@ -692,6 +882,8 @@ final class ChessTournamentService: ObservableObject {
                 // A second's margin past zero, so the claim's block time is safely after; and
                 // only a recent flag - an old abandoned game is left to the board's Claim.
                 guard now - 1_500 >= flagAt, now - flagAt < Self.autoClaimWindowMs else { continue }
+                // Not off a board that may be behind the chain.
+                guard flagIsConfirmed(in: tournament, game: game, flagAt: flagAt) else { continue }
                 // Our own last move still carries this phone's clock: the opponent's clock
                 // started at an instant the chain has not confirmed yet - wait for it.
                 if let last = game.moves.last, localStamps.contains(last.txId) { continue }
@@ -708,13 +900,33 @@ final class ChessTournamentService: ObservableObject {
         guard let me = myAddress, game.decidedWinner(at: now) == me, !game.isOver else { return }
         let key = "\(tournament.id)|\(game.id)"
         if let at = claimedGames[key], now - at < Self.claimTapGapMs { return }
+        if arenaServerDown, !flagIsConfirmed(in: tournament, game: game, flagAt: game.flagAt ?? now) {
+            lastError = "The chess server is unreachable and the network hasn't confirmed this yet. Try again in a moment."
+            return
+        }
         postClaim(tournament, game: game, force: true)
     }
 
     private func postClaim(_ tournament: ChessTournament, game: ChessTournamentGame, force: Bool = false) {
         let key = "\(tournament.id)|\(game.id)"
         guard !claimsInFlight.contains(key) else { return }
-        if !force, let at = claimedGames[key], now - at < Self.claimRetryMs { return }
+        if !force {
+            if let at = claimedGames[key], now - at < Self.claimRetryMs { return }
+            let flagAt = game.flagAt ?? 0
+            var record = autoClaims[key].flatMap { $0.flagAt == flagAt ? $0 : nil } ?? AutoClaim(flagAt: flagAt)
+            guard record.tries < Self.maxAutoClaims else { return }
+            // A claim that didn't take: read the arena again before paying for another. The
+            // next tick waits on `flagIsConfirmed` until that's done.
+            if record.tries > 0, !record.repaged {
+                record.repaged = true
+                autoClaims[key] = record
+                PublicChatService.shared.repageArena(since: game.startedAt)
+                return
+            }
+            record.tries += 1
+            record.repaged = false
+            autoClaims[key] = record
+        }
         claimedGames[key] = now
         claimsInFlight.insert(key)
         Task {

@@ -55,6 +55,10 @@ struct ChessWaitingRoomView: View {
                     .font(.title2.weight(.bold))
                 seats
                 countdown
+                if service.arenaServerDown {
+                    ChessServerDownNote(text: "Chess server unreachable. Watching the network for players, so someone who joined while the app was away may not show.")
+                        .padding(.horizontal, 32)
+                }
                 if let tournament, !tournament.isPublic {
                     privateCode(tournament)
                 }

@@ -645,7 +645,8 @@ struct KachatAddressLiveNamesList: View {
         guard let key = KachatNamesRegistry.keyOf(address) else { loaded = true; return }
         if registry.refreshedAt == nil { await registry.refresh() }
         // an expired name past grace isn't theirs any more: it's available to anyone
-        names = (try? await registry.heldNames(owner: key)) ?? []
+        // a failed read keeps what's on screen: it isn't "holds no names"
+        if let held = try? await registry.heldNames(owner: key) { names = held }
         loaded = true
     }
 }

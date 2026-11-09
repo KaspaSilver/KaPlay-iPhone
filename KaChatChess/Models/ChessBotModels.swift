@@ -236,6 +236,20 @@ final class ChessBotProgress: ObservableObject {
         }
     }
 
+    /// An account was deleted: its records go from memory as well as the saved copies (on both
+    /// networks' addresses, any case), or the next bot game finished would write them back.
+    func removeAll(forAddress address: String) {
+        let variants = Set(WalletManager.accountAddressVariants(address).map { $0.lowercased() })
+        records = records.filter { !variants.contains($0.key.lowercased()) }
+        stampedWins = stampedWins.filter { !variants.contains($0.key.lowercased()) }
+        if let data = try? JSONEncoder().encode(records) {
+            UserDefaults.standard.set(data, forKey: Self.defaultsKey)
+        }
+        if let data = try? JSONEncoder().encode(stampedWins) {
+            UserDefaults.standard.set(data, forKey: Self.stampedWinsKey)
+        }
+    }
+
     func addStampedWin(moves: Int, against bot: ChessBot) {
         let win = StampedWin(moves: moves, at: Int64(Date().timeIntervalSince1970 * 1000))
         stampedWins[address, default: [:]][bot.level, default: []].append(win)

@@ -132,18 +132,6 @@ final class ChatService: ObservableObject {
     /// (see `ChatDetailView.attachPendingShareImageIfAvailable`). Session-only by design.
     var pendingShareImages: [String: Data] = [:]
 
-    func stagePendingShareImage(_ data: Data, for contactAddress: String) {
-        pendingShareImages[contactAddress] = data
-    }
-
-    func pendingShareImage(for contactAddress: String) -> Data? {
-        pendingShareImages[contactAddress]
-    }
-
-    func clearPendingShareImage(for contactAddress: String) {
-        pendingShareImages.removeValue(forKey: contactAddress)
-    }
-
     // Connection status properties
     @Published var isRpcSubscribed = false
     @Published var lastSuccessfulSyncDate: Date?
@@ -780,40 +768,6 @@ final class ChatService: ObservableObject {
                 self?.isUtxoSubscribed = false  // Reset subscription state
                 await self?.setupUtxoSubscription()
             }
-        }
-    }
-
-    /// Clear all chat data (called when clearing app data)
-    /// - Parameter skipStoreClear: If true, skips calling messageStore.clearAll() (use when store was already cleared)
-    func clearAllData(skipStoreClear: Bool = false) {
-        stopPolling()
-        resetForNewWallet(skipStoreClear: skipStoreClear)
-        contactsCancellable?.cancel()
-        contactsCancellable = nil
-        settingsCancellable?.cancel()
-        settingsCancellable = nil
-        pingLatencyCancellable?.cancel()
-        pingLatencyCancellable = nil
-        nodePoolSubscriptionStateCancellable?.cancel()
-        nodePoolSubscriptionStateCancellable = nil
-        nodePoolPrimaryEndpointCancellable?.cancel()
-        nodePoolPrimaryEndpointCancellable = nil
-        conversationCountCancellable?.cancel()
-        conversationCountCancellable = nil
-        pendingResubscriptionTask?.cancel()
-        pendingResubscriptionTask = nil
-        // Block-based observers are only released by removing their token - `removeObserver(self)`
-        // does not reach them - so every token `init` registered is dropped here, not just the
-        // first. `resetForNewWallet()` deliberately keeps them: it is a data reset on wallet
-        // switch/logout, nothing re-registers them afterwards, and the handlers self-gate on
-        // the current wallet.
-        if let observer = rpcReconnectObserver {
-            NotificationCenter.default.removeObserver(observer)
-            rpcReconnectObserver = nil
-        }
-        if let observer = rpcReconnectedObserver {
-            NotificationCenter.default.removeObserver(observer)
-            rpcReconnectedObserver = nil
         }
     }
 

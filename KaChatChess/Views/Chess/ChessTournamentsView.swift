@@ -51,6 +51,9 @@ struct ChessTournamentsView: View {
             .contentShape(Rectangle())
             .gesture(tabSwipe())
             List {
+                if service.arenaServerDown {
+                    Section { ChessServerDownNote() }
+                }
                 switch tab {
                 case .play:
                     if mode == .duel { duelSections } else { tournamentSections }
@@ -257,7 +260,7 @@ struct ChessTournamentsView: View {
         }
         Section {
             ForEach(service.myPrivateDuels) { duel in
-                tournamentRow(duel, action: duel.status == .open ? "Waiting" : "In play")
+                tournamentRow(duel, action: duel.status == .open ? "Waiting" : (service.hasUnclaimedWin(duel) ? "Claim win" : "In play"))
             }
             Button {
                 privateCode = ""
@@ -468,7 +471,7 @@ struct ChessTournamentsView: View {
         }
         Section {
             ForEach(service.myPrivateTournaments) { tournament in
-                tournamentRow(tournament, action: tournament.status == .open ? "\(tournament.seatsLeft) seat\(tournament.seatsLeft == 1 ? "" : "s") left" : "In play")
+                tournamentRow(tournament, action: tournament.status == .open ? "\(tournament.seatsLeft) seat\(tournament.seatsLeft == 1 ? "" : "s") left" : (service.hasUnclaimedWin(tournament) ? "Claim win" : "In play"))
             }
             Button {
                 privateCode = ""
@@ -497,6 +500,8 @@ struct ChessTournamentsView: View {
         let count = seated.count
         let inThisRoom = me.map { seated.contains($0) } ?? false
         let busyElsewhere = service.myActiveTournament != nil && !inThisRoom
+        // Without the chess server this phone can't know the room's number or its seats.
+        let unconfirmed = service.arenaServerDown && !inThisRoom
         return VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 12) {
                 Image(systemName: capacity == 2 ? "person.2.fill" : "person.3.fill")
@@ -504,16 +509,23 @@ struct ChessTournamentsView: View {
                     .foregroundColor(.accentColor)
                     .frame(width: 32)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(title).font(.headline)
-                    Text("\(count) of \(capacity) player\(capacity == 1 ? "" : "s") waiting").font(.caption).foregroundColor(.secondary)
+                    if unconfirmed {
+                        Text(capacity == 2 ? "Public 1v1" : "Public tournament").font(.headline)
+                        Text("Seats can't be checked right now").font(.caption).foregroundColor(.secondary)
+                    } else {
+                        Text(title).font(.headline)
+                        Text("\(count) of \(capacity) player\(capacity == 1 ? "" : "s") waiting").font(.caption).foregroundColor(.secondary)
+                    }
                 }
                 Spacer()
             }
-            HStack(spacing: 6) {
-                ForEach(0..<capacity, id: \.self) { seat in
-                    Circle()
-                        .fill(seat < count ? Color.accentColor : Color.secondary.opacity(0.25))
-                        .frame(width: 12, height: 12)
+            if !unconfirmed {
+                HStack(spacing: 6) {
+                    ForEach(0..<capacity, id: \.self) { seat in
+                        Circle()
+                            .fill(seat < count ? Color.accentColor : Color.secondary.opacity(0.25))
+                            .frame(width: 12, height: 12)
+                    }
                 }
             }
             if inThisRoom, let room {
@@ -522,6 +534,8 @@ struct ChessTournamentsView: View {
                 pill(mine.status == .open ? "You're waiting in \(mine.name)" : "You're playing in \(mine.name)", filled: false) {
                     if mine.status == .open { waitingRoomId = mine.id } else { openTournamentId = mine.id }
                 }
+            } else if unconfirmed {
+                pill("Waiting for the chess server", filled: false) {}
             } else {
                 pill(isJoining ? "Joining…" : (service.historyReady ? service.joinLabel(roomId: id) : "Loading rooms…"), filled: service.historyReady) {
                     guard !isJoining, service.historyReady else { return }
@@ -629,6 +643,9 @@ struct ChessLeaderboardRows: View {
     }
 
     var body: some View {
+        if service.arenaServerDown {
+            Section { ChessServerDownNote(text: "Chess server unreachable. Showing what this phone has, which can be less than the full board.") }
+        }
         Section {
             Picker("Leaderboard period", selection: $period) {
                 Text("This month").tag(ChessLeaderboardPeriod.month)

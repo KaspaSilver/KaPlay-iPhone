@@ -319,7 +319,8 @@ enum ChessTournamentEngine {
         return rows.values.sorted {
             if $0.wins != $1.wins { return $0.wins > $1.wins }
             if $0.losses != $1.losses { return $0.losses < $1.losses }
-            return $0.lastPlayedAt > $1.lastPlayedAt
+            if $0.lastPlayedAt != $1.lastPlayedAt { return $0.lastPlayedAt > $1.lastPlayedAt }
+            return $0.address < $1.address
         }
     }
 
@@ -329,7 +330,8 @@ enum ChessTournamentEngine {
         rows.filter { $0.wins + $0.losses > 0 }.sorted {
             if $0.wins != $1.wins { return $0.wins > $1.wins }
             if $0.losses != $1.losses { return $0.losses < $1.losses }
-            return $0.lastPlayedAt > $1.lastPlayedAt
+            if $0.lastPlayedAt != $1.lastPlayedAt { return $0.lastPlayedAt > $1.lastPlayedAt }
+            return $0.address < $1.address
         }
     }
 
@@ -340,7 +342,8 @@ enum ChessTournamentEngine {
         rows.filter { $0.tournamentsWon + $0.tournamentsLost > 0 }.sorted {
             if $0.tournamentsWon != $1.tournamentsWon { return $0.tournamentsWon > $1.tournamentsWon }
             if $0.tournamentsLost != $1.tournamentsLost { return $0.tournamentsLost < $1.tournamentsLost }
-            return $0.lastPlayedAt > $1.lastPlayedAt
+            if $0.lastPlayedAt != $1.lastPlayedAt { return $0.lastPlayedAt > $1.lastPlayedAt }
+            return $0.address < $1.address
         }
     }
 }

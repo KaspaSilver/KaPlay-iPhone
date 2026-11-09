@@ -67,13 +67,6 @@ final class MessageStore {
         defaults.set(Date().timeIntervalSince1970, forKey: MessageStore.dpiCorruptionWarningDateKey)
     }
 
-    func clearDpiCorruptionWarning() {
-        let defaults = UserDefaults.standard
-        defaults.removeObject(forKey: MessageStore.dpiCorruptionWarningKey)
-        defaults.removeObject(forKey: MessageStore.dpiCorruptionWarningEndpointKey)
-        defaults.removeObject(forKey: MessageStore.dpiCorruptionWarningDateKey)
-    }
-
     func destroyLocalStoreFiles() async {
         resetViewContextBeforeStoreRemoval()
         let coordinator = container.persistentStoreCoordinator
@@ -86,8 +79,8 @@ final class MessageStore {
         }
 
         let url = storeURLForWallet(currentWalletAddress)
-        let walURL = url.appendingPathExtension("-wal")
-        let shmURL = url.appendingPathExtension("-shm")
+        let walURL = URL(fileURLWithPath: url.path + "-wal")
+        let shmURL = URL(fileURLWithPath: url.path + "-shm")
 
         for fileURL in [url, walURL, shmURL] {
             if FileManager.default.fileExists(atPath: fileURL.path) {
@@ -310,33 +303,6 @@ final class MessageStore {
         }
     }
 
-    func fetchAllMessages(decryptionKey: SymmetricKey) async -> [StoredMessage] {
-        guard ensureStoreLoaded() else { return [] }
-        let walletAddress = currentWalletAddress
-        return await withCheckedContinuation { (continuation: CheckedContinuation<[StoredMessage], Never>) in
-            container.performBackgroundTask { context in
-                var results: [StoredMessage] = []
-                let request = NSFetchRequest<CDMessage>(entityName: CDMessage.entityName)
-                request.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: true)]
-                request.includesPendingChanges = true
-                // Filter by wallet address if set
-                if let walletAddress = walletAddress {
-                    request.predicate = NSPredicate(format: "walletAddress == %@ OR walletAddress == nil", walletAddress)
-                }
-                do {
-                    let records = try context.fetch(request)
-                    results = records.compactMap { record in
-                        guard let message = self.decodeMessage(record, key: decryptionKey) else { return nil }
-                        return StoredMessage(contactAddress: record.contactAddress, message: message)
-                    }
-                } catch {
-                    self.logInfo("[MessageStore] Failed to fetch messages: \(error)")
-                }
-                continuation.resume(returning: results)
-            }
-        }
-    }
-
     /// The messages the conversation list actually keeps in memory, fetched as that set instead
     /// of as everything.
     ///
@@ -429,99 +395,6 @@ final class MessageStore {
         let hasMore: Bool
     }
 
-    /// Async/background keyset page fetch.
-    func fetchMessagesPageAsync(
-        contactAddress: String,
-        decryptionKey: SymmetricKey,
-        limit: Int,
-        olderThan cursor: MessagePageCursor? = nil
-    ) async -> MessagePage {
-        guard ensureStoreLoaded() else { return MessagePage(messages: [], oldestCursor: nil, hasMore: false) }
-        guard limit > 0 else { return MessagePage(messages: [], oldestCursor: nil, hasMore: false) }
-
-        let walletAddress = currentWalletAddress
-        return await withCheckedContinuation { continuation in
-            container.performBackgroundTask { context in
-                let request = NSFetchRequest<CDMessage>(entityName: CDMessage.entityName)
-                request.predicate = self.pagedMessagesPredicate(
-                    contactAddress: contactAddress,
-                    walletAddress: walletAddress,
-                    olderThan: cursor
-                )
-                request.sortDescriptors = [
-                    NSSortDescriptor(key: "blockTime", ascending: false),
-                    NSSortDescriptor(key: "timestamp", ascending: false),
-                    NSSortDescriptor(key: "txId", ascending: false)
-                ]
-                request.fetchLimit = limit + 1
-                request.includesPendingChanges = false
-
-                do {
-                    let records = try context.fetch(request)
-                    continuation.resume(returning: self.makePageResult(from: records, key: decryptionKey, limit: limit))
-                } catch {
-                    self.logInfo("[MessageStore] Failed to fetch messages page async for %@: %@", contactAddress, error.localizedDescription)
-                    continuation.resume(returning: MessagePage(messages: [], oldestCursor: nil, hasMore: false))
-                }
-            }
-        }
-    }
-
-    private func pagedMessagesPredicate(
-        contactAddress: String,
-        walletAddress: String?,
-        olderThan cursor: MessagePageCursor?
-    ) -> NSPredicate {
-        let basePredicate: NSPredicate
-        if let walletAddress {
-            basePredicate = NSPredicate(
-                format: "contactAddress == %@ AND (walletAddress == %@ OR walletAddress == nil)",
-                contactAddress,
-                walletAddress
-            )
-        } else {
-            basePredicate = NSPredicate(format: "contactAddress == %@", contactAddress)
-        }
-
-        guard let cursor else { return basePredicate }
-
-        let olderPredicate = NSPredicate(
-            format: "(blockTime < %lld) OR (blockTime == %lld AND timestamp < %@) OR (blockTime == %lld AND timestamp == %@ AND txId < %@)",
-            cursor.blockTime,
-            cursor.blockTime,
-            cursor.timestamp as NSDate,
-            cursor.blockTime,
-            cursor.timestamp as NSDate,
-            cursor.txId
-        )
-        return NSCompoundPredicate(andPredicateWithSubpredicates: [basePredicate, olderPredicate])
-    }
-
-    private func makePageResult(from records: [CDMessage], key: SymmetricKey, limit: Int) -> MessagePage {
-        guard !records.isEmpty else {
-            return MessagePage(messages: [], oldestCursor: nil, hasMore: false)
-        }
-
-        let decoded = records.compactMap { decodeMessage($0, key: key) }
-        guard !decoded.isEmpty else {
-            return MessagePage(messages: [], oldestCursor: nil, hasMore: false)
-        }
-
-        let hasMore = decoded.count > limit
-        let pageSlice = hasMore ? Array(decoded.prefix(limit)) : decoded
-        let oldest = pageSlice.last
-        let cursor = oldest.map {
-            MessagePageCursor(
-                blockTime: Int64($0.blockTime),
-                timestamp: $0.timestamp,
-                txId: $0.txId
-            )
-        }
-
-        // Query order is newest-first. Return oldest-first for prepend merges.
-        return MessagePage(messages: Array(pageSlice.reversed()), oldestCursor: cursor, hasMore: hasMore)
-    }
-
     /// When the oldest stored message of a conversation was sent (current wallet scope), or nil
     /// when there is none. Background context, like `countMessages`.
     func earliestMessageDate(contactAddress: String) async -> Date? {
@@ -543,73 +416,6 @@ final class MessageStore {
                 request.fetchLimit = 1
                 request.includesPendingChanges = false
                 continuation.resume(returning: (try? context.fetch(request))?.first?.timestamp)
-            }
-        }
-    }
-
-    /// Count messages for a single conversation in current wallet scope.
-    /// Runs on a background context - see `fetchConversationMeta` for why blocking `viewContext`
-    /// here used to be able to freeze the UI (e.g. this is on the read-receipt/notification path).
-    func countMessages(contactAddress: String) async -> Int {
-        guard ensureStoreLoaded() else { return 0 }
-        let walletAddress = currentWalletAddress
-        return await withCheckedContinuation { (continuation: CheckedContinuation<Int, Never>) in
-            container.performBackgroundTask { context in
-                let request = NSFetchRequest<CDMessage>(entityName: CDMessage.entityName)
-                if let walletAddress {
-                    request.predicate = NSPredicate(
-                        format: "contactAddress == %@ AND (walletAddress == %@ OR walletAddress == nil)",
-                        contactAddress,
-                        walletAddress
-                    )
-                } else {
-                    request.predicate = NSPredicate(format: "contactAddress == %@", contactAddress)
-                }
-                request.includesPendingChanges = false
-                do {
-                    continuation.resume(returning: try context.count(for: request))
-                } catch {
-                    self.logInfo("[MessageStore] Failed to count messages for %@: %@", contactAddress, error.localizedDescription)
-                    continuation.resume(returning: 0)
-                }
-            }
-        }
-    }
-
-    /// Count sent and received messages for a single conversation in current wallet scope.
-    /// Runs on a background context - see `fetchConversationMeta` for why blocking `viewContext`
-    /// here used to be able to freeze the UI.
-    func messageStats(contactAddress: String) async -> (sent: Int, received: Int) {
-        guard ensureStoreLoaded() else { return (0, 0) }
-        let walletAddress = currentWalletAddress
-        return await withCheckedContinuation { (continuation: CheckedContinuation<(sent: Int, received: Int), Never>) in
-            container.performBackgroundTask { context in
-                let basePredicate: String
-                let baseArgs: [Any]
-                if let walletAddress {
-                    basePredicate = "contactAddress == %@ AND (walletAddress == %@ OR walletAddress == nil)"
-                    baseArgs = [contactAddress, walletAddress]
-                } else {
-                    basePredicate = "contactAddress == %@"
-                    baseArgs = [contactAddress]
-                }
-
-                let sentRequest = NSFetchRequest<CDMessage>(entityName: CDMessage.entityName)
-                sentRequest.predicate = NSPredicate(format: "\(basePredicate) AND isOutgoing == YES", argumentArray: baseArgs)
-                sentRequest.includesPendingChanges = false
-
-                let receivedRequest = NSFetchRequest<CDMessage>(entityName: CDMessage.entityName)
-                receivedRequest.predicate = NSPredicate(format: "\(basePredicate) AND isOutgoing == NO", argumentArray: baseArgs)
-                receivedRequest.includesPendingChanges = false
-
-                do {
-                    let sent = try context.count(for: sentRequest)
-                    let received = try context.count(for: receivedRequest)
-                    continuation.resume(returning: (sent, received))
-                } catch {
-                    self.logInfo("[MessageStore] Failed to count message stats for %@: %@", contactAddress, error.localizedDescription)
-                    continuation.resume(returning: (0, 0))
-                }
             }
         }
     }
@@ -637,28 +443,6 @@ final class MessageStore {
                     self.logInfo("[MessageStore] Failed to fetch message \(txId): \(error)")
                 }
                 continuation.resume(returning: result)
-            }
-        }
-    }
-
-    /// Check if a message exists with actual content (not placeholder) in the store - i.e.
-    /// whether an archive restore has delivered the text of an outgoing message sent from
-    /// another device. Runs on a background context - see `fetchConversationMeta` for
-    /// why blocking `viewContext` here used to be able to freeze the UI.
-    func hasMessageWithContent(txId: String) async -> Bool {
-        guard ensureStoreLoaded() else { return false }
-        return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-            container.performBackgroundTask { context in
-                let request = NSFetchRequest<CDMessage>(entityName: CDMessage.entityName)
-                request.predicate = NSPredicate(format: "txId == %@ AND contentEncrypted != nil", txId)
-                request.fetchLimit = 1
-                do {
-                    let count = try context.count(for: request)
-                    continuation.resume(returning: count > 0)
-                } catch {
-                    self.logInfo("[MessageStore] Failed to check message content \(txId): \(error)")
-                    continuation.resume(returning: false)
-                }
             }
         }
     }
@@ -904,48 +688,6 @@ final class MessageStore {
         }
     }
 
-    func updateConversationUnread(contactAddress: String, unreadCount: Int) {
-        guard ensureStoreLoaded() else { return }
-        let walletAddr = currentWalletAddress
-        let context = container.newBackgroundContext()
-        context.mergePolicy = NSMergeByPropertyStoreTrumpMergePolicy
-        context.perform {
-            let newUnread = Int64(unreadCount)
-            let request = NSFetchRequest<CDConversation>(entityName: CDConversation.entityName)
-            if let walletAddr = walletAddr {
-                request.predicate = NSPredicate(
-                    format: "contactAddress == %@ AND (walletAddress == %@ OR walletAddress == nil)",
-                    contactAddress,
-                    walletAddr
-                )
-            } else {
-                request.predicate = NSPredicate(format: "contactAddress == %@", contactAddress)
-            }
-            do {
-                var conversations = try context.fetch(request)
-                if conversations.isEmpty {
-                    conversations = [self.fetchOrCreateConversation(contactAddress: contactAddress, walletAddress: walletAddr, in: context)]
-                }
-
-                var didChange = false
-                for conv in conversations {
-                    if conv.unreadCount != newUnread {
-                        conv.unreadCount = newUnread
-                        conv.updatedAt = Date()
-                        if let walletAddr = walletAddr {
-                            conv.walletAddress = walletAddr
-                        }
-                        didChange = true
-                    }
-                }
-                guard didChange else { return }
-                try context.save()
-            } catch {
-                self.logInfo("[MessageStore] Failed to update conversation unread: \(error)")
-            }
-        }
-    }
-
     /// Permanently deletes every message and the conversation row for a single contact - the
     /// per-contact counterpart to `clearAll()`, used by `ContactsManager.deleteContact` so a
     /// deleted chat's history doesn't linger even though its `Contact` is gone.
@@ -1116,107 +858,6 @@ final class MessageStore {
         }
     }
 
-    /// Fetch read status for a specific conversation. Runs on a background context - see
-    /// `fetchConversationMeta` for why blocking `viewContext` here used to be able to freeze the UI.
-    func fetchReadStatus(contactAddress: String) async -> ReadStatus? {
-        guard ensureStoreLoaded() else { return nil }
-        let walletAddr = currentWalletAddress
-        return await withCheckedContinuation { (continuation: CheckedContinuation<ReadStatus?, Never>) in
-            container.performBackgroundTask { context in
-                let request = NSFetchRequest<CDConversation>(entityName: CDConversation.entityName)
-                if let walletAddr {
-                    request.predicate = NSPredicate(format: "contactAddress == %@ AND (walletAddress == %@ OR walletAddress == nil)", contactAddress, walletAddr)
-                } else {
-                    request.predicate = NSPredicate(format: "contactAddress == %@", contactAddress)
-                }
-                request.fetchLimit = 1
-                do {
-                    guard let conv = try context.fetch(request).first else {
-                        continuation.resume(returning: nil)
-                        return
-                    }
-                    continuation.resume(returning: ReadStatus(
-                        contactAddress: conv.contactAddress,
-                        lastReadTxId: conv.lastReadTxId,
-                        lastReadBlockTime: conv.lastReadBlockTime,
-                        lastReadAt: conv.lastReadAt
-                    ))
-                } catch {
-                    self.logInfo("[MessageStore] Failed to fetch read status: \(error)")
-                    continuation.resume(returning: nil)
-                }
-            }
-        }
-    }
-
-    /// Fetch the latest incoming message cursor for a conversation.
-    /// Uses persistent store data so read cursor updates do not depend on in-memory pagination
-    /// window. Runs on a background context - see `fetchConversationMeta` for why blocking
-    /// `viewContext` here used to be able to freeze the UI (this runs every time a chat is opened,
-    /// via `markConversationAsRead`).
-    func fetchLatestIncomingCursor(contactAddress: String) async -> (txId: String?, blockTime: Int64)? {
-        guard ensureStoreLoaded() else { return nil }
-        let walletAddr = currentWalletAddress
-        return await withCheckedContinuation { (continuation: CheckedContinuation<(txId: String?, blockTime: Int64)?, Never>) in
-            container.performBackgroundTask { context in
-                let request = NSFetchRequest<CDMessage>(entityName: CDMessage.entityName)
-                if let walletAddr {
-                    request.predicate = NSPredicate(
-                        format: "contactAddress == %@ AND isOutgoing == NO AND (walletAddress == %@ OR walletAddress == nil)",
-                        contactAddress,
-                        walletAddr
-                    )
-                } else {
-                    request.predicate = NSPredicate(
-                        format: "contactAddress == %@ AND isOutgoing == NO",
-                        contactAddress
-                    )
-                }
-                request.sortDescriptors = [NSSortDescriptor(key: "blockTime", ascending: false)]
-                request.fetchLimit = 1
-                do {
-                    guard let msg = try context.fetch(request).first else {
-                        continuation.resume(returning: nil)
-                        return
-                    }
-                    continuation.resume(returning: (txId: msg.txId, blockTime: msg.blockTime))
-                } catch {
-                    self.logInfo("[MessageStore] Failed to fetch latest incoming cursor: \(error)")
-                    continuation.resume(returning: nil)
-                }
-            }
-        }
-    }
-
-    /// Fetch all read statuses. Runs on a background context - see
-    /// `fetchConversationMeta` for why blocking `viewContext` here used to be able to freeze the UI.
-    func fetchAllReadStatuses() async -> [ReadStatus] {
-        guard ensureStoreLoaded() else { return [] }
-        let walletAddr = currentWalletAddress
-        return await withCheckedContinuation { (continuation: CheckedContinuation<[ReadStatus], Never>) in
-            container.performBackgroundTask { context in
-                let request = NSFetchRequest<CDConversation>(entityName: CDConversation.entityName)
-                if let walletAddr {
-                    request.predicate = NSPredicate(format: "walletAddress == %@ OR walletAddress == nil", walletAddr)
-                }
-                do {
-                    let conversations = try context.fetch(request)
-                    continuation.resume(returning: conversations.map { conv in
-                        ReadStatus(
-                            contactAddress: conv.contactAddress,
-                            lastReadTxId: conv.lastReadTxId,
-                            lastReadBlockTime: conv.lastReadBlockTime,
-                            lastReadAt: conv.lastReadAt
-                        )
-                    })
-                } catch {
-                    self.logInfo("[MessageStore] Failed to fetch all read statuses: \(error)")
-                    continuation.resume(returning: [])
-                }
-            }
-        }
-    }
-
     // MARK: - Per-Device Read Markers (CDReadMarker)
 
     /// Upsert a read marker for the current device. Only updates if blockTime advances (monotonic).
@@ -1285,140 +926,6 @@ final class MessageStore {
         let lastReadBlockTime: Int64
         let lastReadTxId: String?
         let deviceCount: Int
-    }
-
-    /// Recompute effective read status by taking max(blockTime) across all device markers
-    /// - Parameter conversationId: Contact address identifying the conversation
-    /// - Returns: Effective read status or nil if no markers exist
-    /// Runs on a background context - see `fetchConversationMeta` for why blocking `viewContext`
-    /// here used to be able to freeze the UI.
-    func recomputeEffectiveReadStatus(conversationId: String) async -> EffectiveReadStatus? {
-        guard ensureStoreLoaded() else { return nil }
-        guard let walletAddress = currentWalletAddress else { return nil }
-
-        return await withCheckedContinuation { (continuation: CheckedContinuation<EffectiveReadStatus?, Never>) in
-            container.performBackgroundTask { context in
-                let request = NSFetchRequest<CDReadMarker>(entityName: CDReadMarker.entityName)
-                request.predicate = NSPredicate(
-                    format: "walletAddress == %@ AND conversationId == %@",
-                    walletAddress, conversationId
-                )
-
-                do {
-                    let markers = try context.fetch(request)
-                    guard !markers.isEmpty else {
-                        continuation.resume(returning: nil)
-                        return
-                    }
-
-                    // Pick marker with highest blockTime; break ties with updatedAt.
-                    let best = markers.max { lhs, rhs in
-                        if lhs.lastReadBlockTime != rhs.lastReadBlockTime {
-                            return lhs.lastReadBlockTime < rhs.lastReadBlockTime
-                        }
-                        return (lhs.updatedAt ?? .distantPast) < (rhs.updatedAt ?? .distantPast)
-                    }!
-                    continuation.resume(returning: EffectiveReadStatus(
-                        conversationId: conversationId,
-                        lastReadBlockTime: best.lastReadBlockTime,
-                        lastReadTxId: best.lastReadTxId,
-                        deviceCount: markers.count
-                    ))
-                } catch {
-                    self.logInfo("[MessageStore] Failed to recompute effective read status: \(error)")
-                    continuation.resume(returning: nil)
-                }
-            }
-        }
-    }
-
-    /// Compute unread count for a conversation based on effective read status
-    /// - Parameters:
-    ///   - contactAddress: Contact address identifying the conversation
-    ///   - lastReadBlockTime: Effective last read blockTime from recomputeEffectiveReadStatus()
-    /// - Returns: Number of unread incoming messages
-    ///
-    /// Runs on a background context - see `fetchConversationMeta` for why blocking `viewContext`
-    /// here used to be able to freeze the UI.
-    func computeUnreadCount(contactAddress: String, lastReadBlockTime: Int64) async -> Int {
-        guard ensureStoreLoaded() else { return 0 }
-        guard let walletAddress = currentWalletAddress else { return 0 }
-
-        return await withCheckedContinuation { (continuation: CheckedContinuation<Int, Never>) in
-            container.performBackgroundTask { context in
-                let request = NSFetchRequest<CDMessage>(entityName: CDMessage.entityName)
-                // Count incoming messages with blockTime > lastReadBlockTime
-                request.predicate = NSPredicate(
-                    format: "contactAddress == %@ AND isOutgoing == NO AND blockTime > %lld AND (walletAddress == %@ OR walletAddress == nil)",
-                    contactAddress, lastReadBlockTime, walletAddress
-                )
-
-                do {
-                    continuation.resume(returning: try context.count(for: request))
-                } catch {
-                    self.logInfo("[MessageStore] Failed to compute unread count: \(error)")
-                    continuation.resume(returning: 0)
-                }
-            }
-        }
-    }
-
-    /// Fetch all read markers for the current wallet (for debugging/diagnostics). Runs on a
-    /// background context - see `fetchConversationMeta` for why blocking `viewContext` here used
-    /// to be able to freeze the UI.
-    func fetchAllReadMarkers() async -> [(conversationId: String, deviceId: String, blockTime: Int64, updatedAt: Date?)] {
-        guard ensureStoreLoaded() else { return [] }
-        guard let walletAddress = currentWalletAddress else { return [] }
-
-        return await withCheckedContinuation { (continuation: CheckedContinuation<[(conversationId: String, deviceId: String, blockTime: Int64, updatedAt: Date?)], Never>) in
-            container.performBackgroundTask { context in
-                let request = NSFetchRequest<CDReadMarker>(entityName: CDReadMarker.entityName)
-                request.predicate = NSPredicate(format: "walletAddress == %@", walletAddress)
-                request.sortDescriptors = [
-                    NSSortDescriptor(key: "conversationId", ascending: true),
-                    NSSortDescriptor(key: "deviceId", ascending: true)
-                ]
-
-                do {
-                    let markers = try context.fetch(request)
-                    continuation.resume(returning: markers.map { ($0.conversationId, $0.deviceId, $0.lastReadBlockTime, $0.updatedAt) })
-                } catch {
-                    self.logInfo("[MessageStore] Failed to fetch all read markers: \(error)")
-                    continuation.resume(returning: [])
-                }
-            }
-        }
-    }
-
-    /// Prune read markers older than specified days (for stale device cleanup)
-    /// - Parameter days: Age threshold in days (default 90)
-    func pruneStaleReadMarkers(olderThan days: Int = 90) {
-        guard ensureStoreLoaded() else { return }
-        guard let walletAddress = currentWalletAddress else { return }
-
-        let cutoffDate = Date().addingTimeInterval(TimeInterval(-days * 86_400))
-        let context = container.newBackgroundContext()
-
-        context.perform {
-            let request = NSFetchRequest<NSFetchRequestResult>(entityName: CDReadMarker.entityName)
-            request.predicate = NSPredicate(
-                format: "walletAddress == %@ AND updatedAt < %@",
-                walletAddress, cutoffDate as NSDate
-            )
-
-            let deleteRequest = NSBatchDeleteRequest(fetchRequest: request)
-            deleteRequest.resultType = .resultTypeCount
-
-            do {
-                let result = try context.execute(deleteRequest) as? NSBatchDeleteResult
-                let deletedCount = result?.result as? Int ?? 0
-                if deletedCount > 0 {
-                    self.logInfo("[MessageStore] Pruned %d stale read markers (older than %d days)", deletedCount, days)
-                }
-            } catch {
-                self.logInfo("[MessageStore] Failed to prune stale read markers: \(error)")
-            }
-        }
     }
 
     /// Purge persistent history older than specified days
@@ -1651,47 +1158,6 @@ final class MessageStore {
                 }
             } catch {
                 self.logInfo("[MessageStore] Failed to clear incoming messages: \(error)")
-            }
-        }
-    }
-
-    /// Awaitable incoming-message wipe for the CURRENT wallet, optionally limited to the given
-    /// conversations (matched by `CDMessage.contactAddress`). Used by the Danger Zone
-    /// wipe-and-resync flow, which must not start re-fetching until the delete has actually
-    /// landed in the store (the fire-and-forget `clearIncomingMessages()` above could otherwise
-    /// race the re-sync's own writes).
-    func clearIncomingMessagesAndWait(forContacts contactAddresses: [String]? = nil) async {
-        guard ensureStoreLoaded() else { return }
-        if let contactAddresses, contactAddresses.isEmpty { return }
-        let walletAddr = currentWalletAddress
-        let context = container.newBackgroundContext()
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            context.perform {
-                let fetch = NSFetchRequest<NSFetchRequestResult>(entityName: CDMessage.entityName)
-                var clauses = ["isOutgoing == NO"]
-                var arguments: [Any] = []
-                if let contactAddresses {
-                    clauses.append("contactAddress IN %@")
-                    arguments.append(contactAddresses)
-                }
-                if let walletAddr {
-                    clauses.append("(walletAddress == %@ OR walletAddress == nil)")
-                    arguments.append(walletAddr)
-                }
-                fetch.predicate = NSPredicate(format: clauses.joined(separator: " AND "), argumentArray: arguments)
-                let deleteRequest = NSBatchDeleteRequest(fetchRequest: fetch)
-                deleteRequest.resultType = .resultTypeObjectIDs
-                do {
-                    let result = try context.execute(deleteRequest) as? NSBatchDeleteResult
-                    let objectIds = result?.result as? [NSManagedObjectID] ?? []
-                    if !objectIds.isEmpty {
-                        NSManagedObjectContext.mergeChanges(fromRemoteContextSave: [NSDeletedObjectsKey: objectIds], into: [self.viewContext])
-                    }
-                    self.logInfo("[MessageStore] Cleared %d incoming messages (%@)", objectIds.count, contactAddresses == nil ? "all chats" : "\(contactAddresses?.count ?? 0) chats")
-                } catch {
-                    self.logInfo("[MessageStore] Failed to clear incoming messages: \(error)")
-                }
-                continuation.resume()
             }
         }
     }
@@ -2188,59 +1654,6 @@ final class MessageStore {
         let targetMessageIsOutgoing: Bool?
     }
 
-    /// The single newest reaction per contact, across every message in that conversation - not
-    /// scoped to one already-open conversation like `fetchReactions` (which needs a live
-    /// conversation's `reactionsByTxId` to already be populated). Used to show reaction activity
-    /// in the chat list preview when it's more recent than the last real message, which otherwise
-    /// has no visibility into reactions at all (they're applied as a pill, never inserted as a
-    /// message). `decryptionKey` is the same wallet-wide at-rest key `messageEncryptionKey()`
-    /// returns for every conversation (not a per-contact shared secret), so this can scan across
-    /// all contacts in one pass.
-    func fetchLatestReactionPerContact(decryptionKey: SymmetricKey) async -> [String: LatestReactionPreview] {
-        guard ensureStoreLoaded() else { return [:] }
-        let walletAddress = currentWalletAddress
-        return await withCheckedContinuation { (continuation: CheckedContinuation<[String: LatestReactionPreview], Never>) in
-            container.performBackgroundTask { context in
-                let request = NSFetchRequest<CDReaction>(entityName: CDReaction.entityName)
-                if let walletAddress {
-                    request.predicate = NSPredicate(format: "(walletAddress == %@ OR walletAddress == nil)", walletAddress)
-                }
-                guard let allReactions = try? context.fetch(request), !allReactions.isEmpty else {
-                    continuation.resume(returning: [:])
-                    return
-                }
-
-                // Newest reaction per contact, by blockTime.
-                var latestByContact: [String: CDReaction] = [:]
-                for reaction in allReactions {
-                    if let existing = latestByContact[reaction.contactAddress], existing.blockTime >= reaction.blockTime {
-                        continue
-                    }
-                    latestByContact[reaction.contactAddress] = reaction
-                }
-
-                let targetMessagesByTxId = self.batchFetchMessages(
-                    txIds: latestByContact.values.map { $0.targetTxId },
-                    walletAddress: walletAddress,
-                    in: context
-                )
-
-                var result: [String: LatestReactionPreview] = [:]
-                for (contactAddress, reaction) in latestByContact {
-                    guard let emojiData = reaction.emojiEncrypted,
-                          let emoji = self.decryptContent(emojiData, key: decryptionKey) else { continue }
-                    result[contactAddress] = LatestReactionPreview(
-                        emoji: emoji,
-                        reactorAddress: reaction.reactorAddress,
-                        blockTime: reaction.blockTime,
-                        targetMessageIsOutgoing: targetMessagesByTxId[reaction.targetTxId]?.isOutgoing
-                    )
-                }
-                continuation.resume(returning: result)
-            }
-        }
-    }
-
     private static func makeModel() -> NSManagedObjectModel {
         let model = NSManagedObjectModel()
 
@@ -2435,11 +1848,6 @@ final class MessageStore {
         }
     }
 
-    func currentStoreSizeBytes() -> Int64 {
-        let storeUrl = container.persistentStoreCoordinator.persistentStores.first?.url ?? Self.defaultStoreURL()
-        return Self.sizeOfStoreFiles(at: storeUrl)
-    }
-
     private var lastDedupeAt: Date?
     private let dedupeMinInterval: TimeInterval = 10 * 60
     private let dedupeThresholdRatio: Double = 1.2
@@ -2452,76 +1860,6 @@ final class MessageStore {
         let placeholderCount: Int
         let outgoingCount: Int
         let incomingCount: Int
-    }
-
-    /// Counts over the whole store; asynchronous so the diagnostics export never blocks the
-    /// thread that asked (it ran a synchronous performAndWait from the main actor).
-    func currentStoreDiagnostics() async -> StoreDiagnostics {
-        guard ensureStoreLoaded() else {
-            return StoreDiagnostics(totalMessages: 0, distinctTxIds: 0, placeholderCount: 0, outgoingCount: 0, incomingCount: 0)
-        }
-        let context = container.newBackgroundContext()
-        var result = StoreDiagnostics(totalMessages: 0, distinctTxIds: 0, placeholderCount: 0, outgoingCount: 0, incomingCount: 0)
-        let walletAddr = currentWalletAddress
-        return await withCheckedContinuation { continuation in
-        context.perform {
-            let totalFetch = NSFetchRequest<NSFetchRequestResult>(entityName: CDMessage.entityName)
-            totalFetch.resultType = .countResultType
-            if let walletAddr {
-                totalFetch.predicate = NSPredicate(format: "walletAddress == %@ OR walletAddress == nil", walletAddr)
-            }
-            if let countResult = try? context.count(for: totalFetch) {
-                result = StoreDiagnostics(totalMessages: countResult, distinctTxIds: result.distinctTxIds, placeholderCount: result.placeholderCount, outgoingCount: result.outgoingCount, incomingCount: result.incomingCount)
-            }
-
-            let distinctFetch = NSFetchRequest<NSFetchRequestResult>(entityName: CDMessage.entityName)
-            distinctFetch.resultType = .dictionaryResultType
-            distinctFetch.propertiesToFetch = ["txId"]
-            distinctFetch.returnsDistinctResults = true
-            if let walletAddr {
-                distinctFetch.predicate = NSPredicate(format: "walletAddress == %@ OR walletAddress == nil", walletAddr)
-            }
-            let distinctCount = (try? context.fetch(distinctFetch).count) ?? 0
-            result = StoreDiagnostics(totalMessages: result.totalMessages, distinctTxIds: distinctCount, placeholderCount: result.placeholderCount, outgoingCount: result.outgoingCount, incomingCount: result.incomingCount)
-
-            let placeholderFetch = NSFetchRequest<NSFetchRequestResult>(entityName: CDMessage.entityName)
-            placeholderFetch.resultType = .countResultType
-            if let walletAddr {
-                placeholderFetch.predicate = NSPredicate(format: "contentEncrypted == nil AND (walletAddress == %@ OR walletAddress == nil)", walletAddr)
-            } else {
-                placeholderFetch.predicate = NSPredicate(format: "contentEncrypted == nil")
-            }
-            let placeholderCount = (try? context.count(for: placeholderFetch)) ?? 0
-            result = StoreDiagnostics(totalMessages: result.totalMessages, distinctTxIds: result.distinctTxIds, placeholderCount: placeholderCount, outgoingCount: result.outgoingCount, incomingCount: result.incomingCount)
-
-            let outgoingFetch = NSFetchRequest<NSFetchRequestResult>(entityName: CDMessage.entityName)
-            outgoingFetch.resultType = .countResultType
-            if let walletAddr {
-                outgoingFetch.predicate = NSPredicate(format: "isOutgoing == YES AND (walletAddress == %@ OR walletAddress == nil)", walletAddr)
-            } else {
-                outgoingFetch.predicate = NSPredicate(format: "isOutgoing == YES")
-            }
-            let outgoingCount = (try? context.count(for: outgoingFetch)) ?? 0
-
-            let incomingFetch = NSFetchRequest<NSFetchRequestResult>(entityName: CDMessage.entityName)
-            incomingFetch.resultType = .countResultType
-            if let walletAddr {
-                incomingFetch.predicate = NSPredicate(format: "isOutgoing == NO AND (walletAddress == %@ OR walletAddress == nil)", walletAddr)
-            } else {
-                incomingFetch.predicate = NSPredicate(format: "isOutgoing == NO")
-            }
-            let incomingCount = (try? context.count(for: incomingFetch)) ?? 0
-
-            result = StoreDiagnostics(
-                totalMessages: result.totalMessages,
-                distinctTxIds: result.distinctTxIds,
-                placeholderCount: result.placeholderCount,
-                outgoingCount: outgoingCount,
-                incomingCount: incomingCount
-            )
-            continuation.resume(returning: result)
-        }
-        }
     }
 
     private func fetchMessageCounts(in context: NSManagedObjectContext, walletAddr: String?) -> (total: Int, distinct: Int) {
@@ -2616,57 +1954,6 @@ final class MessageStore {
             self.logInfo("[MessageStore] Failed to dedupe messages: %@", error.localizedDescription)
             return false
         }
-    }
-
-    /// Manually checkpoint the WAL file to reduce file size
-    /// Call this when the app is idle (backgrounded, after a large import, etc.)
-    /// This triggers Core Data's PostSaveMaintenance which will checkpoint if needed
-    func checkpointWAL() {
-        guard ensureStoreLoaded() else { return }
-
-        let context = container.newBackgroundContext()
-        // ASYNC perform, never performAndWait: this is fired from the scene-phase handler when
-        // the app backgrounds (tapping a link -> Safari), exactly when a background save may
-        // be using the store. performAndWait blocked the MAIN thread on the SQLite lock, iOS
-        // suspended the process mid-wait, and the app resumed still frozen inside that wait
-        // (~1min hang + "unsafeForcedSync called from Swift Concurrent context"). Every caller
-        // is fire-and-forget; a checkpoint is pure maintenance nobody needs to wait for.
-        context.perform {
-            do {
-                let startTime = Date()
-
-                // Trigger Core Data's PostSaveMaintenance by saving
-                // This will checkpoint the WAL if the file size exceeds the threshold
-                // Since we're calling this when idle (no active transactions),
-                // it won't get "Database busy" errors
-                if context.hasChanges {
-                    try context.save()
-                } else {
-                    // No changes, but still trigger a save to force checkpoint
-                    // Core Data will optimize this to a no-op if nothing changed
-                    try context.save()
-                }
-
-                let duration = Date().timeIntervalSince(startTime) * 1000
-                self.logInfo("[MessageStore] Manual WAL checkpoint triggered in %.0fms", duration)
-            } catch {
-                self.logInfo("[MessageStore] Manual checkpoint failed: %@", error.localizedDescription)
-            }
-        }
-    }
-
-    private static func sizeOfStoreFiles(at url: URL) -> Int64 {
-        let basePath = url.path
-        let candidates = [basePath, basePath + "-wal", basePath + "-shm"]
-        let fileManager = FileManager.default
-        var total: Int64 = 0
-        for path in candidates {
-            if let attributes = try? fileManager.attributesOfItem(atPath: path),
-               let size = attributes[.size] as? NSNumber {
-                total += size.int64Value
-            }
-        }
-        return total
     }
 
     private static func makeAttribute(name: String, type: NSAttributeType, optional: Bool, defaultValue: Any? = nil) -> NSAttributeDescription {

@@ -50,6 +50,9 @@ struct ChessBotLeaderboardsView: View {
 
     var body: some View {
         List {
+            if service.serverUnreachable {
+                Section { ChessServerDownNote(text: "Chess server unreachable. Showing what this phone has.") }
+            }
             Section {
                 if playedBots.isEmpty {
                     Text("No bot has been played yet.")
@@ -111,6 +114,9 @@ struct ChessBotLeaderboardView: View {
 
     var body: some View {
         List {
+            if service.serverUnreachable {
+                Section { ChessServerDownNote(text: "Chess server unreachable. Showing what this phone has.") }
+            }
             Section {
                 Picker("Leaderboard period", selection: $period) {
                     Text("This month").tag(ChessLeaderboardPeriod.month)

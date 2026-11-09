@@ -73,6 +73,29 @@ final class KachatNamesRegistry: ObservableObject {
     private var identityMisses: [String: Date] = [:]
     /// Set when the indexer said it doesn't serve profiles (503) - see `profileOnlyIdentity`.
     private var profilesUnavailableUntil: Date?
+    /// The walk under way: a refresh and the standby walk share it rather than racing.
+    private var walkTask: Task<Bool, Error>?
+    /// When the chain copy was last brought up to date while the indexer was in use, and when
+    /// that last failed (tried again sooner than a success, but not on every refresh).
+    private var standbyWalkedAt: Date?
+    private var standbyFailedAt: Date?
+    /// When each address's profile was last looked for on the chain (`chainProfile`).
+    private var chainProfileCheckedAt: [String: Date] = [:]
+    /// Profile lookups running on the REST API, and the ones waiting for a turn (`chainProfile`).
+    private var chainProfilesRunning = 0
+    private var chainProfileWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Failed indexer requests in a row, and when the last one counted (`indexerOutageConfirmed`).
+    private var indexerFailuresInARow = 0
+    private var lastIndexerFailureAt = Date.distantPast
+    /// After a failover the indexer isn't asked again until then, longer each time its status
+    /// answers and its data routes still don't (`failOverToChain`).
+    private var failoverHoldUntil = Date.distantPast
+    private var failoverBackoff: TimeInterval = 0
+    /// When `prepare` last asked about the source while the chain copy couldn't answer.
+    private var sourceProbedAt = Date.distantPast
+    /// A read was turned away because the chain copy wasn't current: the walk that makes it
+    /// current has to tell the screens, even when it found nothing new.
+    private var chainReadRefused = false
 
     private init() {}
 
@@ -89,20 +112,35 @@ final class KachatNamesRegistry: ObservableObject {
             source = nil
             chainState = nil
             cacheNetwork = nil
+            standbyWalkedAt = nil
             preparedNetwork = m.network
         }
-        if source == nil || forceSourceCheck {
+        // A long walk holds `refresh`, which only looks at the source again after it: while the
+        // chain copy can't answer, a read still finds out whether the indexer can.
+        let nothingToReadYet = source == .chain && !chainCopyIsCurrent
+            && Date().timeIntervalSince(sourceProbedAt) >= Self.sourceProbeInterval
+        if source == nil || forceSourceCheck || nothingToReadYet {
+            sourceProbedAt = Date()
             let chosen = await chooseSource(m)
             if let was = source, was != chosen {
                 AppLog.log("[KachatNames] registry source: %@", chosen == .chain ? "the chain (the indexer is behind or elsewhere)" : "the indexer")
             }
             source = chosen
         }
-        if source == .chain, chainState == nil || cacheNetwork != m.network {
-            chainState = Self.loadCache(m) ?? .atGenesis(m)
-            cacheNetwork = m.network
-        }
+        if source == .chain { await loadChainCopyIfNeeded(m) }
         return m
+    }
+
+    private static let sourceProbeInterval: TimeInterval = 15
+
+    /// The saved copy, read and checked off the main thread.
+    private func loadChainCopyIfNeeded(_ m: KachatNames.Manifest) async {
+        guard chainState == nil || cacheNetwork != m.network else { return }
+        let saved = await Task.detached(priority: .utility) { Self.loadCache(m) }.value
+        // another read got here first, or the network changed meanwhile
+        guard chainState == nil || cacheNetwork != m.network, preparedNetwork == m.network else { return }
+        chainState = saved ?? .atGenesis(m)
+        cacheNetwork = m.network
     }
 
     /// The network `prepare` last ran for.
@@ -114,6 +152,13 @@ final class KachatNamesRegistry: ObservableObject {
         source = nil
         chainState = nil
         cacheNetwork = nil
+        standbyWalkedAt = nil
+        standbyFailedAt = nil
+        failoverHoldUntil = .distantPast
+        failoverBackoff = 0
+        sourceProbedAt = .distantPast
+        chainReadRefused = false
+        chainProfileCheckedAt = [:]
         ownProfiles = [:]
         ownProfileMisses = []
         lastError = nil
@@ -131,8 +176,24 @@ final class KachatNamesRegistry: ObservableObject {
 
     private func chooseSource(_ m: KachatNames.Manifest) async -> Source {
         guard let base = Self.indexerBase() else { return .chain }
-        guard let status: KachatNames.IndexerAPI.StatusJSON = try? await Self.get(base, "/names/status"),
-              status.registryCovenantId?.lowercased() == KachatNames.hex(m.registryCovenantId),
+        // its data routes just stopped answering: not asked again yet (`failOverToChain`)
+        if Date() < failoverHoldUntil { return .chain }
+        let status: KachatNames.IndexerAPI.StatusJSON
+        do {
+            status = try await Self.get(base, "/names/status")
+            // A status answer ends an outage. While on the indexer it says nothing about the
+            // routes the data comes from, so the count of their failures stands.
+            if source?.isIndexer != true { indexerFailuresInARow = 0 }
+        } catch {
+            // One missed status check doesn't take a working indexer out of use, or rule one out
+            // at launch; a request that never got out says nothing about the indexer at all.
+            if source != .chain {
+                if Self.requestNeverAsked(error) { return .indexer(base) }
+                if Self.indexerIsDown(error), !indexerOutageConfirmed() { return .indexer(base) }
+            }
+            return .chain
+        }
+        guard status.registryCovenantId?.lowercased() == KachatNames.hex(m.registryCovenantId),
               status.synced != false else {
             return .chain
         }
@@ -172,12 +233,16 @@ final class KachatNamesRegistry: ObservableObject {
             let m = try await prepare(forceSourceCheck: true)
             var walkedChanges = false
             if source == .chain {
-                walkedChanges = try await walk(m)
+                walkedChanges = try await walkShared(m)
+            } else {
+                walkStandbyCopyIfDue(m)
             }
             lastError = nil
             refreshedAt = Date()
+            let refusedReadsCanAnswer = chainReadRefused && (source?.isIndexer == true || chainCopyIsCurrent)
+            if refusedReadsCanAnswer { chainReadRefused = false }
             let quiet = !announce && !walkedChanges && source == previousSource && previousError == nil
-                && Date().timeIntervalSince(revisionBumpedAt) < 300
+                && !refusedReadsCanAnswer && Date().timeIntervalSince(revisionBumpedAt) < 300
             if !quiet {
                 revision += 1
                 revisionBumpedAt = Date()
@@ -231,31 +296,125 @@ final class KachatNamesRegistry: ObservableObject {
         await refresh(announce: false)
     }
 
+    /// One walk at a time: whoever comes while one runs waits for it.
+    private func walkShared(_ m: KachatNames.Manifest) async throws -> Bool {
+        if let walkTask { return try await walkTask.value }
+        let task = Task { @MainActor in try await self.walk(m) }
+        walkTask = task
+        defer { walkTask = nil }
+        return try await task.value
+    }
+
+    /// While the indexer answers, the chain copy is still kept up to date now and then, so the
+    /// moment it stops answering the names are already here instead of a walk from the genesis
+    /// away. Nothing is read from this copy until then.
+    private func walkStandbyCopyIfDue(_ m: KachatNames.Manifest) {
+        let interval: TimeInterval = NetworkEpochMonitor.shared.isExpensivePath ? 7200 : 1800
+        if let at = standbyWalkedAt, Date().timeIntervalSince(at) < interval { return }
+        if let at = standbyFailedAt, Date().timeIntervalSince(at) < Self.standbyRetryInterval { return }
+        guard walkTask == nil else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.loadChainCopyIfNeeded(m)
+            do {
+                _ = try await self.walkShared(m)
+                self.standbyWalkedAt = Date()
+                self.standbyFailedAt = nil
+            } catch {
+                self.standbyFailedAt = Date()
+                AppLog.log("[KachatNames] standby walk of the registry failed: %@", error.localizedDescription)
+            }
+        }
+    }
+
+    private static let standbyRetryInterval: TimeInterval = 300
+
     /// True when the walk applied a transaction (or started over from the genesis).
     @discardableResult
     private func walk(_ m: KachatNames.Manifest) async throws -> Bool {
+        do {
+            return try await walkAndKeep(m)
+        } catch {
+            // What's held is no longer known to be the registry as it stands, whether the walk
+            // only failed or its from-the-genesis retry left an inconsistent copy behind.
+            markChainCopyUnverified(m)
+            throw error
+        }
+    }
+
+    private func markChainCopyUnverified(_ m: KachatNames.Manifest) {
+        guard preparedNetwork == m.network, var held = chainState, held.reachedTip != nil else { return }
+        held.reachedTip = nil
+        chainState = held
+        Self.saveCache(held)
+    }
+
+    /// Off the main thread: every gap and name, sorted and compared.
+    private nonisolated static func verifyInvariants(_ state: KachatNames.RegistryState) async throws {
+        try state.checkInvariants()
+    }
+
+    private func walkAndKeep(_ m: KachatNames.Manifest) async throws -> Bool {
         var state = chainState ?? .atGenesis(m)
-        var report = try await walkOnce(&state, m)
+        var report = try await walkToTip(&state, m)
         // An inconsistent result (a stale UTXO, or gaps and names that don't tile the key
         // space) is walked again once from the genesis rather than kept.
-        if report.stale || (try? state.checkInvariants()) == nil {
+        var inconsistent = report.stale
+        if !inconsistent { inconsistent = (try? await Self.verifyInvariants(state)) == nil }
+        if inconsistent {
             AppLog.log("[KachatNames] the walked registry is inconsistent; walking again from the genesis")
             state = .atGenesis(m)
-            report = try await walkOnce(&state, m)
-            try state.checkInvariants()
+            report = try await walkToTip(&state, m)
+            try await Self.verifyInvariants(state)
         }
-        state.verifiedAt = KachatNames.nowMs()
+        if report.reachedTip {
+            state.reachedTip = true
+            state.verifiedAt = KachatNames.nowMs()
+        } else {
+            // stopped short (a spend the REST API hasn't indexed, or out of rounds): not the
+            // registry as it stands, whatever an earlier walk reached
+            state.reachedTip = nil
+        }
         if !report.applied.isEmpty {
             AppLog.log("[KachatNames] walked %d registry transaction(s) in %d round(s)", report.applied.count, report.rounds)
         }
         if !report.unresolved.isEmpty {
             AppLog.log("[KachatNames] %d spent registry UTXO(s) wait for the REST API to index their spend", report.unresolved.count)
         }
+        // a network switch while this walked: the answer is the other network's
+        guard preparedNetwork == m.network else { return false }
         let changed = !report.applied.isEmpty || chainState == nil
+        // nothing new is not worth a write (`verifiedAt` means nothing after a relaunch anyway)
+        let tipChanged = chainState?.reachedTip != state.reachedTip
         chainState = state
-        Self.saveCache(state)
+        if changed || tipChanged { Self.saveCache(state) }
         return changed
     }
+
+    /// A long history takes more than one walk's rounds: keeps going, saving what it has between
+    /// them, so a walk that fails later doesn't lose the part already read.
+    private func walkToTip(_ state: inout KachatNames.RegistryState, _ m: KachatNames.Manifest) async throws -> KachatNames.RegistryState.WalkReport {
+        var total = try await walkOnce(&state, m)
+        var passes = 1
+        while total.ranOutOfRounds, !total.stale, passes < Self.maxWalkPasses, preparedNetwork == m.network {
+            // part way through a catch-up: readable again only once the walk reaches the tip
+            state.reachedTip = nil
+            chainState = state
+            Self.saveCache(state)
+            let next = try await walkOnce(&state, m)
+            total.rounds += next.rounds
+            total.applied += next.applied
+            total.events += next.events
+            total.unresolved = next.unresolved
+            total.stale = next.stale
+            total.reachedTip = next.reachedTip
+            total.ranOutOfRounds = next.ranOutOfRounds
+            passes += 1
+        }
+        return total
+    }
+
+    private static let maxWalkPasses = 20
 
     private func walkOnce(_ state: inout KachatNames.RegistryState, _ m: KachatNames.Manifest) async throws -> KachatNames.RegistryState.WalkReport {
         // the registry's gaps and names (registry v4 has no price record)
@@ -339,13 +498,13 @@ final class KachatNamesRegistry: ObservableObject {
 
     // MARK: - Reads
 
-    /// An indexer's answer is only a claim. Before a payment trusts it, the chain has to hold the name
-    /// record it describes: the script commits to the name and its owner, and carries the registry's
+    /// An answer is only a claim. Before a payment trusts it, a node has to hold the name record
+    /// it describes: the script commits to the name and its owner, and carries the registry's
     /// covenant id, so an indexer can't point a name at another address. Throws if it doesn't. A
-    /// record read from the chain itself needs no second look.
+    /// record from the chain copy is checked too: the copy can be behind, and a name sold since
+    /// then still matches it.
     func confirmOnChain(_ n: KachatNames.NameInfo) async throws {
-        guard case .indexer? = source else { return }
-        guard let fields = n.fields else { throw KachatNames.Failure("the indexer's record can't be checked") }
+        guard let fields = n.fields else { throw KachatNames.Failure("the record can't be checked") }
         let m = try await service.loadManifest()
         _ = try await service.liveRegistryUtxo(script: m.name.script(fields.encoded), outpoint: n.outpoint)
     }
@@ -354,17 +513,112 @@ final class KachatNamesRegistry: ObservableObject {
         try await prepare()
         let name = KachatNames.Codec.normalize(raw)
         try KachatNames.Codec.validate(name)
-        switch source {
-        case .indexer(let base):
-            let j: KachatNames.IndexerAPI.NameJSON = try await Self.get(base, "/names/\(name)")
+        if case .indexer(let base) = source,
+           let j = try await fromIndexer(KachatNames.IndexerAPI.NameJSON.self, base, "/names/\(name)") {
             if let info = j.info(keyOf: Self.keyOf) { return .registered(info) }
             return .free(name: name, gap: j.gap?.info)
-        default:
-            guard let st = chainState else { throw KachatNames.Failure("the registry is not loaded") }
-            if let n = st.name(name) { return .registered(KachatNames.RegistryState.info(n)) }
-            return .free(name: name, gap: st.gap(containing: KachatNames.Codec.key(name)).map(KachatNames.RegistryState.info))
+        }
+        let st = try readChainState()
+        if let n = st.name(name) { return .registered(KachatNames.RegistryState.info(n)) }
+        return .free(name: name, gap: st.gap(containing: KachatNames.Codec.key(name)).map(KachatNames.RegistryState.info))
+    }
+
+    /// The indexer's answer, or nil once it has stopped answering (`indexerOutageConfirmed`): the
+    /// registry then moves to the chain and the caller reads it from there. A single failure is
+    /// thrown for the caller's own retry, and a 404 and the like are answers, thrown as they
+    /// always were.
+    private func fromIndexer<T: Decodable>(_ type: T.Type, _ base: String, _ path: String) async throws -> T? {
+        do {
+            let answer: T = try await Self.get(base, path)
+            noteIndexerAnswered()
+            return answer
+        } catch {
+            guard Self.indexerIsDown(error) else {
+                if !Self.requestNeverAsked(error) { indexerFailuresInARow = 0 }
+                throw error
+            }
+            guard indexerOutageConfirmed() else { throw error }
+            failOverToChain(after: error)
+            return nil
         }
     }
+
+    private func noteIndexerAnswered() {
+        indexerFailuresInARow = 0
+        failoverBackoff = 0
+    }
+
+    /// Counts a failed request; true from the third in a row within two minutes, so one timeout
+    /// never moves the registry off a working indexer. Failures within five seconds are one:
+    /// a screen of names asks all at once, and one dropped connection fails every request.
+    private func indexerOutageConfirmed() -> Bool {
+        let now = Date()
+        let sinceLast = now.timeIntervalSince(lastIndexerFailureAt)
+        if sinceLast > 120 { indexerFailuresInARow = 0 }
+        if sinceLast >= 5 {
+            lastIndexerFailureAt = now
+            indexerFailuresInARow += 1
+        }
+        return indexerFailuresInARow >= 3
+    }
+
+    /// The request never reached the indexer: cancelled, or this phone has no connection.
+    private nonisolated static func requestNeverAsked(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        guard let urlError = error as? URLError else { return false }
+        return urlError.code == .cancelled || urlError.code == .notConnectedToInternet || urlError.code == .dataNotAllowed
+    }
+
+    private nonisolated static func indexerIsDown(_ error: Error) -> Bool {
+        if requestNeverAsked(error) { return false }
+        if let failure = error as? KachatNames.Failure {
+            let prefix = "the names indexer answered "
+            guard failure.message.hasPrefix(prefix), let code = Int(failure.message.dropFirst(prefix.count)) else { return false }
+            return code == 0 || code == 429 || code >= 500
+        }
+        if error is URLError { return true }
+        // a body it couldn't decode is still the indexer answering
+        return false
+    }
+
+    /// The indexer stopped answering: the names are on the chain, so read them there from now on.
+    /// The next refresh (once a minute while on the chain) goes back to it when it recovers. Its
+    /// status can answer while the routes the data comes from don't, so it isn't asked again
+    /// for a while, longer each time, or every screen would reload on each trip there and back.
+    private func failOverToChain(after error: Error) {
+        guard case .indexer = source else { return }
+        AppLog.log("[KachatNames] the indexer didn't answer (%@): reading the registry from the chain", error.localizedDescription)
+        source = .chain
+        failoverBackoff = min(max(failoverBackoff * 2, 60), 900)
+        failoverHoldUntil = Date().addingTimeInterval(failoverBackoff)
+        Task { @MainActor [weak self] in await self?.refresh(announce: false) }
+    }
+
+    /// How old the chain copy's last full check can be and still answer. The copy is walked
+    /// about once a minute while it's the source, so this allows for one missed walk.
+    private static let chainCopyMaxAgeMs: Int64 = 180_000
+
+    /// The chain copy holds the whole registry, and a node confirmed it moments ago.
+    private var chainCopyIsCurrent: Bool {
+        guard let st = chainState, st.reachedTip == true, let at = st.verifiedAt else { return false }
+        return KachatNames.nowMs() - at <= Self.chainCopyMaxAgeMs
+    }
+
+    /// The chain copy, only while it holds the whole registry as it stands. Otherwise "not in
+    /// here" says nothing and an owner may have changed, so a read fails (and whatever is saved
+    /// keeps showing) rather than answering that a name is free or whose it is.
+    private func readChainState() throws -> KachatNames.RegistryState {
+        guard chainCopyIsCurrent, let st = chainState else {
+            chainReadRefused = true
+            Task { @MainActor [weak self] in await self?.refreshIfStale(maxAge: 30) }
+            throw KachatNames.Failure("the registry is still being read from the chain")
+        }
+        return st
+    }
+
+    /// Whether `myOffers` and `offers(for:)` see every offer. The chain copy only knows the ones
+    /// this device made, so there "not listed" doesn't mean gone.
+    var offersAreComplete: Bool { source?.isIndexer == true }
 
     /// Which of `addresses` hold at least one .kachat name (active or in grace - the same set
     /// Your Domains lists, `heldNames`). Drives the "Contains domain" tag on Manage Addresses and KasSigner.
@@ -408,15 +662,18 @@ final class KachatNamesRegistry: ObservableObject {
     /// The names an owner holds, oldest first; `includeInactive` adds grace and lapsed ones.
     func names(owner: Data, includeInactive: Bool) async throws -> [KachatNames.NameInfo] {
         try await prepare()
-        let all: [KachatNames.NameInfo]
-        switch source {
-        case .indexer(let base):
+        var answered: [KachatNames.NameInfo]?
+        if case .indexer(let base) = source {
             guard let address = Self.address(of: owner) else { return [] }
-            let j: KachatNames.IndexerAPI.NamesJSON = try await Self.get(base, "/names/by-owner/\(address)?includeInactive=\(includeInactive)")
-            all = j.names.compactMap { $0.info(keyOf: Self.keyOf) }
-        default:
+            let j = try await fromIndexer(KachatNames.IndexerAPI.NamesJSON.self, base, "/names/by-owner/\(address)?includeInactive=\(includeInactive)")
+            answered = j?.names.compactMap { $0.info(keyOf: Self.keyOf) }
+        }
+        let all: [KachatNames.NameInfo]
+        if let answered {
+            all = answered
+        } else {
             let ownerHex = KachatNames.hex(owner)
-            all = (chainState?.names ?? []).filter { $0.owner == ownerHex }.map(KachatNames.RegistryState.info)
+            all = try readChainState().names.filter { $0.owner == ownerHex }.map(KachatNames.RegistryState.info)
         }
         let grace = graceMs
         return all
@@ -427,33 +684,28 @@ final class KachatNamesRegistry: ObservableObject {
     /// Active names listed for sale, most recently changed first.
     func listings() async throws -> [KachatNames.NameInfo] {
         try await prepare()
-        switch source {
-        case .indexer(let base):
-            let j: KachatNames.IndexerAPI.ListingsJSON = try await Self.get(base, "/market/listings?sort=recent")
+        let grace = graceMs
+        if case .indexer(let base) = source,
+           let j = try await fromIndexer(KachatNames.IndexerAPI.ListingsJSON.self, base, "/market/listings?sort=recent") {
             // an expired name's old listing is not for sale, whatever the indexer kept
-            let grace = graceMs
             return j.listings.compactMap { $0.info(keyOf: Self.keyOf) }.filter { $0.status(graceMs: grace) == .active }
-        default:
-            let grace = graceMs
-            return (chainState?.names ?? []).map(KachatNames.RegistryState.info)
-                .filter { $0.isListed && $0.status(graceMs: grace) == .active }
-                .sorted { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
         }
+        return try readChainState().names.map(KachatNames.RegistryState.info)
+            .filter { $0.isListed && $0.status(graceMs: grace) == .active }
+            .sorted { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
     }
 
     /// Lapsed names anyone may reclaim, oldest expiry first.
     func lapsed() async throws -> [KachatNames.NameInfo] {
         try await prepare()
-        switch source {
-        case .indexer(let base):
-            let j: KachatNames.IndexerAPI.NamesJSON = try await Self.get(base, "/names/expiring")
+        if case .indexer(let base) = source,
+           let j = try await fromIndexer(KachatNames.IndexerAPI.NamesJSON.self, base, "/names/expiring") {
             return j.names.compactMap { $0.info(keyOf: Self.keyOf) }
-        default:
-            let grace = graceMs
-            return (chainState?.names ?? []).map(KachatNames.RegistryState.info)
-                .filter { $0.status(graceMs: grace) == .lapsed }
-                .sorted { $0.expiresAt < $1.expiresAt }
         }
+        let grace = graceMs
+        return try readChainState().names.map(KachatNames.RegistryState.info)
+            .filter { $0.status(graceMs: grace) == .lapsed }
+            .sorted { $0.expiresAt < $1.expiresAt }
     }
 
     /// Names that expired and are still in their grace period (only their owner can renew them),
@@ -463,17 +715,17 @@ final class KachatNamesRegistry: ObservableObject {
     func inGrace() async throws -> [KachatNames.NameInfo] {
         try await prepare()
         let grace = graceMs
-        let fromChain = { (self.chainState?.names ?? []).map(KachatNames.RegistryState.info) }
         let all: [KachatNames.NameInfo]
         switch source {
         case .indexer(let base):
             if let j: KachatNames.IndexerAPI.NamesJSON = try? await Self.get(base, "/names/grace") {
                 all = j.names.compactMap { $0.info(keyOf: Self.keyOf) }
             } else {
-                all = fromChain()
+                // only a copy read to the tip: "none here" from a partial one says nothing
+                all = (chainState?.reachedTip == true ? chainState?.names ?? [] : []).map(KachatNames.RegistryState.info)
             }
         default:
-            all = fromChain()
+            all = try readChainState().names.map(KachatNames.RegistryState.info)
         }
         return all.filter { $0.status(graceMs: grace) == .grace }.sorted { $0.expiresAt < $1.expiresAt }
     }
@@ -481,40 +733,35 @@ final class KachatNamesRegistry: ObservableObject {
     /// Open offers on a name. Without an indexer only the offers this device made are known.
     func offers(for name: String) async throws -> [KachatNames.OfferInfo] {
         try await prepare()
-        switch source {
-        case .indexer(let base):
-            let j: KachatNames.IndexerAPI.OffersJSON = try await Self.get(base, "/names/\(name)/offers")
+        if case .indexer(let base) = source,
+           let j = try await fromIndexer(KachatNames.IndexerAPI.OffersJSON.self, base, "/names/\(name)/offers") {
             return j.offers.compactMap { $0.info(name: name, keyOf: Self.keyOf) }.sorted { $0.amount > $1.amount }
-        default:
-            let key = KachatNames.hex(KachatNames.Codec.key(name))
-            return (chainState?.offers ?? []).filter { $0.key == key }.map(KachatNames.RegistryState.info).sorted { $0.amount > $1.amount }
         }
+        let key = KachatNames.hex(KachatNames.Codec.key(name))
+        return try readChainState().offers.filter { $0.key == key }.map(KachatNames.RegistryState.info).sorted { $0.amount > $1.amount }
     }
 
     /// The offers `buyer` made that are still open.
     func myOffers(buyer: Data) async throws -> [KachatNames.OfferInfo] {
         try await prepare()
-        switch source {
-        case .indexer(let base):
+        if case .indexer(let base) = source {
             guard let address = Self.address(of: buyer) else { return [] }
-            let j: KachatNames.IndexerAPI.OffersJSON = try await Self.get(base, "/offers/by-buyer/\(address)")
-            return j.offers.compactMap { $0.info(name: nil, keyOf: Self.keyOf) }
-        default:
-            let me = KachatNames.hex(buyer)
-            return (chainState?.offers ?? []).filter { $0.buyer == me }.map(KachatNames.RegistryState.info)
+            if let j = try await fromIndexer(KachatNames.IndexerAPI.OffersJSON.self, base, "/offers/by-buyer/\(address)") {
+                return j.offers.compactMap { $0.info(name: nil, keyOf: Self.keyOf) }
+            }
         }
+        let me = KachatNames.hex(buyer)
+        return try readChainState().offers.filter { $0.buyer == me }.map(KachatNames.RegistryState.info)
     }
 
     /// A name's history, newest first. The walker knows every registry transition it walked.
     func history(name: String) async throws -> [KachatNames.Event] {
         try await prepare()
-        switch source {
-        case .indexer(let base):
-            let j: KachatNames.IndexerAPI.EventsJSON = try await Self.get(base, "/names/\(name)/history")
+        if case .indexer(let base) = source,
+           let j = try await fromIndexer(KachatNames.IndexerAPI.EventsJSON.self, base, "/names/\(name)/history") {
             return j.events.map(\.event)
-        default:
-            return (chainState?.events ?? []).filter { $0.name == name }.reversed()
         }
+        return try readChainState().events.filter { $0.name == name }.reversed()
     }
 
     /// Recent registry activity, newest first: every registration, renewal, extension, listing,
@@ -522,16 +769,15 @@ final class KachatNamesRegistry: ObservableObject {
     /// one without that endpoint yet answers only market events (`/market/activity`).
     func activity() async throws -> [KachatNames.Event] {
         try await prepare()
-        switch source {
-        case .indexer(let base):
+        if case .indexer(let base) = source {
             if let all: KachatNames.IndexerAPI.EventsJSON = try? await Self.get(base, "/names/activity") {
                 return all.events.map(\.event)
             }
-            let j: KachatNames.IndexerAPI.EventsJSON = try await Self.get(base, "/market/activity")
-            return j.events.map(\.event)
-        default:
-            return Array((chainState?.events ?? []).reversed().prefix(200))
+            if let j = try await fromIndexer(KachatNames.IndexerAPI.EventsJSON.self, base, "/market/activity") {
+                return j.events.map(\.event)
+            }
         }
+        return Array(try readChainState().events.reversed().prefix(200))
     }
 
 
@@ -576,7 +822,7 @@ final class KachatNamesRegistry: ObservableObject {
                            last7d: kinds.reduce(0) { $0 + $1.last7d },
                            total: kinds.reduce(0) { $0 + $1.total }), fees)
         default:
-            return Self.totals(of: chainState?.events ?? [], params: m.params)
+            return Self.totals(of: try readChainState().events, params: m.params)
         }
     }
 
@@ -668,7 +914,7 @@ final class KachatNamesRegistry: ObservableObject {
             }
             return (b, a)
         default:
-            guard let nb = chainState?.neighbours(of: n.key) else { throw KachatNames.Failure("no gaps around \(n.name) yet - refresh") }
+            guard let nb = try readChainState().neighbours(of: n.key) else { throw KachatNames.Failure("no gaps around \(n.name) yet - refresh") }
             return (KachatNames.RegistryState.info(nb.below), KachatNames.RegistryState.info(nb.above))
         }
     }
@@ -676,25 +922,80 @@ final class KachatNamesRegistry: ObservableObject {
     // MARK: - Identity and profiles
 
     /// The label and profile of an address (KACHAT_NAMES.md section 7). Without an indexer the
-    /// label comes from the walked names, and the profile is known only for this wallet's own
-    /// address (the record it last wrote).
+    /// label comes from the walked names and the profile from the address's own record on the
+    /// chain (`chainProfile`); this wallet's own last write comes first.
     func identity(address: String) async throws -> KachatNames.Identity {
         let address = address.lowercased()
         // No registry on this network yet (mainnet): no names or label, only the profile.
         guard KachatNamesService.isLaunched else { return try await profileOnlyIdentity(address: address) }
         try await prepare()
-        switch source {
-        case .indexer(let base):
-            let j: KachatNames.IndexerAPI.IdentityJSON = try await Self.get(base, "/identity/\(address)")
+        if case .indexer(let base) = source,
+           let j = try await fromIndexer(KachatNames.IndexerAPI.IdentityJSON.self, base, "/identity/\(address)") {
             return j.identity
-        default:
-            guard let key = Self.keyOf(address) else { return KachatNames.Identity(address: address, label: nil, names: [], profile: nil) }
-            // held names: a name in grace still labels and resolves to its owner
-            let owned = try await heldNames(owner: key)
-            let profile = ownProfile(for: address)?.profile
-            let label = KachatNames.label(owned: owned, primaryName: profile?.primaryName, graceMs: graceMs)
-            return KachatNames.Identity(address: address, label: label, names: owned.map(\.name), profile: profile)
         }
+        guard let key = Self.keyOf(address) else { return KachatNames.Identity(address: address, label: nil, names: [], profile: nil) }
+        // held names: a name in grace still labels and resolves to its owner
+        let owned = try await heldNames(owner: key)
+        var profile = ownProfile(for: address)?.profile
+        if profile == nil { profile = await chainProfile(address: address) }
+        let label = KachatNames.label(owned: owned, primaryName: profile?.primaryName, graceMs: graceMs)
+        return KachatNames.Identity(address: address, label: label, names: owned.map(\.name), profile: profile)
+    }
+
+    /// The address's profile with no indexer: its latest record on the chain, looked for at most
+    /// every half hour. Not found (too far back in a busy address's history, or the REST API not
+    /// answering) keeps the profile already saved, since that is no proof it was ever cleared.
+    private func chainProfile(address: String) async -> KachatNames.Profile? {
+        let saved = identities[address]?.identity.profile
+        if let at = chainProfileCheckedAt[address], Date().timeIntervalSince(at) < Self.chainProfileRecheck { return saved }
+        chainProfileCheckedAt[address] = Date()
+        // A screen of names asks all at once: a few at a time on the REST API, the rest wait.
+        if chainProfilesRunning >= Self.chainProfileMaxRunning {
+            await withCheckedContinuation { (waiter: CheckedContinuation<Void, Never>) in
+                self.chainProfileWaiters.append(waiter)
+            }
+        } else {
+            chainProfilesRunning += 1
+        }
+        defer {
+            // a waiter takes this one's slot; with none waiting the slot is given back
+            if chainProfileWaiters.isEmpty { chainProfilesRunning -= 1 } else { chainProfileWaiters.removeFirst().resume() }
+        }
+        return await Self.latestProfileRecord(address: address) ?? saved
+    }
+
+    private static let chainProfileMaxRunning = 4
+    private static let chainProfileRecheck: TimeInterval = 1800
+    /// Two pages, newest first: profile records are rare, and this runs per person shown.
+    private nonisolated static let profilePages = 2
+    private nonisolated static let profilePageSize = 100
+
+    /// The newest `kchat:1:profile:` record `address` wrote (KACHAT_NAMES.md section 7): one of
+    /// its inputs is the address's and one of its outputs pays back to it, so only the key holder
+    /// can write one. Whether an input is the address's is the REST API's word.
+    private nonisolated static func latestProfileRecord(address: String) async -> KachatNames.Profile? {
+        let base = AppSettings.load().kaspaRestAPIURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let root = base.hasSuffix("/") ? String(base.dropLast()) : base
+        let marker = KachatNames.hex(Data("kchat:1:profile:".utf8))
+        for page in 0..<profilePages {
+            guard let url = URL(string: "\(root)/addresses/\(address)/full-transactions?limit=\(profilePageSize)&offset=\(page * profilePageSize)&resolve_previous_outpoints=light&fields=is_accepted,payload,inputs,outputs,block_time"),
+                  let (data, response) = try? await session.data(from: url),
+                  (response as? HTTPURLResponse)?.statusCode == 200,
+                  let list = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else { return nil }
+            for tx in list {
+                if let accepted = tx["is_accepted"] as? Bool, !accepted { continue }
+                guard let payload = (tx["payload"] as? String)?.lowercased(), payload.hasPrefix(marker),
+                      ((tx["inputs"] as? [[String: Any]]) ?? []).contains(where: { ($0["previous_outpoint_address"] as? String)?.lowercased() == address }),
+                      ((tx["outputs"] as? [[String: Any]]) ?? []).contains(where: { ($0["script_public_key_address"] as? String)?.lowercased() == address }),
+                      let json = Data(hexString: String(payload.dropFirst(marker.count))),
+                      json.count <= KachatNames.Codec.maxProfileJSONBytes,
+                      let profile = try? JSONDecoder().decode(KachatNames.Profile.self, from: json),
+                      profile.v == 1 else { continue }
+                return profile.sanitized()
+            }
+            if list.count < profilePageSize { break }
+        }
+        return nil
     }
 
     /// An address's profile where the network has no registry yet (mainnet): the indexer's
@@ -707,8 +1008,9 @@ final class KachatNamesRegistry: ObservableObject {
         }
         // An indexer without profiles on this network answers 503 for every address: one such
         // answer pauses all profile lookups for ten minutes instead of one request per contact.
+        // With no indexer to ask, the address's own record on the chain answers (`chainProfile`).
         guard let base = Self.indexerBase(), (profilesUnavailableUntil ?? .distantPast) < Date() else {
-            throw KachatNames.Failure("profiles are not indexed on this network yet")
+            return KachatNames.Identity(address: address, label: nil, names: [], profile: await chainProfile(address: address))
         }
         do {
             let j: KachatNames.IndexerAPI.ProfileJSON = try await Self.get(base, "/profiles/\(address)")
@@ -717,7 +1019,8 @@ final class KachatNamesRegistry: ObservableObject {
             if (error as? KachatNames.Failure)?.message.hasSuffix("answered 503") == true {
                 profilesUnavailableUntil = Date().addingTimeInterval(600)
             }
-            throw error
+            guard Self.indexerIsDown(error) else { throw error }
+            return KachatNames.Identity(address: address, label: nil, names: [], profile: await chainProfile(address: address))
         }
     }
 
@@ -746,6 +1049,8 @@ final class KachatNamesRegistry: ObservableObject {
             try? await Task.sleep(nanoseconds: 8_000_000_000)
             while let self {
                 if UIApplication.shared.applicationState == .active {
+                    // on the chain: keep up with it, and go back to the indexer once it recovers
+                    if self.source == .chain { await self.refreshIfStale(maxAge: 55) }
                     await self.refreshUnnamedIdentities()
                 }
                 try? await Task.sleep(nanoseconds: 60_000_000_000)
@@ -855,11 +1160,15 @@ final class KachatNamesRegistry: ObservableObject {
         var out: [String: KachatNames.Identity] = [:]
         // the indexer takes at most 200 per call
         for chunk in stride(from: 0, to: addresses.count, by: 200).map({ Array(addresses[$0..<min($0 + 200, addresses.count)]) }) {
-            guard let answer: BatchJSON = try? await Self.post(base, "/identity/batch", BatchBody(addresses: chunk)) else {
+            do {
+                let answer: BatchJSON = try await Self.post(base, "/identity/batch", BatchBody(addresses: chunk))
+                noteIndexerAnswered()
+                for (address, identity) in answer.identities {
+                    out[address.lowercased()] = identity.identity
+                }
+            } catch {
+                if Self.indexerIsDown(error), indexerOutageConfirmed() { failOverToChain(after: error) }
                 return nil
-            }
-            for (address, identity) in answer.identities {
-                out[address.lowercased()] = identity.identity
             }
         }
         return out
@@ -1077,19 +1386,19 @@ final class KachatNamesRegistry: ObservableObject {
 
     // MARK: - Cache files (Application Support/KachatNames/<network>/)
 
-    private static func directory(network: String = KachatNamesService.networkName) -> URL? {
+    private nonisolated static func directory(network: String = KachatNamesService.networkName) -> URL? {
         guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
         let dir = base.appendingPathComponent("KachatNames", isDirectory: true).appendingPathComponent(network, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
 
-    static func readFile(_ name: String, network: String = KachatNamesService.networkName) -> Data? {
+    nonisolated static func readFile(_ name: String, network: String = KachatNamesService.networkName) -> Data? {
         guard let dir = directory(network: network) else { return nil }
         return try? Data(contentsOf: dir.appendingPathComponent(name))
     }
 
-    static func writeFile(_ name: String, _ data: Data, network: String = KachatNamesService.networkName) {
+    nonisolated static func writeFile(_ name: String, _ data: Data, network: String = KachatNamesService.networkName) {
         guard let dir = directory(network: network) else { return }
         try? data.write(to: dir.appendingPathComponent(name), options: .atomic)
     }
@@ -1106,17 +1415,23 @@ final class KachatNamesRegistry: ObservableObject {
 
     private static func profileFile(_ address: String) -> String { "profile-\(walletSuffix(address)).json" }
 
-    private static func loadCache(_ m: KachatNames.Manifest) -> KachatNames.RegistryState? {
+    private nonisolated static func loadCache(_ m: KachatNames.Manifest) -> KachatNames.RegistryState? {
         guard let data = readFile("registry.json"),
               let st = try? JSONDecoder().decode(KachatNames.RegistryState.self, from: data),
               st.matches(m), (try? st.checkInvariants()) != nil else { return nil }
         return st
     }
 
+    /// Saves run in order on one queue, so an older copy can't land after a newer one.
+    private nonisolated static let cacheQueue = DispatchQueue(label: "com.kachat.kachatNames.registryCache", qos: .utility)
+
     private static func saveCache(_ st: KachatNames.RegistryState) {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        if let data = try? encoder.encode(st) { writeFile("registry.json", data) }
+        let network = KachatNamesService.networkName
+        cacheQueue.async {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            if let data = try? encoder.encode(st) { Self.writeFile("registry.json", data, network: network) }
+        }
     }
 }
 
@@ -1498,11 +1813,12 @@ final class KachatNamesNotifier {
 
     func check() async {
         guard KachatNamesService.isLaunched, !checking,
-              let me = KachatNamesActions.shared.myKey, let wallet = KachatNamesActions.shared.myAddress,
+              KachatNamesActions.shared.myKey != nil, let wallet = KachatNamesActions.shared.myAddress,
               let p = KachatNamesService.shared.manifest?.params else { return }
         checking = true
         defer { checking = false }
         let registry = KachatNamesRegistry.shared
+        let offersCompleteAtStart = registry.offersAreComplete
         // every address of this wallet, not only the main one: a name claimed with Buy From
         // gets its notices too (IOS-085 / XP-024)
         guard let own = try? await KachatNamesActions.shared.ownNamesAndOffers(heldOnly: false) else { return }
@@ -1511,21 +1827,27 @@ final class KachatNamesNotifier {
         let ownKeys = KachatNamesActions.shared.allOwnKeys
         var offersOnMine: [KachatNames.OfferInfo] = []
         for n in owned where n.status(graceMs: p.graceMs) == .active {
-            offersOnMine += ((try? await registry.offers(for: n.name)) ?? []).filter { ownKeys.contains($0.seller) }
+            // a failed read isn't "no offers": comparing it would announce them all gone, then new
+            guard let offers = try? await registry.offers(for: n.name) else { return }
+            offersOnMine += offers.filter { ownKeys.contains($0.seller) }
         }
-        // The indexer pushes name reminders only to the chatting address: for a name on another
-        // address of this wallet the phone schedules its own (XP-024).
+        // read from the chain copy at any point: an offer it doesn't list may still be open
+        let offersComplete = offersCompleteAtStart && registry.offersAreComplete
+        // KaPlay gets no pushes, so the phone schedules every name's reminders itself (XP-024).
         // a different wallet signed in meanwhile: this answer isn't its
         guard KachatNamesActions.shared.myAddress == wallet else { return }
-        await KachatNameReminders.schedule(for: owned.filter { $0.owner != me }, params: p, wallet: wallet)
+        await KachatNameReminders.schedule(for: owned, params: p, wallet: wallet)
 
         let old: Snapshot? = UserDefaults.standard.data(forKey: key(wallet)).flatMap { try? JSONDecoder().decode(Snapshot.self, from: $0) }
+        // the first record of where things stand needs every offer in it
+        guard old != nil || offersComplete else { return }
         let quiet = old == nil // the first check only records where things stand
         var new = Snapshot()
         let now = KachatNames.nowMs()
 
         func post(_ id: String, _ name: String, _ title: String, _ body: String) {
-            guard !quiet else { return }
+            // signed out or switched during one of the reads above: not this account's bell
+            guard !quiet, KachatNamesActions.shared.myAddress == wallet else { return }
             GlobalNotificationCenter.shared.record(id: "kachat-\(id)", source: .kachat, title: title, body: body,
                                                    timestamp: now, targetId: name)
         }
@@ -1556,7 +1878,7 @@ final class KachatNamesNotifier {
                 s.graceNoted = true
                 if !s.lapsedNoted {
                     post("lapsed-\(n.name)-\(n.expiresAt)", n.name, S("%@ is no longer yours", display),
-                         AppLocalization.string("It expired and wasn't renewed, so it's now available to anyone in the marketplace. Your bond comes back to you when someone claims it."))
+                         AppLocalization.string("It expired and wasn't renewed, so anyone can claim it now. Your bond comes back to you when someone claims it."))
                     s.lapsedNoted = true
                 }
             }
@@ -1584,32 +1906,41 @@ final class KachatNamesNotifier {
         }
 
         // Offers on your names.
-        for o in offersOnMine {
-            new.offersOnMine.insert(o.id)
-            guard old?.offersOnMine.contains(o.id) != true, let name = o.name else { continue }
-            post("offer-\(o.id)", name, S("New offer on %@", "\(name).kachat"), S("%@ KAS offered for it.", KaspaUnit.plain(o.amount)))
+        if offersComplete {
+            for o in offersOnMine {
+                new.offersOnMine.insert(o.id)
+                guard old?.offersOnMine.contains(o.id) != true, let name = o.name else { continue }
+                post("offer-\(o.id)", name, S("New offer on %@", "\(name).kachat"), S("%@ KAS offered for it.", KaspaUnit.plain(o.amount)))
+            }
+        } else {
+            new.offersOnMine = old?.offersOnMine ?? []
         }
 
-        // Your offers: accepted, or back with you.
+        // Your offers: accepted, or back with you. Unknown on the chain isn't gone: they stay
+        // as they were until the indexer can say.
         for o in myOpenOffers { new.myOffers[o.id] = o.name ?? "" }
+        if !offersComplete { new.myOffers = old?.myOffers ?? new.myOffers }
         for (id, name) in old?.myOffers ?? [:] where new.myOffers[id] == nil && !name.isEmpty {
             if selfClosedOffers.contains(id) { continue }
             let display = "\(name).kachat"
+            // one id per outcome: an earlier row must not swallow what really became of the offer
             if owned.contains(where: { $0.name == name }) {
-                post("myoffer-\(id)", name, AppLocalization.string("Offer accepted"), S("%@ is yours now.", display))
+                post("myoffer-accepted-\(id)", name, AppLocalization.string("Offer accepted"), S("%@ is yours now.", display))
                 continue
             }
             let history = (try? await registry.history(name: name)) ?? []
             switch history.first(where: { ["offer_decline", "offer_refund", "offer_withdraw"].contains($0.op) })?.op {
             case "offer_decline":
-                post("myoffer-\(id)", name, S("Offer on %@ declined", display), AppLocalization.string("The owner declined it. The KAS is back with you."))
+                post("myoffer-declined-\(id)", name, S("Offer on %@ declined", display), AppLocalization.string("The owner declined it. The KAS is back with you."))
             case "offer_refund":
-                post("myoffer-\(id)", name, S("Offer on %@ expired", display), AppLocalization.string("Nobody accepted it in time. The KAS is back with you."))
+                post("myoffer-expired-\(id)", name, S("Offer on %@ expired", display), AppLocalization.string("Nobody accepted it in time. The KAS is back with you."))
             default:
-                post("myoffer-\(id)", name, S("Offer on %@ returned", display), AppLocalization.string("It can no longer be accepted. The KAS is back with you."))
+                post("myoffer-returned-\(id)", name, S("Offer on %@ returned", display), AppLocalization.string("It can no longer be accepted. The KAS is back with you."))
             }
         }
 
+        // the notices above didn't reach this account's bell: seen again on its next check
+        guard KachatNamesActions.shared.myAddress == wallet else { return }
         if let data = try? JSONEncoder().encode(new) { UserDefaults.standard.set(data, forKey: key(wallet)) }
     }
 }
@@ -1650,7 +1981,14 @@ enum KachatNameReminders {
 
     static func schedule(for names: [KachatNames.NameInfo], params p: KachatNames.Params, wallet: String) async {
         let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
+        var settings = await center.notificationSettings()
+        // Asked the first time there is a reminder to set, with the app on screen. Denied, the
+        // reminders are dropped below and Your Domains says they're off (`KachatLiveDomainsTab`).
+        if settings.authorizationStatus == .notDetermined, UIApplication.shared.applicationState == .active,
+           names.contains(where: { $0.expiresAt + p.graceMs > KachatNames.nowMs() }) {
+            _ = try? await center.requestAuthorization(options: [.alert, .sound])
+            settings = await center.notificationSettings()
+        }
         let all = await center.pendingNotificationRequests().map(\.identifier)
         let legacy = all.filter { $0.hasPrefix(legacyPrefix) }
         if !legacy.isEmpty { center.removePendingNotificationRequests(withIdentifiers: legacy) }

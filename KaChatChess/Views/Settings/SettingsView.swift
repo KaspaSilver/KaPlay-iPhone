@@ -507,10 +507,7 @@ struct ConnectionSettingsView: View {
     @ObservedObject private var namesRegistry = KachatNamesRegistry.shared
 
     @State private var indexerURL: String = ""
-    @State private var kaPostIndexerURL: String = ""
-    @State private var translationServiceURL: String = ""
     @State private var publicChatIndexerURL: String = ""
-    @State private var pushIndexerURL: String = ""
     @State private var kaspaRestAPIURL: String = ""
     @State private var trustedNodeValidationError: String?
 
@@ -570,30 +567,12 @@ struct ConnectionSettingsView: View {
         } header: {
             Text("Message Indexer")
         } footer: {
-            Text("Message indexer service for chat functionality. Also serves .kachat names when it has them (see the Domains tab).")
+            Text("Serves .kachat names when it has them (see the Domains tab).")
         }
 
         Section {
             VStack(alignment: .leading, spacing: 4) {
-                Text("KaPost Indexer URL")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                TextField(indexerPlaceholder(AppSettings.defaultKaPostIndexerURL), text: $kaPostIndexerURL)
-                    .font(.system(.body, design: .monospaced))
-                    .autocapitalization(.none)
-                    .autocorrectionDisabled()
-                    .keyboardType(.URL)
-                httpsInlineError(for: kaPostIndexerURL)
-            }
-        } header: {
-            Text("KaPost Indexer")
-        } footer: {
-            Text("K social network indexer that powers KaPosts feeds")
-        }
-
-        Section {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Public Chats Indexer URL")
+                Text("Chess Indexer URL")
                     .font(.caption)
                     .foregroundColor(.secondary)
                 TextField(indexerPlaceholder(AppSettings.defaultPublicChatIndexerURL), text: $publicChatIndexerURL)
@@ -604,27 +583,9 @@ struct ConnectionSettingsView: View {
                 httpsInlineError(for: publicChatIndexerURL)
             }
         } header: {
-            Text("Public Chats Indexer")
+            Text("Chess Indexer")
         } footer: {
-            Text("KaChat public chat history indexer for #kaspa and #kachat-bugs")
-        }
-
-        Section {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Push Indexer URL")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                TextField(indexerPlaceholder(AppSettings.defaultPushIndexerURL), text: $pushIndexerURL)
-                    .font(.system(.body, design: .monospaced))
-                    .autocapitalization(.none)
-                    .autocorrectionDisabled()
-                    .keyboardType(.URL)
-                httpsInlineError(for: pushIndexerURL)
-            }
-        } header: {
-            Text("Push Registration")
-        } footer: {
-            Text("Used only for push registration and updates")
+            Text("Serves the chess arena's rooms, moves and leaderboards. A server that doesn't have them means online games can't find each other.")
         }
 
     }
@@ -742,28 +703,6 @@ struct ConnectionSettingsView: View {
         } footer: {
             Text("Save your own node addresses here, then tap one to copy it and paste into the Kaspa Node field above.")
         }
-    }
-
-    @ViewBuilder
-    private var translationSections: some View {
-        Section {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Translation Service URL")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                TextField(AppSettings.defaultTranslationServiceURL, text: $translationServiceURL)
-                    .font(.system(.body, design: .monospaced))
-                    .autocapitalization(.none)
-                    .autocorrectionDisabled()
-                    .keyboardType(.URL)
-                httpsInlineError(for: translationServiceURL)
-            }
-        } header: {
-            Text("Translation Service")
-        } footer: {
-            Text("Translates KaPosts written in another language. Runs on the KaPost indexer's box by default; point this at your own if you host one (see TRANSLATION_SERVICE.md).")
-        }
-
     }
 
     @ViewBuilder
@@ -885,13 +824,12 @@ struct ConnectionSettingsView: View {
     /// One tab per kind of connection, so the page stays short as the app talks to more
     /// services: indexers, the Kaspa node, translation, name services, the block explorer.
     private enum ConnectionTab: String, CaseIterable {
-        case indexer, node, translation, domains, explorer
+        case indexer, node, domains, explorer
 
         var title: String {
             switch self {
             case .indexer: return "Indexer"
             case .node: return "Node"
-            case .translation: return "Translation"
             case .domains: return "Domains"
             case .explorer: return "Explorer"
             }
@@ -911,7 +849,6 @@ struct ConnectionSettingsView: View {
                 switch selectedTab {
                 case .indexer: indexerSections
                 case .node: nodeSections
-                case .translation: translationSections
                 case .domains: domainsSections
                 case .explorer: explorerSections
                 }
@@ -986,10 +923,7 @@ struct ConnectionSettingsView: View {
 
     private func loadCurrentSettings() {
         indexerURL = settingsViewModel.settings.indexerURL
-        kaPostIndexerURL = settingsViewModel.settings.kaPostIndexerURL
-        translationServiceURL = settingsViewModel.settings.translationServiceURL
         publicChatIndexerURL = settingsViewModel.settings.publicChatIndexerURL
-        pushIndexerURL = settingsViewModel.settings.pushIndexerURL
         kaspaRestAPIURL = settingsViewModel.settings.kaspaRestAPIURL
     }
 
@@ -1005,7 +939,7 @@ struct ConnectionSettingsView: View {
     /// https:// (Decision 3A).
     @discardableResult
     private func saveSettings() -> Bool {
-        let allFields = [indexerURL, kaPostIndexerURL, translationServiceURL, publicChatIndexerURL, pushIndexerURL, kaspaRestAPIURL]
+        let allFields = [indexerURL, publicChatIndexerURL, kaspaRestAPIURL]
         guard !allFields.contains(where: isCleartextHTTP) else {
             showToast(Self.httpsRequiredError, style: .error)
             return false
@@ -1020,10 +954,7 @@ struct ConnectionSettingsView: View {
         let defaults = ConnectionProfile.defaults(for: settingsViewModel.settings.networkType)
         let previousIndexerURL = settingsViewModel.settings.indexerURL
         settingsViewModel.settings.indexerURL = normalizedOrDefault(indexerURL, defaults.indexerURL)
-        settingsViewModel.settings.kaPostIndexerURL = normalizedOrDefault(kaPostIndexerURL, defaults.kaPostIndexerURL)
-        settingsViewModel.settings.translationServiceURL = normalizedOrDefault(translationServiceURL, defaults.translationServiceURL)
         settingsViewModel.settings.publicChatIndexerURL = normalizedOrDefault(publicChatIndexerURL, defaults.publicChatIndexerURL)
-        settingsViewModel.settings.pushIndexerURL = normalizedOrDefault(pushIndexerURL, defaults.pushIndexerURL)
         settingsViewModel.settings.kaspaRestAPIURL = normalizedOrDefault(kaspaRestAPIURL, defaults.kaspaRestAPIURL)
         settingsViewModel.saveSettings()
         // A new indexer is asked about .kachat names now, not at the next stale refresh.
@@ -1458,18 +1389,6 @@ struct ConnectionStatusDetailView: View {
                     .font(.system(.caption, design: .monospaced))
                     .foregroundColor(.secondary)
                     .lineLimit(1)
-            }
-
-            // Push register endpoint (only if different from indexer)
-            if settingsViewModel.settings.pushIndexerURL != settingsViewModel.settings.indexerURL {
-                HStack {
-                    Text("Push Register")
-                    Spacer()
-                    Text(extractHost(from: settingsViewModel.settings.pushIndexerURL))
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                }
             }
 
             HStack {

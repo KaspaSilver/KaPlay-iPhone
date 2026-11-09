@@ -65,27 +65,6 @@ final class PublicChatService: ObservableObject {
     /// (ONLINE_CHESS.md). Hidden from Public Chats, no unread, no banners.
     nonisolated static let serviceChannels: Set<String> = [ChessTournamentCodec.arenaChannel]
 
-    /// Native-language label for a curated language room, e.g. "kaspa-espanol" -> "Español".
-    /// Native names (not English ones) so a speaker scanning the list finds their own language.
-    nonisolated static func languageDisplayName(for channel: String) -> String? {
-        switch PublicChatChannelName.normalize(channel) {
-        case "kaspa-indonesia": return "Bahasa Indonesia"
-        case "kaspa-czech": return "Čeština"
-        case "kaspa-german": return "Deutsch"
-        case "kaspa-espanol": return "Español"
-        case "kaspa-francais": return "Français"
-        case "kaspa-portugues": return "Português"
-        case "kaspa-romania": return "Română"
-        case "kaspa-slovak": return "Slovenčina"
-        case "kaspa-russian": return "Русский"
-        case "kaspa-chinese": return "中文"
-        case "kaspa-japanese": return "日本語"
-        case "kaspa-korean": return "한국어"
-        case "kaspa-hebrew": return "עברית"
-        default: return nil
-        }
-    }
-
     @Published private(set) var channels: [PublicChatChannel] = []
     @Published private(set) var messagesByChannel: [String: [PublicChatMessage]] = [:]
     /// This wallet's public chat reactions, keyed by channel then by targetTxId - mirrors
@@ -108,9 +87,10 @@ final class PublicChatService: ObservableObject {
     /// The same rows, by when this phone started waiting for them (wall ms). Kept across
     /// launches, so a row the network dropped before a relaunch is still found out
     /// (`checkUnconfirmedServiceRows`); a relaunch restarts the wait, as the chain's answer may
-    /// have come while the app was closed.
-    private var localStampSentAt: [String: Int64] = PublicChatService.loadLocalStamps() {
-        didSet { Self.saveLocalStamps(localStampSentAt) }
+    /// have come while the app was closed. Per account, like the store the rows live in: filled
+    /// by `setCurrentWallet`.
+    private var localStampSentAt: [String: Int64] = [:] {
+        didSet { Self.saveLocalStamps(localStampSentAt, wallet: walletAddress) }
     }
     private var isCheckingLocalStamps = false
     /// Set when a public chat-room notification is tapped, so the chat list can navigate to that
@@ -168,6 +148,72 @@ final class PublicChatService: ObservableObject {
                 self.updateScanningStateIfNeeded()
             }
             .store(in: &cancellables)
+        // Before stamps were kept per account.
+        UserDefaults.standard.removeObject(forKey: Self.localStampsKey)
+    }
+
+    /// True while the chess arena's indexer has stopped answering. The arena then lives on the
+    /// block stream, with the REST API filling in the player's own games
+    /// (`ChessTournamentService.readMyGamesFromChainIfDue`).
+    @Published private(set) var arenaIndexerDown = false
+    /// When the newest indexer answer for the arena was asked for (wall ms): rows up to then are
+    /// in the store, so it only counts once any paging-in that was due has finished. A timeout
+    /// claim waits for one newer than the flag.
+    private(set) var arenaIndexerAnsweredAt: Int64 = 0
+
+    private func noteArenaAnswered(channel: String, askedAt: Int64) {
+        guard channel == ChessTournamentCodec.arenaChannel, deepBackfilledChannels.contains(channel) else { return }
+        arenaIndexerAnsweredAt = max(arenaIndexerAnsweredAt, askedAt)
+    }
+
+    /// The arena's history is paged in, as far as this session owes it.
+    var arenaBackfillDone: Bool { deepBackfilledChannels.contains(ChessTournamentCodec.arenaChannel) }
+
+    /// The latest word on the arena's indexer, after every read: state, not transitions, so a
+    /// missed or reordered change can't leave it stuck either way.
+    func arenaHealthObserved(down: Bool) {
+        guard down != arenaIndexerDown else { return }
+        AppLog.log("[PublicChat] Arena indexer %@", down ? "isn't answering: reading from the block stream and the Kaspa REST API" : "is answering again")
+        arenaIndexerAvailabilityChanged(down: down)
+        NotificationCenter.default.post(name: .indexerAvailabilityChanged, object: nil, userInfo: ["down": down])
+    }
+
+    /// The indexer's address was cleared while it was down: nothing would ever report it back.
+    func resyncArenaIndexerIfUnset() {
+        guard arenaIndexerDown, Self.indexerBaseURL(forChannel: ChessTournamentCodec.arenaChannel).isEmpty else { return }
+        Task { await PublicChatIndexerClient.arenaHealth.reset() }
+        arenaHealthObserved(down: false)
+    }
+
+    /// Pages the arena back to `since` on the next poll: one of this player's games shows a
+    /// move missing, or a claim didn't take. Until that's done no answer counts as fresh.
+    func repageArena(since: Int64) {
+        requestRepage(channel: ChessTournamentCodec.arenaChannel, since: since - Self.repageMarginMs)
+    }
+
+    /// Whether the REST API shows this transaction accepted (a bot stamp).
+    func isTransactionAccepted(txId: String) async -> Bool {
+        if case .accepted = await Self.lookUpTransaction(txId: txId) { return true }
+        return false
+    }
+
+    private static func skipsIndexer(_ channel: String) async -> Bool {
+        guard channel == ChessTournamentCodec.arenaChannel else { return false }
+        return await PublicChatIndexerClient.arenaHealth.shouldSkipIndexer()
+    }
+
+    /// Down: on cellular the block stream comes back on (`scanWantedChannels`). Back: the arena is
+    /// paged in again, since the steady poll's newest rows can't reach back over an outage, and
+    /// the indexer's block times replace what the stream gave meanwhile.
+    private func arenaIndexerAvailabilityChanged(down: Bool) {
+        arenaIndexerDown = down
+        if !down {
+            deepBackfilledChannels.remove(ChessTournamentCodec.arenaChannel)
+            deepBackfillResume[ChessTournamentCodec.arenaChannel] = nil
+            backfillFloor[ChessTournamentCodec.arenaChannel] = nil
+            arenaIndexerAnsweredAt = 0
+        }
+        updateScanningStateIfNeeded()
     }
 
     /// When the app-wide indexer was last asked which rooms it tracks.
@@ -215,6 +261,12 @@ final class PublicChatService: ObservableObject {
             deepBackfilledChannels = []
             deepBackfillResume = [:]
             indexerFetchedChannels = []
+            arenaIndexerAnsweredAt = 0
+            indexerCoveredUntil = [:]
+            backfillFloor = [:]
+            localStampSentAt = normalized.map { Self.loadLocalStamps(wallet: $0) } ?? [:]
+            localStampNextCheck = [:]
+            droppedServiceRows = []
         }
         if tearingDownOtherWallet { liveViewRefCounts = [:] }
         loadReadState()
@@ -309,8 +361,12 @@ final class PublicChatService: ObservableObject {
     private func fetchNewestAndMerge(channel: String) async -> Bool {
         let base = Self.indexerBaseURL(forChannel: channel)
         guard !base.isEmpty else { return false }
+        if await Self.skipsIndexer(channel) { return false }
+        let askedAt = Int64(Date().timeIntervalSince1970 * 1000)
+        repageIfPollingLapsed(channel: channel, now: askedAt)
         do {
             let page = try await PublicChatIndexerClient.fetchHistoryPage(baseURL: base, channel: channel, limit: 40)
+            defer { noteArenaAnswered(channel: channel, askedAt: askedAt) }
             // Guarded: inserting an element that is already there still publishes, which
             // re-rendered an open room on every sweep for nothing.
             if !indexerFetchedChannels.contains(channel) { indexerFetchedChannels.insert(channel) }
@@ -398,56 +454,8 @@ final class PublicChatService: ObservableObject {
         return featured + others
     }
 
-    /// "Delete" from the room list. A room you added is left for good (`leaveChannel`, its
-    /// messages go). A default room cannot really be deleted - it is simply switched off, the
-    /// same as its toggle in Public Chats settings, and that toggle brings it back.
-    func removeFromList(_ rawName: String) {
-        let name = PublicChatChannelName.normalize(rawName)
-        if Self.curatedChannels.contains(name) {
-            setCuratedChannel(name, shown: false)
-        } else {
-            leaveChannel(name)
-        }
-    }
-
     func isCuratedChannelShown(_ name: String) -> Bool {
         !hiddenCuratedChannels.contains(PublicChatChannelName.normalize(name))
-    }
-
-    /// What a default room's switch in Public Chats settings reads: on only when the room is
-    /// joined AND not switched off - i.e. it is in the list and the Chats circles row. A
-    /// language room is not joined until someone opens or switches it on, so it reads off
-    /// until then (it used to read "on" while appearing nowhere).
-    func isCuratedChannelOn(_ name: String) -> Bool {
-        let normalized = PublicChatChannelName.normalize(name)
-        return isCuratedChannelShown(normalized) && channels.contains { $0.channelName == normalized }
-    }
-
-    /// Off: the room leaves the list and its notifications stop (the bell goes off, which also
-    /// takes it off the push service's watch list). On: it is joined if it wasn't (the same as
-    /// joining it from the join sheet, so it appears in the list and the circles row at once)
-    /// and comes back - #kaspa and #kachat-bugs with their bell on again, as they start; the
-    /// language rooms with the bell a newly joined room gets.
-    func setCuratedChannel(_ rawName: String, shown: Bool) {
-        let name = PublicChatChannelName.normalize(rawName)
-        guard Self.curatedChannels.contains(name) else { return }
-        if shown {
-            hiddenCuratedChannels.remove(name)
-        } else {
-            hiddenCuratedChannels.insert(name)
-        }
-        if let key = hiddenCuratedKey {
-            UserDefaults.standard.set(Array(hiddenCuratedChannels), forKey: key)
-        }
-        if shown, !channels.contains(where: { $0.channelName == name }) {
-            joinChannel(name)
-        }
-        let isJoined = channels.contains { $0.channelName == name }
-        if !shown, isJoined {
-            setNotifyEnabled(false, forChannel: name)
-        } else if shown, isJoined, Self.featuredChannels.contains(name) {
-            setNotifyEnabled(true, forChannel: name)
-        }
     }
 
     private var lastReadKey: String? { walletAddress.map { "kachat_broadcast_last_read_\($0)" } }
@@ -502,25 +510,6 @@ final class PublicChatService: ObservableObject {
         persistReadState()
     }
 
-    func markChannelUnread(_ name: String) {
-        manuallyUnreadChannels.insert(PublicChatChannelName.normalize(name))
-        persistReadState()
-    }
-
-    /// Loads every joined room's stored messages so the list can show last message, time and
-    /// unread count, and starts a read marker for rooms that have none.
-    func primeChannelSummaries() {
-        var seeded = false
-        for channel in channels {
-            if messagesByChannel[channel.channelName] == nil { loadMessages(for: channel.channelName) }
-            if lastReadByChannel[channel.channelName] == nil {
-                lastReadByChannel[channel.channelName] = Int64(Date().timeIntervalSince1970 * 1000)
-                seeded = true
-            }
-        }
-        if seeded { persistReadState() }
-    }
-
     /// #kaspa and #kachat-bugs notify by default. Applied once per wallet, so a bell the user
     /// later switches off stays off.
     // Rooms join with notifications OFF and stay off until the user turns a bell on - the
@@ -535,15 +524,6 @@ final class PublicChatService: ObservableObject {
     var featuredChannelsNotJoined: [String] {
         let joined = Set(channels.map { $0.channelName })
         return Self.featuredChannels.filter { !joined.contains($0) }
-    }
-
-    /// The curated Popular rooms are permanent fixtures of the list screen - make sure they
-    /// have store rows (bell state etc.) without requiring an explicit join.
-    func ensureFeaturedChannelsJoined() {
-        for name in Self.featuredChannels {
-            _ = store.joinChannel(name)
-        }
-        refreshChannels()
     }
 
     @discardableResult
@@ -630,24 +610,6 @@ final class PublicChatService: ObservableObject {
         return AppSettings.load().publicChatIndexerURL.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// This room's override as the user typed it, or "" when it follows the app-wide setting.
-    func indexerOverride(forChannel channel: String) -> String {
-        indexerOverrides[PublicChatChannelName.normalize(channel)] ?? ""
-    }
-
-    /// Points one room at its own indexer. An empty (or whitespace) value clears the override so
-    /// the room follows the app-wide setting again. Restarts this room's polling so the change
-    /// takes effect without leaving the room.
-    func setIndexerOverride(_ url: String, forChannel channel: String) {
-        let key = PublicChatChannelName.normalize(channel)
-        let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        var overrides = indexerOverrides
-        if trimmed.isEmpty { overrides.removeValue(forKey: key) } else { overrides[key] = trimmed }
-        indexerOverrides = overrides
-        stopIndexerPolling(channel: key)
-        if isViewing(channel: key) { startIndexerPollingIfConfigured(channel: key) }
-    }
-
     func hiddenSendersByChannel() -> (global: Set<String>, perChannel: [String: Set<String>]) {
         store.hiddenSendersByChannel()
     }
@@ -710,6 +672,33 @@ final class PublicChatService: ObservableObject {
     /// so until every page happened to succeed in one go.
     private var deepBackfillResume: [String: (before: Int64, pagesLeft: Int)] = [:]
     private static let indexerPollIntervalNanos: UInt64 = 8 * 1_000_000_000
+    /// When the newest answered poll of a room was asked for (wall ms). Anything older than this
+    /// that a newest-rows poll can't reach (app in the background, room closed, polls failing)
+    /// is paged in again (`repageIfPollingLapsed`).
+    private var indexerCoveredUntil: [String: Int64] = [:]
+    /// How far back a repeat of the backfill goes; none means the whole 30-day window.
+    private var backfillFloor: [String: Int64] = [:]
+    private static let pollLapseMs: Int64 = 20_000
+    private static let repageMarginMs: Int64 = 60_000
+
+    /// The polls stopped for a while: the rows since then may be past what the newest page holds.
+    private func repageIfPollingLapsed(channel: String, now: Int64) {
+        guard deepBackfilledChannels.contains(channel), let covered = indexerCoveredUntil[channel],
+              now - covered > Self.pollLapseMs else { return }
+        requestRepage(channel: channel, since: covered - Self.repageMarginMs)
+    }
+
+    /// The next poll pages the room back to `since`. A backfill already running to an older
+    /// point, or the whole window, is left to go there.
+    private func requestRepage(channel: String, since: Int64) {
+        if deepBackfilledChannels.remove(channel) != nil {
+            backfillFloor[channel] = since
+            deepBackfillResume[channel] = nil
+        } else if let floor = backfillFloor[channel] {
+            backfillFloor[channel] = min(floor, since)
+        }
+        if channel == ChessTournamentCodec.arenaChannel { arenaIndexerAnsweredAt = 0 }
+    }
 
     /// While a room is open, the KaChat public chat indexer is polled every few seconds and new
     /// rows merge into the local store (txid-deduped) - live block scanning alone proved
@@ -721,6 +710,10 @@ final class PublicChatService: ObservableObject {
         let base = Self.indexerBaseURL(forChannel: channel)
         guard !base.isEmpty else { return }
         indexerPollTasks[channel] = Task { [weak self] in
+            // Opening a chess screen asks at once whether the arena's indexer is back.
+            if channel == ChessTournamentCodec.arenaChannel {
+                await PublicChatIndexerClient.arenaHealth.allowProbeNow()
+            }
             while !Task.isCancelled {
                 // The room view stays mounted (and this loop alive) while the app is in the
                 // background, but there is nobody to show a fresh row to - skip the network
@@ -739,13 +732,16 @@ final class PublicChatService: ObservableObject {
     }
 
     private func fetchFromIndexerAndMerge(baseURL: String, channel: String) async {
+        if await Self.skipsIndexer(channel) { return }
+        let askedAt = Int64(Date().timeIntervalSince1970 * 1000)
+        repageIfPollingLapsed(channel: channel, now: askedAt)
         do {
             // Steady-state polls only need the newest few rows (everything older is already in
             // the store, txid-deduped); re-fetching 200 rows every 8s was pure re-download. The
-            // one-shot deep backfill below keeps the full 200-row pages. The indexer's `before`
+            // deep backfill below keeps the full 200-row pages. The indexer's `before`
             // parameter pages OLDER history, so it cannot act as a newest-side floor - the
-            // small limit is the mechanism. A burst larger than 30 between two polls is
-            // recovered on the next room open (deep backfill re-runs per session).
+            // small limit is the mechanism. Rows the newest page can't reach after a gap in the
+            // polling are paged in again (`repageIfPollingLapsed`).
             let steadyStateLimit = deepBackfilledChannels.contains(channel) ? 30 : 200
             let messages = try await PublicChatIndexerClient.fetchHistoryPage(
                 baseURL: baseURL, channel: channel, limit: steadyStateLimit
@@ -757,12 +753,16 @@ final class PublicChatService: ObservableObject {
             // the message a notification had just announced showed up seconds after the room
             // opened, not with it.
             await mergeIndexerRows(messages.messages, channel: channel, prune: true)
-            // One-shot deep backfill per room per session: page older history with `before`
-            // until the indexer runs out or we reach its 30-day window. Without this, rooms
+            indexerCoveredUntil[channel] = askedAt
+            // Deep backfill: page older history with `before` until the indexer runs out or we
+            // reach its 30-day window, or the floor of a repeat after a gap. Without this, rooms
             // only ever showed the newest single page (200 rows) — busy rooms like
             // #kachat-bugs never loaded anywhere near the 30 days the indexer holds.
             if !deepBackfilledChannels.contains(channel) {
-                let cutoff = Int64(Date().timeIntervalSince1970 * 1000) - PublicChatStore.indexerRetentionMillis
+                let cutoff = max(
+                    Int64(Date().timeIntervalSince1970 * 1000) - PublicChatStore.indexerRetentionMillis,
+                    backfillFloor[channel] ?? 0
+                )
                 var hasMore: Bool
                 var oldest: Int64?
                 var pagesLeft: Int
@@ -807,8 +807,10 @@ final class PublicChatService: ObservableObject {
                 if !interrupted {
                     deepBackfilledChannels.insert(channel)
                     deepBackfillResume[channel] = nil
+                    backfillFloor[channel] = nil
                 }
             }
+            noteArenaAnswered(channel: channel, askedAt: askedAt)
         } catch {
             // Best-effort on top of live scanning - the loop just tries again next tick.
             AppLog.log("%@", "[PublicChat] Indexer fetch failed for #\(channel): \(error.localizedDescription)")
@@ -869,9 +871,12 @@ final class PublicChatService: ObservableObject {
             // Rows this phone sent carry its own clock until the chain's time reaches us -
             // see processPublicChatHits.
             for row in rows {
+                // Our own row can have taken this phone's clock again after the indexer's time
+                // was applied (the send resolving late): that one is never "already applied".
+                let onOwnClock = localStampSentAt[row.id] != nil || droppedServiceRows.remove(row.id) != nil
                 confirmLocalStamp(row.id)
                 let key = "\(row.id)@\(row.blockTime)"
-                guard !wasApplied(key, channel: channel) else { continue }
+                guard onOwnClock || !wasApplied(key, channel: channel) else { continue }
                 if store.updateBlockTime(id: row.id, blockTime: row.blockTime) {
                     insertedCount += 1
                 }
@@ -972,36 +977,6 @@ final class PublicChatService: ObservableObject {
         editingMessage = nil
     }
 
-    /// Edits one of this wallet's own text messages in a room: applied locally at once
-    /// (pending), then sent as an edit envelope exactly like a reaction - one transaction, no
-    /// message row of its own. Sent or failed follow.
-    func sendPublicChatEdit(channel rawChannel: String, targetTxId: String, text: String) async throws {
-        let channel = PublicChatChannelName.normalize(rawChannel)
-        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty else { return }
-        guard let wallet = WalletManager.shared.currentWallet else { throw KasiaError.walletNotFound }
-        guard let privateKey = WalletManager.shared.getPrivateKey() else { throw KasiaError.keychainError("Could not get private key") }
-        editingMessage = nil
-        let payload = MessageEditCodec.encode(targetTxId: targetTxId, text: clean)
-        let now = Int64(Date().timeIntervalSince1970 * 1000)
-        store.upsertEdit(targetTxId: targetTxId, channel: channel, text: clean, editTxId: nil, blockTime: now, deliveryStatus: "pending")
-        loadEdits(for: channel)
-        do {
-            let realTxId = try await ChatService.shared.enqueueOutgoingTxOperation {
-                try await self.sendPublicChatInternal(
-                    channel: channel, content: payload, walletAddress: wallet.publicAddress,
-                    privateKey: privateKey, pendingId: "edit_\(UUID().uuidString)"
-                )
-            }
-            store.upsertEdit(targetTxId: targetTxId, channel: channel, text: clean, editTxId: realTxId, blockTime: now, deliveryStatus: nil)
-            loadEdits(for: channel)
-        } catch {
-            store.upsertEdit(targetTxId: targetTxId, channel: channel, text: clean, editTxId: nil, blockTime: now, deliveryStatus: "failed")
-            loadEdits(for: channel)
-            throw error
-        }
-    }
-
     /// Background read with a per-channel generation - see `loadEdits`.
     private func loadReactions(for channel: String) {
         reactionLoadGeneration[channel, default: 0] &+= 1
@@ -1027,21 +1002,6 @@ final class PublicChatService: ObservableObject {
 
     private func windowSize(for channel: String) -> Int? {
         Self.serviceChannels.contains(channel) ? nil : (windowSizeByChannel[channel] ?? Self.roomWindowSize)
-    }
-
-    /// Whether the room may hold messages older than what is loaded.
-    func hasOlderMessages(forChannel name: String) -> Bool {
-        let channel = PublicChatChannelName.normalize(name)
-        guard windowSize(for: channel) != nil else { return false }
-        return !windowExhausted.contains(channel)
-    }
-
-    /// Widens the room's window by another `roomWindowSize` and reloads it.
-    func loadOlderMessages(forChannel name: String) async {
-        let channel = PublicChatChannelName.normalize(name)
-        guard let current = windowSize(for: channel), !windowExhausted.contains(channel) else { return }
-        windowSizeByChannel[channel] = current + Self.roomWindowSize
-        await reloadMessages(for: channel)
     }
 
     /// Reads the room's window on a background context and publishes it if it changed. Not
@@ -1095,16 +1055,6 @@ final class PublicChatService: ObservableObject {
         return true
     }
 
-    /// Prunes expired messages across all joined channels and refreshes the given channel's
-    /// visible list - called on a timer while a channel screen is open so retention feels
-    /// live. Off the main thread now, so the timer is cheap; it still only re-reads the room
-    /// when something was actually removed.
-    func pruneNowAndRefresh(forChannel name: String) async {
-        if await store.pruneExpiredMessages() {
-            await reloadMessages(for: PublicChatChannelName.normalize(name))
-        }
-    }
-
     // MARK: - Reply
 
     func startReplyTo(_ message: PublicChatMessage) {
@@ -1117,123 +1067,7 @@ final class PublicChatService: ObservableObject {
 
     // MARK: - Retry
 
-    func retryPublicChat(_ message: PublicChatMessage) {
-        guard message.deliveryStatus == .failed else { return }
-        guard let wallet = WalletManager.shared.currentWallet, wallet.publicAddress == message.senderAddress else { return }
-        guard let privateKey = WalletManager.shared.getPrivateKey() else { return }
-
-        let channel = message.channelName
-        let content = message.content
-        let pendingId = message.id
-
-        store.updateMessageStatus(id: pendingId, status: .pending)
-        loadMessages(for: channel)
-
-        Task {
-            do {
-                _ = try await ChatService.shared.enqueueOutgoingTxOperation {
-                    try await self.sendPublicChatInternal(
-                        channel: channel,
-                        content: content,
-                        walletAddress: wallet.publicAddress,
-                        privateKey: privateKey,
-                        pendingId: pendingId
-                    )
-                }
-            } catch {
-                try? await self.handleSendFailure(
-                    error,
-                    channel: channel,
-                    content: content,
-                    walletAddress: wallet.publicAddress,
-                    privateKey: privateKey,
-                    pendingId: pendingId
-                )
-            }
-        }
-    }
-
     // MARK: - Reactions
-
-    /// Reacts to `targetTxId` with `emoji` ("add"), or removes this wallet's existing reaction
-    /// on it ("remove") - mirroring `GroupChatService.sendGroupReaction`'s optimistic-apply/
-    /// status-flip flow. The wire format is a NORMAL public chat whose content is the shared
-    /// `MessageReactionCodec` JSON ({"type":"reaction","targetTxId":...,"emoji":...,"action":
-    /// "add"|"remove"}), sent through the exact same tx pipeline as a text public chat (no reply
-    /// wrapping) - Android and desktop speak the identical shape. Never creates a visible
-    /// message row; receivers intercept it into their reactions index instead.
-    func sendPublicChatReaction(channel rawChannel: String, targetTxId: String, emoji: String, action: String) async throws {
-        let channel = PublicChatChannelName.normalize(rawChannel)
-        guard let wallet = WalletManager.shared.currentWallet else {
-            throw KasiaError.walletNotFound
-        }
-        guard let privateKey = WalletManager.shared.getPrivateKey() else {
-            throw KasiaError.keychainError("Could not get private key")
-        }
-
-        let payload = MessageReactionCodec.encode(targetTxId: targetTxId, emoji: emoji, action: action)
-        let nowMillis = Int64(Date().timeIntervalSince1970 * 1000)
-
-        // Optimistic local apply: pending "add" shows the pill immediately; "remove" clears it.
-        // A remove is stored as a tombstone (emoji nil) rather than a row delete - see
-        // `PublicChatStore`'s Reactions doc comment for why.
-        store.upsertOwnReaction(
-            targetTxId: targetTxId,
-            channel: channel,
-            reactorAddress: wallet.publicAddress,
-            emoji: action == "remove" ? nil : emoji,
-            reactionTxId: nil,
-            blockTime: nowMillis,
-            deliveryStatus: action == "remove" ? nil : "pending"
-        )
-        loadReactions(for: channel)
-
-        do {
-            let realTxId = try await ChatService.shared.enqueueOutgoingTxOperation {
-                try await self.sendPublicChatInternal(
-                    channel: channel,
-                    content: payload,
-                    walletAddress: wallet.publicAddress,
-                    privateKey: privateKey,
-                    pendingId: "reaction_\(UUID().uuidString)"
-                )
-            }
-            store.upsertOwnReaction(
-                targetTxId: targetTxId,
-                channel: channel,
-                reactorAddress: wallet.publicAddress,
-                emoji: action == "remove" ? nil : emoji,
-                reactionTxId: realTxId,
-                blockTime: Int64(Date().timeIntervalSince1970 * 1000),
-                deliveryStatus: action == "remove" ? nil : "sent"
-            )
-            loadReactions(for: channel)
-        } catch {
-            // The reaction tx failed to send. Flag it failed so the pill shows the red error
-            // icon and a Retry appears under the message. A failed "remove" restores the
-            // optimistically-cleared emoji (marked failed) so it isn't silently lost - Retry
-            // re-attempts the correct action, matching group chat exactly.
-            store.upsertOwnReaction(
-                targetTxId: targetTxId,
-                channel: channel,
-                reactorAddress: wallet.publicAddress,
-                emoji: emoji,
-                reactionTxId: nil,
-                blockTime: Int64(Date().timeIntervalSince1970 * 1000),
-                deliveryStatus: "failed",
-                failedAction: action
-            )
-            loadReactions(for: channel)
-            throw error
-        }
-    }
-
-    /// Re-attempts a public chat reaction whose send previously failed. `action` is the failed
-    /// reaction's stored `failedAction` ("add"/"remove"). Delegates to `sendPublicChatReaction`,
-    /// which clears the failed flag optimistically and re-flags it only if this attempt fails too.
-    func retryPublicChatReaction(channel: String, targetTxId: String, emoji: String, action: String) async throws {
-        try await sendPublicChatReaction(channel: channel, targetTxId: targetTxId, emoji: emoji, action: action)
-    }
 
     // MARK: - Fee estimation
 
@@ -1296,27 +1130,6 @@ final class PublicChatService: ObservableObject {
     }
 
     // MARK: - Sending
-
-    /// Send a voice message - wraps the same inline JSON shape used by 1:1 chat's
-    /// `ChatService.sendAudio` (and matching Android's `VoiceMessageContent` field-for-field) so a
-    /// voice message recorded on either platform plays back on both, then reuses `sendPublicChat`
-    /// for the actual optimistic-send/reply-wrap/retry plumbing.
-    func sendPublicChatAudio(
-        channel: String,
-        audioData: Data,
-        fileName: String = "voice.webm",
-        mimeType: String = "audio/webm"
-    ) async throws {
-        let base64 = audioData.base64EncodedString()
-        // Deterministic field order (mimeType before content) - see MediaFileEnvelope.
-        let jsonString = MediaFileEnvelope.json(
-            name: fileName,
-            size: audioData.count,
-            mimeType: mimeType,
-            dataUrlContent: "data:\(mimeType);base64,\(base64)"
-        )
-        try await sendPublicChat(channel: channel, content: jsonString)
-    }
 
     /// `deferNoInputRetry` false (the chess sends): a send whose coins are not spendable yet
     /// throws instead of being retried later in the background, so the caller - which retries a
@@ -1397,7 +1210,12 @@ final class PublicChatService: ObservableObject {
     /// When a due row may next be looked up (wall ms): one still in a mempool, or one the REST
     /// API could not answer for, is asked about again later, not on every tick.
     private var localStampNextCheck: [String: Int64] = [:]
+    /// Own rows marked failed this session: if the chain shows one after all, it counts again.
+    private var droppedServiceRows: Set<String> = []
     private nonisolated static let localStampsKey = "publicChatLocalStampSentAt"
+    /// A row a node says it doesn't hold still waits this long from sending, for a REST API
+    /// running behind. Short of the give-up: a move really lost must leave clock to replay it.
+    private static let restLagGraceMs: Int64 = 120_000
 
     private func trackLocalStamp(_ txId: String) {
         localStampSentAt[txId] = Int64(Date().timeIntervalSince1970 * 1000)
@@ -1410,25 +1228,28 @@ final class PublicChatService: ObservableObject {
         localStampNextCheck[txId] = nil
     }
 
-    private nonisolated static func loadLocalStamps() -> [String: Int64] {
-        guard let data = UserDefaults.standard.data(forKey: localStampsKey),
+    private nonisolated static func localStampsWalletKey(_ wallet: String) -> String { "\(localStampsKey).\(wallet)" }
+
+    private nonisolated static func loadLocalStamps(wallet: String) -> [String: Int64] {
+        guard let data = UserDefaults.standard.data(forKey: localStampsWalletKey(wallet)),
               let saved = try? JSONDecoder().decode([String: Int64].self, from: data) else { return [:] }
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         return saved.mapValues { _ in now }
     }
 
-    private nonisolated static func saveLocalStamps(_ stamps: [String: Int64]) {
-        guard let data = try? JSONEncoder().encode(stamps) else { return }
-        UserDefaults.standard.set(data, forKey: localStampsKey)
+    private nonisolated static func saveLocalStamps(_ stamps: [String: Int64], wallet: String?) {
+        guard let wallet, let data = try? JSONEncoder().encode(stamps) else { return }
+        UserDefaults.standard.set(data, forKey: localStampsWalletKey(wallet))
     }
 
     /// Own arena rows the chain has not shown `bound` ms after they were sent. Each is looked up:
-    /// accepted (REST API), it takes the block's time there; in a mempool, it waits another
-    /// round; found nowhere, it is marked failed, so the arena's reducer stops applying it and
-    /// the board is the chain's again (a move is the player's to play again). A row the network
-    /// cannot be asked about is given up after `giveUp` ms. A failed row the chain shows later
-    /// takes its block time and counts again (`PublicChatStore.updateBlockTime`). Returns the
-    /// ids marked failed.
+    /// accepted (REST API), it takes the block's time there; in a mempool or spent to a coin the
+    /// address holds, it waits or counts as landed; found nowhere by a node that answered, once
+    /// the REST API has had `restLagGraceMs` to catch up, it is marked failed, so the arena's
+    /// reducer stops applying it and the board is the chain's again (a move is the player's to
+    /// play again). A row the network cannot be asked about is given up after `giveUp` ms. A
+    /// failed row the chain shows later takes its block time and counts again
+    /// (`PublicChatStore.updateBlockTime`). Returns the ids marked failed.
     func checkUnconfirmedServiceRows(olderThan bound: Int64, giveUpAfter giveUp: Int64) async -> Set<String> {
         guard !isCheckingLocalStamps else { return [] }
         let now = Int64(Date().timeIntervalSince1970 * 1000)
@@ -1456,13 +1277,32 @@ final class PublicChatService: ObservableObject {
                     localStampNextCheck[txId] = later
                     continue
                 }
+                // No mempool entry also comes back when no node could be asked, and a 404 from a
+                // REST API running behind: neither says the transaction is gone.
+                let address = WalletManager.shared.currentWallet?.publicAddress
+                if let address, let utxos = try? await NodePoolService.shared.getUtxosByAddresses([address], allowRestFallback: false) {
+                    if utxos.contains(where: { $0.outpoint.transactionId == txId }) {
+                        confirmLocalStamp(txId)
+                        continue
+                    }
+                    if now - sentAt <= Self.restLagGraceMs {
+                        localStampNextCheck[txId] = later
+                        continue
+                    }
+                } else if now - sentAt <= giveUp {
+                    localStampNextCheck[txId] = later
+                    continue
+                }
             case .unanswered:
                 break
             }
+            // The chain showed it, or the account changed, while the lookups ran.
+            guard localStampSentAt[txId] != nil else { continue }
             AppLog.log("[PublicChatService] Own arena tx %@ never reached the chain: dropped", String(txId.prefix(12)))
             localStampSentAt[txId] = nil
             localStampNextCheck[txId] = nil
             store.updateMessageStatus(id: txId, status: .failed)
+            droppedServiceRows.insert(txId)
             failed.insert(txId)
             changed = true
         }
@@ -1743,7 +1583,9 @@ final class PublicChatService: ObservableObject {
     /// rooms) have NO other delivery path, so they keep the stream even on cellular.
     private var scanWantedChannels: Set<String> {
         var wanted = wantedChannels
-        guard NetworkEpochMonitor.shared.isExpensivePath else { return wanted }
+        // With the indexer down the stream is the only live route, cellular or not: it's how a
+        // game in progress keeps getting the other player's moves.
+        guard NetworkEpochMonitor.shared.isExpensivePath, !arenaIndexerDown else { return wanted }
         // Per room, since each can point at its own indexer now: a curated room whose override
         // is blank still counts as indexed via the app-wide setting.
         wanted.subtract(Self.indexerTrackedChannels.filter { !Self.indexerBaseURL(forChannel: $0).isEmpty })
@@ -1927,15 +1769,21 @@ final class PublicChatService: ObservableObject {
                 (id: $0.txId, channel: $0.channel, senderAddress: $0.senderAddress, content: $0.content, blockTime: $0.blockTime)
             })
             for hit in messageHits {
+                // Only a row still on this phone's clock, or given up on. Any other row already
+                // has a chain time: a transaction can sit in several parallel blocks with
+                // different times, and the indexer's is the one every phone ends up with.
+                let takesStreamTime = Self.serviceChannels.contains(hit.channel)
+                    && !inserted.contains(hit.txId)
+                    && (localStampSentAt[hit.txId] != nil || store.deliveryStatus(ofMessage: hit.txId) == .failed)
                 if Self.serviceChannels.contains(hit.channel) { confirmLocalStamp(hit.txId) }
                 if inserted.contains(hit.txId) {
                     touchedChannels.insert(hit.channel)
                     notifyIfEnabled(channel: hit.channel, senderAddress: hit.senderAddress, content: hit.content, txId: hit.txId)
-                } else if Self.serviceChannels.contains(hit.channel),
-                          store.updateBlockTime(id: hit.txId, blockTime: hit.blockTime) {
+                } else if takesStreamTime, store.updateBlockTime(id: hit.txId, blockTime: hit.blockTime) {
                     // Our own arena row, stamped with this phone's clock when it was submitted:
                     // the block's time is what every other phone sees, so take it (the reducer
                     // orders joins and runs the clocks by it).
+                    droppedServiceRows.remove(hit.txId)
                     touchedChannels.insert(hit.channel)
                 }
             }
@@ -1953,6 +1801,104 @@ final class PublicChatService: ObservableObject {
             loadMessages(for: channel)
         }
         await store.pruneExpiredMessages()
+    }
+
+    // MARK: - The arena from the REST API
+
+    private struct ChainArenaRow {
+        let txId: String
+        let sender: String
+        let content: String
+        let blockTime: Int64
+    }
+
+    private nonisolated static let chainPageSize = 100
+    private nonisolated static let chainMaxPages = 20
+
+    /// One room's messages from its known players, read by address from the Kaspa REST API, for
+    /// while the indexer is down. A channel has no address of its own, so this can only fill in a
+    /// room whose players this phone already knows; it can't find new rooms or new joiners, and
+    /// the arena's history can't be rebuilt this way. Only rows the store doesn't hold go in, so
+    /// a time the indexer gave is left alone. True when every player's address answered.
+    func readArenaFromChain(tournamentId: String, players: [String], since: Int64) async -> Bool {
+        var found: [ChainArenaRow] = []
+        var complete = true
+        for address in players {
+            guard let rows = await Self.chainArenaRows(address: address, tournamentId: tournamentId, since: since) else {
+                complete = false
+                continue
+            }
+            found.append(contentsOf: rows)
+        }
+        await mergeChainArenaRows(found)
+        return complete
+    }
+
+    private func mergeChainArenaRows(_ found: [ChainArenaRow]) async {
+        guard !found.isEmpty else { return }
+        let arena = ChessTournamentCodec.arenaChannel
+        let hidden = store.hiddenSenderAddresses(forChannel: arena)
+        let rows = found
+            .filter { !hidden.contains($0.sender) }
+            .map { (id: $0.txId, channel: arena, senderAddress: $0.sender, content: $0.content, blockTime: $0.blockTime) }
+        var changed = !(await store.insertMessages(rows)).isEmpty
+        // Our own rows still on this phone's clock, or given up on, take the chain's time.
+        for row in rows where localStampSentAt[row.id] != nil || droppedServiceRows.contains(row.id) {
+            confirmLocalStamp(row.id)
+            droppedServiceRows.remove(row.id)
+            if store.updateBlockTime(id: row.id, blockTime: row.blockTime) { changed = true }
+        }
+        if changed { await reloadMessagesNow(for: arena) }
+    }
+
+    /// `address`'s accepted posts to the room since `since`, newest pages first until they're
+    /// older than that. The author rule is the block scan's (XP-012): input 0 spends from the
+    /// address output 0 pays. Nil when the REST API didn't answer.
+    private nonisolated static func chainArenaRows(address: String, tournamentId: String, since: Int64) async -> [ChainArenaRow]? {
+        let base = AppSettings.load().kaspaRestAPIURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let root = base.hasSuffix("/") ? String(base.dropLast()) : base
+        let me = address.lowercased()
+        var found: [ChainArenaRow] = []
+        for page in 0..<chainMaxPages {
+            guard let url = URL(string: "\(root)/addresses/\(me)/full-transactions?limit=\(chainPageSize)&offset=\(page * chainPageSize)&resolve_previous_outpoints=light&fields=transaction_id,is_accepted,payload,inputs,outputs,block_time") else { return nil }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 10
+            guard let (data, response) = try? await URLSession.shared.data(for: request),
+                  (response as? HTTPURLResponse)?.statusCode == 200,
+                  let rows = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else { return nil }
+            var reachedSince = false
+            for row in rows {
+                guard let blockTime = chainNumber(row["block_time"]) else { continue }
+                if blockTime < since { reachedSince = true; continue }
+                if let parsed = chainArenaRow(row, address: address, me: me, blockTime: blockTime),
+                   ChessTournamentCodec.decode(parsed.content)?.t == tournamentId {
+                    found.append(parsed)
+                }
+            }
+            if rows.count < chainPageSize || reachedSince { break }
+        }
+        return found
+    }
+
+    private nonisolated static func chainNumber(_ value: Any?) -> Int64? {
+        if let number = value as? NSNumber { return number.int64Value }
+        if let text = value as? String { return Int64(text) }
+        return nil
+    }
+
+    private nonisolated static func chainArenaRow(_ row: [String: Any], address: String, me: String, blockTime: Int64) -> ChainArenaRow? {
+        func first(_ key: String) -> [String: Any]? {
+            ((row[key] as? [[String: Any]]) ?? []).min { (chainNumber($0["index"]) ?? 0) < (chainNumber($1["index"]) ?? 0) }
+        }
+        guard (row["is_accepted"] as? Bool) == true, let txId = row["transaction_id"] as? String,
+              (first("inputs")?["previous_outpoint_address"] as? String)?.lowercased() == me,
+              (first("outputs")?["script_public_key_address"] as? String)?.lowercased() == me,
+              let payloadHex = row["payload"] as? String,
+              let payload = CryptoUtils.hexToData(payloadHex),
+              let text = String(data: payload, encoding: .utf8),
+              let parsed = KasiaTransactionBuilder.parsePublicChatPayload(text),
+              PublicChatChannelName.normalize(parsed.channel) == ChessTournamentCodec.arenaChannel else { return nil }
+        return ChainArenaRow(txId: txId, sender: address, content: parsed.content, blockTime: blockTime)
     }
 
     // MARK: - Local notifications
@@ -2045,18 +1991,6 @@ enum PublicChatIndexerClient {
         }
     }
 
-    /// GET /get-public chats?channel=<name>&limit=<n>[&before=<blockTimeMs>]
-    /// -> {"messages":[{txId, channel, senderAddress, content, blockTime}], "hasMore": Bool}
-    /// blockTime is ms; results newest-first; `before` pages older history.
-    static func fetchHistory(
-        baseURL: String,
-        channel: String,
-        limit: Int = 200,
-        before: Int64? = nil
-    ) async throws -> [IndexedPublicChat] {
-        try await fetchHistoryPage(baseURL: baseURL, channel: channel, limit: limit, before: before).messages
-    }
-
     /// Same fetch, but keeps the server's `hasMore` so callers can page older history with
     /// `before` — the plain fetchHistory silently discarded it, which is why rooms only ever
     /// showed the newest single page.
@@ -2065,6 +1999,55 @@ enum PublicChatIndexerClient {
         channel: String,
         limit: Int = 200,
         before: Int64? = nil
+    ) async throws -> (messages: [IndexedPublicChat], hasMore: Bool) {
+        guard PublicChatChannelName.normalize(channel) == ChessTournamentCodec.arenaChannel else {
+            return try await requestHistoryPage(baseURL: baseURL, channel: channel, limit: limit, before: before)
+        }
+        do {
+            let page = try await requestHistoryPage(baseURL: baseURL, channel: channel, limit: limit, before: before)
+            await noteArenaResult(error: nil)
+            return page
+        } catch {
+            await noteArenaResult(error: error)
+            throw error
+        }
+    }
+
+    /// Whether the chess arena's indexer is answering. Every arena read reports here.
+    static let arenaHealth = IndexerHealth()
+
+    private enum Outcome { case answered, down, inconclusive }
+
+    private static func outcome(of error: Error) -> Outcome {
+        if error is CancellationError { return .inconclusive }
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            // the phone has no connection: that says nothing about the indexer
+            case .cancelled, .notConnectedToInternet, .dataNotAllowed: return .inconclusive
+            default: return .down
+            }
+        }
+        // Any status that isn't a success, or a body that doesn't decode, gave no rows: to the
+        // arena that's the same as no answer, and the REST API must take over.
+        if error is ClientError || error is DecodingError { return .down }
+        return .inconclusive
+    }
+
+    private static func noteArenaResult(error: Error?) async {
+        switch error.map(outcome(of:)) ?? .answered {
+        case .answered: _ = await arenaHealth.recordAnswer()
+        case .down: _ = await arenaHealth.recordFailure()
+        case .inconclusive: break
+        }
+        let down = await arenaHealth.isDown
+        await MainActor.run { PublicChatService.shared.arenaHealthObserved(down: down) }
+    }
+
+    private static func requestHistoryPage(
+        baseURL: String,
+        channel: String,
+        limit: Int,
+        before: Int64?
     ) async throws -> (messages: [IndexedPublicChat], hasMore: Bool) {
         var trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasSuffix("/") { trimmed = String(trimmed.dropLast()) }
@@ -2109,6 +2092,64 @@ enum PublicChatIndexerClient {
               let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
               let decoded = try? JSONDecoder().decode(TrackedChannelsResponse.self, from: data) else { return nil }
         return decoded.channels
+    }
+}
+
+extension Notification.Name {
+    /// The chess arena's indexer stopped answering or came back; `userInfo["down"]` says which.
+    static let indexerAvailabilityChanged = Notification.Name("indexerAvailabilityChanged")
+}
+
+/// Whether an indexer is answering (the same as KaChat's). It only counts as down after several
+/// failures in a row, so one timeout never moves the arena off it. While it's down, one request a
+/// minute is let through to find out when it's back; any answer brings it back at once.
+actor IndexerHealth {
+    private var downSince: Date?
+    private var failuresInARow = 0
+    private var lastFailureAt = Date.distantPast
+    private var retryAt = Date.distantPast
+    private static let failuresToGoDown = 3
+    /// Failures further apart than this aren't a run.
+    private static let failureWindow: TimeInterval = 120
+    private static let retryInterval: TimeInterval = 60
+
+    var isDown: Bool { downSince != nil }
+
+    /// The next read goes through, down or not (a chess screen just opened).
+    func allowProbeNow() { retryAt = .distantPast }
+
+    func reset() {
+        downSince = nil
+        failuresInARow = 0
+        retryAt = .distantPast
+    }
+
+    func shouldSkipIndexer() -> Bool {
+        guard downSince != nil else { return false }
+        let now = Date()
+        // moved here rather than a "probing" flag, which could stick if the caller never asks
+        guard now >= retryAt else { return true }
+        retryAt = now.addingTimeInterval(Self.retryInterval)
+        return false
+    }
+
+    /// True when this is the moment it went down.
+    func recordFailure() -> Bool {
+        let now = Date()
+        if now.timeIntervalSince(lastFailureAt) > Self.failureWindow { failuresInARow = 0 }
+        lastFailureAt = now
+        failuresInARow += 1
+        guard downSince == nil, failuresInARow >= Self.failuresToGoDown else { return false }
+        downSince = now
+        retryAt = now.addingTimeInterval(Self.retryInterval)
+        return true
+    }
+
+    /// True when this is the moment it came back.
+    func recordAnswer() -> Bool {
+        failuresInARow = 0
+        defer { downSince = nil }
+        return downSince != nil
     }
 }
 

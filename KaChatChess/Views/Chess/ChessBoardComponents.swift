@@ -1,5 +1,18 @@
 import SwiftUI
 
+/// The line a chess screen shows while the chess server isn't answering: what's on screen may be
+/// behind, and says so.
+struct ChessServerDownNote: View {
+    var text: LocalizedStringKey = "Chess server unreachable, showing what we have. Your games keep going from the network. Public rooms can be joined again when it's back."
+
+    var body: some View {
+        Label(text, systemImage: "exclamationmark.icloud")
+            .font(.caption)
+            .foregroundColor(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 // Board pieces shared with KaChat's 1:1 chat chess, which KaChat Chess does not have: the
 // glyphs and the small board (from MessageBubbleView.swift) and the waiting overlay (from
 // ChessGameView.swift).

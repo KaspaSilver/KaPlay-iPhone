@@ -1,10 +1,7 @@
 import Foundation
 
-/// Pure, UI-free chess rules engine backing the "Play Chess" 1:1 chat feature. No external
-/// dependencies (see ChessGameService's doc comment for why - adding a real chess library isn't
-/// safely scriptable for the iOS target here). Board state is never persisted directly; it's
-/// always re-derived by replaying a game's move messages through this engine (see
-/// ChessGameService.summarize).
+/// Pure, UI-free chess rules engine, with no external dependencies. Board state is never
+/// persisted directly; it's always re-derived by replaying a game's moves through this engine.
 enum ChessColor: String, Codable, Equatable {
     case white
     case black

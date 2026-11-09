@@ -1,12 +1,10 @@
 import SwiftUI
 import UIKit
+import UserNotifications
 
-// The live `.kachat` screens, TESTNET ONLY (testnet-10 and a verified registry manifest): the hub's
-// search, registrations in flight, Marketplace / My Names / Activity, the name detail with its
-// actions, every transaction sheet and the address profile editor. On mainnet none of this is
-// reached - `KachatListingDetailView` and the profile editor keep their "Coming soon" mockups.
-// KaPlay (copied from KaPay) reaches these through Wallet > Your Domains > .kachat, an address's
-// Domains tab and the bell; it has no .kachat marketplace tab, so the hub pages go unused. Every spending or destructive action shows its cost first, asks to
+// The live `.kachat` screens: the name detail with its owner actions and their transaction sheets.
+// KaPlay (copied from KaPay) reaches them through Wallet > Your Domains > .kachat, an address's
+// Domains tab and the bell. Every spending or destructive action shows its cost first, asks to
 // confirm, then passes the device's own lock (`DeviceAuth`) before anything is signed.
 
 // MARK: - Amounts
@@ -232,20 +230,6 @@ extension View {
     func kachatGlass(cornerRadius: CGFloat = 16) -> some View { modifier(KachatGlass(cornerRadius: cornerRadius)) }
 }
 
-/// "Testnet", on testnet only: mainnet's names are the real ones and need no label.
-struct KachatTestnetBadge: View {
-    var body: some View {
-        if KachatNamesService.networkName != "mainnet" {
-            Text("Testnet")
-                .font(.caption.weight(.bold))
-                .foregroundColor(.orange)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 4)
-                .background(Capsule().fill(Color.orange.opacity(0.15)))
-        }
-    }
-}
-
 struct KachatStatusPill: View {
     let status: KachatNames.Status
 
@@ -276,37 +260,6 @@ struct KachatStatusPill: View {
 
 // MARK: - Name tiles
 
-/// A square tile for one name in the marketplace grids (For sale, Available): the full name -
-/// it wraps onto more lines, never truncates, and the tile grows to fit - with ".kachat" under
-/// it, and the price (or a Reclaim button) at the bottom.
-struct KachatNameTile<Footer: View>: View {
-    let name: String
-    @ViewBuilder var footer: Footer
-
-    /// Centered: the name, ".kachat" under it, then the footer (the price asked, and any button).
-    var body: some View {
-        VStack(spacing: 10) {
-            Spacer(minLength: 0)
-            VStack(spacing: 2) {
-                Text(verbatim: name)
-                    .font(.headline.weight(.bold))
-                    .foregroundColor(.primary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(verbatim: ".kachat")
-                    .font(.caption.weight(.semibold))
-                    .foregroundColor(.accentColor)
-            }
-            footer
-            Spacer(minLength: 0)
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, minHeight: 140, alignment: .center)
-        .kachatGlass()
-        .contentShape(Rectangle())
-    }
-}
-
 /// Two tiles per row.
 struct KachatNameGrid<Content: View>: View {
     @ViewBuilder var content: Content
@@ -321,225 +274,12 @@ struct KachatNameGrid<Content: View>: View {
 
 // MARK: - Hub model
 
-@MainActor
-final class KachatHubModel: ObservableObject {
-    enum Search: Equatable {
-        case idle
-        case checking
-        case invalid(String)
-        case free(String, KachatNames.GapInfo?)
-        case registered(KachatNames.NameInfo)
-        case failed(String)
-    }
-
-    /// nil until the manifest is checked; false when it fails (the hub then stays a mockup).
-    @Published private(set) var ready: Bool?
-    @Published private(set) var setupError: String?
-    /// The manifest is for the previous registry (v1): the hub says "Setting up", calmly.
-    @Published private(set) var upgrading = false
-    @Published private(set) var search: Search = .idle
-    @Published private(set) var listings: [KachatNames.NameInfo] = []
-    @Published private(set) var lapsed: [KachatNames.NameInfo] = []
-    /// Expired and still in grace: the Expired tab, with a countdown to each release.
-    @Published private(set) var grace: [KachatNames.NameInfo] = []
-    @Published private(set) var mine: [KachatNames.NameInfo] = []
-    @Published private(set) var myOffers: [KachatNames.OfferInfo] = []
-    @Published private(set) var activity: [KachatNames.Event] = []
-    @Published private(set) var loadError: String?
-    @Published private(set) var loaded = false
-
-    var registry: KachatNamesRegistry { .shared }
-    var params: KachatNames.Params? { KachatNamesService.shared.manifest?.params }
-    var isLive: Bool { KachatLive.isEnabled && ready == true }
-
-    func start() async {
-        guard KachatLive.isEnabled else {
-            // Not launched here (mainnet): the same pages, empty, under "Coming soon".
-            ready = nil
-            loaded = true
-            return
-        }
-        do {
-            try await registry.prepare(forceSourceCheck: true)
-            ready = true
-            setupError = nil
-            upgrading = false
-        } catch {
-            ready = false
-            upgrading = KachatNamesService.isRegistryUpgrading(error)
-            setupError = error.localizedDescription
-            return
-        }
-        KachatNamesActions.shared.resume()
-        // Coming back to the screen: the pages are loaded, so only a stale registry is refreshed
-        // (the screen reloads on its revision). A full refresh and reload ran on every appear.
-        if loaded, loadError == nil {
-            await registry.refreshIfStale()
-            return
-        }
-        // A refresh that moved `revision` already reloads through the screen's revision
-        // observer; reloading here as well ran the seven requests twice, side by side.
-        let before = registry.revision
-        await registry.refresh()
-        if registry.revision == before { await reload() }
-    }
-
-    func refresh() async {
-        guard isLive else { return }
-        await registry.refresh()
-        await reload()
-    }
-
-    func reload() async {
-        guard isLive else { return }
-        do {
-            listings = try await registry.listings()
-            lapsed = try await registry.lapsed()
-            grace = (try? await registry.inGrace()) ?? []
-            // the chatting address and every used address of this wallet (IOS-085)
-            if KachatNamesActions.shared.myKey != nil {
-                let own = try await KachatNamesActions.shared.ownNamesAndOffers(heldOnly: false)
-                mine = own.names
-                myOffers = own.offers
-                if !myOffers.isEmpty {
-                    await KachatNamesActions.shared.refreshVirtualDaa()
-                    // Your own expired offers come back to you on their own, and so do the ones
-                    // whose name changed hands since you made them.
-                    await KachatNamesActions.shared.returnExpiredOffers(myOffers)
-                    await KachatNamesActions.shared.withdrawDeclinedOffers(myOffers)
-                }
-            } else {
-                mine = []
-                myOffers = []
-            }
-            activity = try await registry.activity()
-            loadError = nil
-        } catch {
-            loadError = error.localizedDescription
-        }
-        loaded = true
-    }
-
-    func lookup(_ text: String) async {
-        let typed = KachatNames.Codec.normalize(text)
-        guard !typed.isEmpty else { search = .idle; return }
-        guard KachatLive.invalidReason(typed) == nil else { search = .invalid(typed); return }
-        search = .checking
-        do {
-            switch try await registry.claimLookup(typed) {
-            case .registered(let n): search = .registered(n)
-            case .free(let name, let gap): search = .free(name, gap)
-            }
-        } catch {
-            search = .failed(error.localizedDescription)
-        }
-    }
-
-    func pricePerYear(_ name: String) -> UInt64? { KachatLive.price(name) }
-}
-
 // MARK: - Hub: search result
 
 struct KachatClaimTarget: Identifiable {
     let name: String
     let gap: KachatNames.GapInfo
     var id: String { name }
-}
-
-struct KachatLiveSearchResult: View {
-    @ObservedObject var model: KachatHubModel
-    let typed: String
-    let onClaim: (KachatClaimTarget) -> Void
-
-    var body: some View {
-        content
-            .padding(12)
-            .kachatGlass(cornerRadius: 12)
-            .task(id: typed) {
-                try? await Task.sleep(nanoseconds: 350_000_000)
-                guard !Task.isCancelled else { return }
-                await model.lookup(typed)
-            }
-    }
-
-    private var name: String { KachatNames.Codec.normalize(typed) }
-
-    @ViewBuilder
-    private var content: some View {
-        switch model.search {
-        case .registered(let n) where n.name == name:
-            NavigationLink {
-                KachatListingDetailView(info: n)
-            } label: {
-                HStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(verbatim: n.display).font(.headline).lineLimit(1)
-                        registeredLine(n)
-                    }
-                    Spacer()
-                    Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundColor(Color(.tertiaryLabel))
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-        case .free(let free, let gap) where free == name:
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(verbatim: "\(free).kachat").font(.headline).lineLimit(1)
-                    // no price here: a name's first year and later years cost differently (the
-                    // claim's "For how long?" shows each)
-                    Text("Available")
-                        .font(.caption)
-                        .foregroundColor(.green)
-                }
-                Spacer()
-                Button("Claim") {
-                    if let gap { onClaim(KachatClaimTarget(name: free, gap: gap)) }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(gap == nil)
-            }
-        case .invalid:
-            row(subtitle: KachatLive.invalidReason(name).map { Text($0) } ?? Text("Not a valid name."))
-        case .failed(let message):
-            row(subtitle: Text(verbatim: message))
-        default:
-            HStack(spacing: 10) {
-                Text(verbatim: "\(name).kachat").font(.headline).lineLimit(1)
-                Spacer()
-                ProgressView()
-            }
-        }
-    }
-
-    private func row(subtitle: Text) -> some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(verbatim: "\(name).kachat").font(.headline).lineLimit(1)
-                subtitle.font(.caption).foregroundColor(.secondary)
-            }
-            Spacer()
-        }
-    }
-
-    @ViewBuilder
-    private func registeredLine(_ n: KachatNames.NameInfo) -> some View {
-        switch n.status(graceMs: KachatNamesRegistry.shared.graceMs) {
-        case .active:
-            if KachatLive.isMine(n.owner) {
-                Text("Yours").font(.caption).foregroundColor(.secondary)
-            } else if n.isListed {
-                Text("Taken · for sale at \(KaspaUnit.amount(n.price))").font(.caption).foregroundColor(.secondary)
-            } else {
-                Text("Taken").font(.caption).foregroundColor(.secondary)
-            }
-        case .grace:
-            Text("Expired - the owner can still renew it").font(.caption).foregroundColor(.orange)
-        case .lapsed:
-            // never reached: a lapsed name searches as free to claim (`claimLookup`)
-            EmptyView()
-        }
-    }
 }
 
 // MARK: - A finished transaction
@@ -730,130 +470,6 @@ struct KachatTxStageSteps: View {
 
 // MARK: - Hub: registrations in flight
 
-/// A registration's progress as a half sheet. Swiping it away leaves the claim running: the
-/// .kachat screen's claims button (`KachatClaimsButton`) lists it. Claiming takes the app being
-/// open (the commit has to age about a minute before the name registers).
-struct KachatRegistrationProgressSheet: View {
-    let registrationId: String
-    let onClose: () -> Void
-    @ObservedObject private var actions = KachatNamesActions.shared
-
-    private var registration: KachatNames.PendingRegistration? { actions.pending.first { $0.id == registrationId } }
-
-    var body: some View {
-        ScrollView {
-            VStack(spacing: 14) {
-                if let registration {
-                    Text(String(format: AppLocalization.string("Claiming %@"), "\(registration.name).kachat"))
-                        .font(.headline)
-                        .multilineTextAlignment(.center)
-                        .padding(.top, 22)
-                    KachatRegistrationCard(registration: registration)
-                    if registration.needsDriving {
-                        Text("Keep KaPlay open: the name is registered about a minute after the hidden commit confirms. If you leave, it picks up where it left off when you come back.")
-                            .font(.footnote)
-                            .foregroundColor(.secondary)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal, 24)
-                    }
-                }
-            }
-            .padding(.bottom, 20)
-        }
-        // closes once the registration is dismissed (Done) or its commit was cancelled
-        .onChange(of: registration?.isOpen != true) { over in if over { onClose() } }
-    }
-}
-
-/// The app-level progress sheet: brings a claim still in progress back up once when the app
-/// starts (a claim needs the app open to finish). Swiping it away leaves the claim running.
-struct KachatRegistrationPresenter: ViewModifier {
-    @ObservedObject private var actions = KachatNamesActions.shared
-
-    private struct Route: Identifiable { let id: String }
-
-    private var route: Binding<Route?> {
-        Binding(
-            get: {
-                guard KachatNamesService.isLaunched, let id = actions.autoPresentedRegistration else { return nil }
-                return Route(id: id)
-            },
-            set: { if $0 == nil { actions.autoPresentedRegistration = nil } }
-        )
-    }
-
-    func body(content: Content) -> some View {
-        content.sheet(item: route) { r in
-            KachatRegistrationProgressSheet(registrationId: r.id) { actions.autoPresentedRegistration = nil }
-                .presentationDetents([.medium, .large])
-                .presentationDragIndicator(.visible)
-        }
-    }
-}
-
-/// The .kachat screen's claims button, next to "How it works": the names being claimed right
-/// now (and finished ones not yet dismissed), with a count. Hidden when there are none.
-struct KachatClaimsButton: View {
-    @ObservedObject private var actions = KachatNamesActions.shared
-    @State private var showList = false
-
-    var body: some View {
-        let open = actions.openRegistrations
-        if KachatNamesService.isLaunched, !open.isEmpty {
-            Button {
-                showList = true
-            } label: {
-                Image(systemName: "hourglass")
-                    .overlay(alignment: .topTrailing) {
-                        Text(verbatim: "\(open.count)")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 4)
-                            .frame(minWidth: 15, minHeight: 15)
-                            .background(Capsule().fill(Color.accentColor))
-                            .offset(x: 9, y: -8)
-                    }
-            }
-            .accessibilityLabel(Text("Names being claimed"))
-            .sheet(isPresented: $showList) { KachatClaimsListSheet() }
-        }
-    }
-}
-
-/// Every open claim with its progress: the list behind `KachatClaimsButton`.
-struct KachatClaimsListSheet: View {
-    @ObservedObject private var actions = KachatNamesActions.shared
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(spacing: 14) {
-                    ForEach(actions.openRegistrations) { registration in
-                        KachatRegistrationCard(registration: registration)
-                    }
-                    Text("Keep KaPlay open: the name is registered about a minute after the hidden commit confirms. If you leave, it picks up where it left off when you come back.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 24)
-                }
-                .padding(.vertical, 16)
-            }
-            .background(Color(.systemGroupedBackground))
-            .navigationTitle("Claiming")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
-            }
-            // the last one dismissed: nothing left to show
-            .onChange(of: actions.openRegistrations.isEmpty) { empty in if empty { dismiss() } }
-        }
-        .presentationDetents([.medium, .large])
-        .presentationDragIndicator(.visible)
-    }
-}
-
 struct KachatRegistrationCard: View {
     let registration: KachatNames.PendingRegistration
     @ObservedObject private var actions = KachatNamesActions.shared
@@ -981,154 +597,6 @@ struct KachatRegistrationCard: View {
 
 // MARK: - Hub: pages
 
-struct KachatLiveMarketPage: View {
-    @ObservedObject var model: KachatHubModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            KachatLiveSectionHeader(title: "For sale", detail: nil)
-            if model.listings.isEmpty {
-                KachatLiveEmpty(text: model.loaded ? "No names are listed right now." : nil)
-            } else {
-                KachatNameGrid {
-                    ForEach(model.listings) { n in
-                        NavigationLink { KachatListingDetailView(info: n) } label: {
-                            KachatNameTile(name: n.name) {
-                                Text(verbatim: KaspaUnit.amount(n.price))
-                                    .font(.subheadline.weight(.semibold))
-                                    .foregroundColor(.primary)
-                                    .lineLimit(1)
-                                    .minimumScaleFactor(0.7)
-                                // what a buyer gets: the paid time left, flagged when it's short
-                                Text(String(format: AppLocalization.string("Expires %@"), KachatNamesActions.dayString(n.expiresAt)))
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                                    .multilineTextAlignment(.center)
-                                if n.expiresAt - (KachatLive.params?.expiresSoonMs ?? 30 * 86_400_000) < KachatNames.nowMs() {
-                                    Text("Expires soon")
-                                        .font(.caption2.weight(.bold))
-                                        .foregroundColor(.orange)
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 2)
-                                        .background(Capsule().fill(Color.orange.opacity(0.15)))
-                                }
-                            }
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-        }
-        .padding(.top, 4)
-    }
-}
-
-/// Names that expired and are still in their grace period: only their owner can renew them, and
-/// each counts down to the moment it is released to Available - for anyone waiting to claim a
-/// name they want.
-struct KachatLiveExpiredPage: View {
-    @ObservedObject var model: KachatHubModel
-    @State private var openName: KachatNames.NameInfo?
-    @State private var reloadedFor: Set<String> = []
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            KachatLiveSectionHeader(title: "Expired", detail: nil)
-            if model.grace.isEmpty {
-                KachatLiveEmpty(text: model.loaded ? "No names are in their grace period right now." : nil)
-            } else {
-                KachatNameGrid {
-                    ForEach(model.grace) { n in
-                        NavigationLink { KachatListingDetailView(info: n) } label: {
-                            KachatNameTile(name: n.name) {
-                                TimelineView(.periodic(from: .now, by: 1)) { context in
-                                    let releaseAt = n.expiresAt + (KachatLive.params?.graceMs ?? 0)
-                                    let left = releaseAt - Int64(context.date.timeIntervalSince1970 * 1000)
-                                    VStack(spacing: 2) {
-                                        Text("Released in")
-                                            .font(.caption2)
-                                            .foregroundColor(.secondary)
-                                        Text(verbatim: KachatLive.countdown(left))
-                                            .font(.subheadline.weight(.bold).monospacedDigit())
-                                            .foregroundColor(.orange)
-                                    }
-                                    .onChange(of: left <= 0) { released in
-                                        // released: it moves to Available
-                                        if released, !reloadedFor.contains(n.id) {
-                                            reloadedFor.insert(n.id)
-                                            Task { await model.reload() }
-                                        }
-                                    }
-                                }
-                                if let price = KachatLive.price(n.name) {
-                                    Text(verbatim: KaspaUnit.amount(price))
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                        .lineLimit(1)
-                                        .minimumScaleFactor(0.7)
-                                }
-                            }
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-        }
-        .padding(.top, 4)
-    }
-}
-
-/// Names that expired and stayed unrenewed through the grace period: back on the market at the
-/// normal price. Claim frees the old record and registers it in one go (the progress half sheet).
-struct KachatLiveAvailablePage: View {
-    @ObservedObject var model: KachatHubModel
-    @State private var claimTarget: KachatClaimTarget?
-    /// The tile tapped (outside its Claim button): its detail opens.
-    @State private var openName: KachatNames.NameInfo?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            KachatLiveSectionHeader(title: "Available", detail: nil)
-            if model.lapsed.isEmpty {
-                KachatLiveEmpty(text: model.loaded ? "No expired names right now." : nil)
-            } else {
-                // a tap gesture, not a NavigationLink, so the Claim button inside keeps its tap
-                KachatNameGrid {
-                    ForEach(model.lapsed) { n in
-                        KachatNameTile(name: n.name) {
-                            // what claiming it costs: the price for its length
-                            if let price = KachatLive.price(n.name) {
-                                Text(verbatim: KaspaUnit.amount(price))
-                                    .font(.subheadline.weight(.semibold))
-                                    .foregroundColor(.primary)
-                                    .lineLimit(1)
-                                    .minimumScaleFactor(0.7)
-                            }
-                            Button("Claim") { claim(n) }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
-                        }
-                        .onTapGesture { openName = n }
-                        .accessibilityAddTraits(.isButton)
-                    }
-                }
-            }
-        }
-        .padding(.top, 4)
-        .sheet(item: $claimTarget) { KachatClaimSheet(target: $0) }
-        .navigationDestination(isPresented: Binding(get: { openName != nil }, set: { if !$0 { openName = nil } })) {
-            if let openName { KachatListingDetailView(info: openName) }
-        }
-    }
-
-    private func claim(_ n: KachatNames.NameInfo) {
-        Task { @MainActor in
-            guard let gap = try? await KachatNamesRegistry.shared.claimGap(for: n) else { return }
-            claimTarget = KachatClaimTarget(name: n.name, gap: gap)
-        }
-    }
-}
-
 /// The offers this wallet made, with Withdraw (and Refund once expired). Shown in Profile >
 /// Your Domains > .kachat, under your names.
 struct KachatMyOffersSection: View {
@@ -1153,29 +621,6 @@ struct KachatMyOffersSection: View {
     }
 }
 
-struct KachatLiveActivityPage: View {
-    @ObservedObject var model: KachatHubModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            KachatLiveSectionHeader(title: "Recent activity", detail: "Every claim, renewal, listing, sale, offer, transfer and reclaim across the registry.")
-            if model.activity.isEmpty {
-                KachatLiveEmpty(text: model.loaded ? "Nothing yet." : nil)
-            } else {
-                VStack(spacing: 0) {
-                    ForEach(Array(model.activity.prefix(100).enumerated()), id: \.element.id) { index, e in
-                        KachatEventRow(event: e, showName: true)
-                        if index < min(model.activity.count, 100) - 1 { Divider().padding(.leading, 56) }
-                    }
-                }
-                .kachatGlass()
-                .padding(.horizontal, 16)
-            }
-        }
-        .padding(.top, 4)
-    }
-}
-
 struct KachatLiveSectionHeader: View {
     let title: LocalizedStringKey
     let detail: LocalizedStringKey?
@@ -1187,25 +632,6 @@ struct KachatLiveSectionHeader: View {
                 Text(detail).font(.caption).foregroundColor(.secondary)
             }
         }
-        .padding(.horizontal, 16)
-    }
-}
-
-struct KachatLiveEmpty: View {
-    /// nil while loading
-    let text: LocalizedStringKey?
-
-    var body: some View {
-        Group {
-            if let text {
-                Text(text).font(.subheadline).foregroundColor(.secondary)
-            } else {
-                ProgressView()
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 18)
-        .kachatGlass()
         .padding(.horizontal, 16)
     }
 }
@@ -2478,7 +1904,7 @@ struct KachatLiveNameDetail: View {
     @ObservedObject private var actions = KachatNamesActions.shared
 
     private enum Sheet: Identifiable {
-        case buy, offer, extend, renew, list, delist, transfer, release
+        case extend, renew, transfer, release
         var id: Int { hashValue }
     }
 
@@ -2686,21 +2112,9 @@ struct KachatLiveNameDetail: View {
                 }
                 // Every owner action lives in one half sheet of tiles.
                 actionButton("Manage Name", "slider.horizontal.3", prominent: status == .active) { showManage = true }
-            } else if case .kasSigner? = heldBy {
-                // Read-only: the app shows that a KasSigner address holds the name (the Owner card
-                // says which); acting on it is the device's job.
-                EmptyView()
-            } else {
-                HStack(spacing: 10) {
-                    if info.isListed && status == .active {
-                        actionButton("Buy Now", "cart", prominent: true) { sheet = .buy }
-                    }
-                    // an expired name is free to claim soon: no offers on it
-                    if status == .active {
-                        actionButton("Make an Offer", "hand.raised") { sheet = .offer }
-                    }
-                }
             }
+            // Nothing for anyone else: buying and offers are the marketplace, which KaPlay
+            // leaves out, and a KasSigner address's name is the device's to act on.
         }
         .padding(.horizontal, 16)
     }
@@ -2741,15 +2155,7 @@ struct KachatLiveNameDetail: View {
                                         icon: "arrow.clockwise", run: open(.renew)))
             }
         }
-        if info.isListed {
-            items.append(ManageItem(title: "Change Price", subtitle: "Changes the asking price.",
-                                    icon: "tag", disabled: status != .active, run: open(.list)))
-            items.append(ManageItem(title: "Delist", subtitle: "Takes the name off the market.",
-                                    icon: "tag.slash", run: open(.delist)))
-        } else {
-            items.append(ManageItem(title: "List for Sale", subtitle: "Puts the name up for sale at your price.",
-                                    icon: "tag", disabled: status != .active, run: open(.list)))
-        }
+        // No listing here: KaPlay leaves the marketplace out.
         items.append(ManageItem(title: "Transfer", subtitle: "Sends the name to another address.",
                                 icon: "arrow.left.arrow.right", run: open(.transfer)))
         // The primary name is the chatting address's identity; a name on a spending address
@@ -2935,18 +2341,8 @@ struct KachatLiveNameDetail: View {
     @ViewBuilder
     private func sheetView(_ s: Sheet) -> some View {
         switch s {
-        case .buy: KachatBuySheet(info: info)
-        case .offer: KachatOfferSheet(info: info)
         case .extend: KachatExtendSheet(info: info)
         case .renew: KachatRenewSheet(info: info)
-        case .list: KachatListSheet(info: info)
-        case .delist:
-            KachatTxSheet(
-                title: "Delist", confirmTitle: "Delist",
-                authReason: KachatLive.authReason, doneTitle: "Delisted",
-                rows: [.init(title: "Name", value: info.display), .init(title: "Listed at", value: KaspaUnit.amount(info.price))],
-                operation: .list(info, price: 0), operationKey: "delist-\(info.outpoint.index)-\(KachatNames.hex(info.outpoint.txid))"
-            )
         case .transfer: KachatTransferSheet(info: info)
         case .release:
             KachatTxSheet(
@@ -2982,8 +2378,11 @@ struct KachatLiveNameDetail: View {
         if !ownedByWallet, let ownerAddress, let id = try? await registry.identity(address: ownerAddress) {
             ownerLabel = id.label
         }
-        history = (try? await registry.history(name: info.name)) ?? []
-        offers = Self.currentOffers((try? await registry.offers(for: info.name)) ?? [], owner: info.owner, history: history)
+        // a failed read keeps what's on screen: it isn't "no history" or "no offers"
+        history = (try? await registry.history(name: info.name)) ?? history
+        if let open = try? await registry.offers(for: info.name) {
+            offers = Self.currentOffers(open, owner: info.owner, history: history)
+        }
         if !offers.isEmpty {
             await actions.refreshVirtualDaa()
             // Expired offers don't stay on your name: the owner's app (and the buyer's) send
@@ -3292,44 +2691,6 @@ private struct KachatRenewReview: View {
     }
 }
 
-struct KachatListSheet: View {
-    let info: KachatNames.NameInfo
-    @State private var priceText = ""
-    @StateObject private var fiatAmountState = KaspaFiatAmountState()
-
-    private var price: UInt64? { KaspaUnit.sompi(fromUserText: priceText).flatMap { $0 > 0 ? $0 : nil } }
-
-    var body: some View {
-        KachatTxSheet(
-            title: info.isListed ? "Change Price" : "List for Sale", confirmTitle: info.isListed ? "Change Price" : "List",
-            authReason: KachatLive.authReason, doneTitle: info.isListed ? "Price changed" : "Listed for sale",
-            footer: "Anyone can buy it at this price: the payment reaches you and the name reaches them in one transaction. Delist any time.",
-            rows: rows,
-            operation: price.map { .list(info, price: $0) }, operationKey: "list-\(price ?? 0)",
-            swipeUp: KachatSwipeUp(bar: info.isListed ? "Swipe up to Change Price" : "Swipe up to List",
-                                   labels: .transaction(done: info.isListed ? "Price changed" : "Listed for sale"),
-                                   recipient: info.display, showsAmount: false),
-            entryQuestion: info.isListed ? "What's the new price?" : "What's your price?",
-            canContinue: price != nil
-        ) {
-            KaspaKeypadAmountEntry(
-                fiatAmountState: fiatAmountState,
-                onAmountChange: { priceText = $0 },
-                showsMax: false,
-                footnote: info.isListed ? "\(AppLocalization.string("Listed at")) \(KaspaUnit.amount(info.price))" : nil,
-                onMax: {}
-            )
-        }
-    }
-
-    private var rows: [KachatTxRow] {
-        var r: [KachatTxRow] = [.init(title: "Name", value: info.display)]
-        if info.isListed { r.append(.init(title: "Listed at", value: KaspaUnit.amount(info.price))) }
-        if let price { r.append(.init(title: info.isListed ? "New price" : "Price", value: KaspaUnit.amount(price))) }
-        return r
-    }
-}
-
 struct KachatTransferSheet: View {
     let info: KachatNames.NameInfo
     @State private var input = ""
@@ -3459,6 +2820,8 @@ struct KachatLiveDomainsTab: View {
     /// the offers this wallet made (moved here from the marketplace's former My Names tab)
     @State private var myOffers: [KachatNames.OfferInfo] = []
     @State private var loaded = false
+    /// Notifications are off in iOS Settings, so `KachatNameReminders` can't set any.
+    @State private var remindersDenied = false
 
     var body: some View {
         ScrollView {
@@ -3488,6 +2851,10 @@ struct KachatLiveDomainsTab: View {
                                 .foregroundColor(.accentColor)
                             Text("No .kachat names yet")
                                 .font(.headline)
+                            Text("Claim a name in KaPay or KaChat with this account, and it shows up here.")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                                .multilineTextAlignment(.center)
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 40)
@@ -3502,6 +2869,22 @@ struct KachatLiveDomainsTab: View {
                             .buttonStyle(.plain)
                         }
                     }
+                    if remindersDenied && !names.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Renewal reminders are off")
+                                .font(.subheadline.weight(.semibold))
+                            Text("Turn on notifications for KaPlay so a name doesn't expire without a warning.")
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+                            Button("Open Settings") {
+                                if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+                            }
+                            .font(.footnote.weight(.semibold))
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(14)
+                        .kachatGlass()
+                    }
                     if !myOffers.isEmpty {
                         KachatMyOffersSection(offers: myOffers)
                             .padding(.horizontal, -16)
@@ -3515,6 +2898,7 @@ struct KachatLiveDomainsTab: View {
         .task(id: registry.revision) {
             showCachedIfNeeded()
             await load()
+            remindersDenied = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus == .denied
             // a name that lapses while this is open leaves right then
             await registry.dropLapsed(from: names) { names = $0 }
         }
@@ -3581,425 +2965,6 @@ struct KachatLiveDomainsTab: View {
 }
 
 // MARK: - Edit KaChat Profile
-
-/// Where a social link's lookup stands - the editor saves only a field whose lookup found what
-/// that field shows, so what gets saved is what was reviewed.
-enum KachatSocialLookup: Equatable {
-    case none, looking, found, empty, unreachable
-}
-
-/// One profile field's source (avatar, banner or bio) looked up on this device, showing exactly
-/// the piece other people will see.
-struct KachatSocialPreview: View {
-    let link: String
-    let kind: KachatNames.SocialSource.Kind
-    @Binding var lookup: KachatSocialLookup
-
-    @ObservedObject private var resolver = KachatSocialImageResolver.shared
-    @State private var resolved: KachatNames.SocialProfile?
-    @State private var attempt = 0
-    /// The lookup whose answer may land: a newer one (edited link, Retry) supersedes it.
-    @State private var activeKey = ""
-
-    private var source: KachatNames.SocialSource? { KachatNames.SocialSource(link: link, for: kind) }
-
-    private func piece(_ p: KachatNames.SocialProfile?) -> String? {
-        switch kind {
-        case .avatar: return p?.avatar
-        case .banner: return p?.banner
-        case .bio: return p?.bio
-        }
-    }
-
-    var body: some View {
-        // A VStack, not a Group: a Group hands its modifiers to each child, so `.task` below
-        // would belong to whichever child shows - and switching from the spinner to the result
-        // would cancel it and start the lookup again, endlessly. The VStack is one stable view.
-        VStack(alignment: .leading, spacing: 0) {
-            if let source {
-                switch lookup {
-                case .none, .looking:
-                    HStack(spacing: 10) {
-                        ProgressView()
-                        Text("Looking up the profile...").font(.footnote).foregroundColor(.secondary)
-                    }
-                case .found:
-                    found(source)
-                case .empty:
-                    note("person.crop.circle.badge.exclamationmark", missingText(source.platform))
-                case .unreachable:
-                    HStack(spacing: 10) {
-                        Image(systemName: "wifi.exclamationmark").foregroundColor(.secondary)
-                        Text(verbatim: String(format: AppLocalization.string("Couldn't reach %@."), source.platform.displayName))
-                            .font(.footnote).foregroundColor(.secondary)
-                        Spacer()
-                        Button("Retry") { attempt += 1 }.font(.footnote.weight(.semibold))
-                    }
-                }
-            }
-        }
-        // Debounced: one lookup once typing pauses. `attempt` reruns it for Retry. Whatever
-        // happens - cancelled, restarted, failed - the state always lands somewhere final.
-        .task(id: "\(source?.link ?? "")#\(attempt)") {
-            let myKey = "\(source?.link ?? "")#\(attempt)"
-            activeKey = myKey
-            guard let source else { resolved = nil; lookup = .none; return }
-            // The row scrolled back into view (a Form rebuilds its rows): the answer this
-            // screen already got shows at once - no debounce, no "Looking up" flash, no
-            // refetch. Retry (attempt > 0) still runs the full lookup.
-            if attempt == 0, let cached = resolver.cachedProfile(source) {
-                resolved = cached
-                lookup = piece(cached) == nil ? .empty : .found
-                // Still re-checked quietly (the resolver's own 5-minute freshness): a profile
-                // changed on the platform lands here without the flash.
-                let result = await resolver.resolve(source)
-                guard activeKey == myKey, case .answered(let fresh) = result, fresh != cached else { return }
-                resolved = fresh
-                lookup = piece(fresh) == nil ? .empty : .found
-                return
-            }
-            lookup = .looking
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            guard activeKey == myKey else { return }
-            let result = await resolver.resolve(source)
-            guard activeKey == myKey else { return }
-            resolved = result.profile
-            switch result {
-            case .answered(let p):
-                lookup = piece(p) == nil ? .empty : .found
-            case .unreachable(let cached):
-                lookup = piece(cached) == nil ? .unreachable : .found
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func found(_ source: KachatNames.SocialSource) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            switch kind {
-            case .avatar:
-                KNSAvatarView(avatarURLString: resolved?.avatar, fallbackText: "", size: 64)
-            case .banner:
-                KNSBannerImageView(bannerURLString: resolved?.banner, height: 90, cornerRadius: 8, fitsWidth: true)
-            case .bio:
-                Text(verbatim: resolved?.bio ?? "").font(.subheadline)
-            }
-            Text(verbatim: String(format: AppLocalization.string("From %@"), source.platform.displayName))
-                .font(.caption.weight(.semibold))
-                .foregroundColor(.secondary)
-        }
-        .padding(.vertical, 4)
-    }
-
-    private func missingText(_ platform: KachatNames.SocialSource.Platform) -> String {
-        let key: String
-        switch kind {
-        case .avatar: key = "No avatar on this %@ profile."
-        case .banner: key = "No banner on this %@ profile."
-        case .bio: key = "No bio on this %@ profile."
-        }
-        return String(format: AppLocalization.string(key), platform.displayName)
-    }
-
-    private func note(_ icon: String, _ text: String) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: icon).foregroundColor(.secondary)
-            Text(verbatim: text).font(.footnote).foregroundColor(.secondary)
-        }
-    }
-}
-
-/// One profile field's source as the editor holds it: the platform picked and the handle typed.
-struct KachatSourceInput: Equatable {
-    var platform: KachatNames.SocialSource.Platform = .x
-    var handle = ""
-
-    init(platform: KachatNames.SocialSource.Platform = .x, handle: String = "") {
-        self.platform = platform
-        self.handle = handle
-    }
-
-    /// From a stored profile link.
-    init(stored link: String?, _ kind: KachatNames.SocialSource.Kind) {
-        if let s = KachatNames.SocialSource(link: link ?? "", for: kind) {
-            self.init(platform: s.platform, handle: s.displayHandle)
-        } else {
-            self.init()
-        }
-    }
-
-    var isEmpty: Bool { handle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-
-    func source(_ kind: KachatNames.SocialSource.Kind) -> KachatNames.SocialSource? {
-        KachatNames.SocialSource.from(platform: platform, handle: handle, for: kind)
-    }
-
-    func isBad(_ kind: KachatNames.SocialSource.Kind) -> Bool { !isEmpty && source(kind) == nil }
-
-    /// The source when the handle field holds a whole pasted link (rather than a handle).
-    func pastedSource(_ kind: KachatNames.SocialSource.Kind) -> KachatNames.SocialSource? {
-        let t = handle.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard t.lowercased().hasPrefix("http") || (t.contains(".") && t.contains("/")) else { return nil }
-        return source(kind)
-    }
-}
-
-/// The address profile (KACHAT_NAMES.md section 7): where the avatar, banner and bio come from
-/// (a social profile link each - they can be different accounts), a Linktree link, and which of
-/// your names labels you - written as a `kchat:1:profile:` self-transfer. No free text and no
-/// uploads: what shows comes from a platform that moderates it.
-struct KachatLiveProfileEditor: View {
-    @Environment(\.dismiss) private var dismiss
-    @ObservedObject private var registry = KachatNamesRegistry.shared
-
-    /// Each piece's source: a platform from the picker plus the handle typed after its prefix.
-    @State private var avatarIn = KachatSourceInput()
-    @State private var bannerIn = KachatSourceInput()
-    @State private var bioIn = KachatSourceInput()
-    @State private var avatarLookup: KachatSocialLookup = .none
-    @State private var bannerLookup: KachatSocialLookup = .none
-    @State private var bioLookup: KachatSocialLookup = .none
-    @State private var linktree = ""
-    @State private var primary = ""
-    @State private var activeNames: [String] = []
-    @State private var loaded = false
-    @State private var showSave = false
-    @State private var showClear = false
-
-    private typealias Kind = KachatNames.SocialSource.Kind
-
-    private var profile: KachatNames.Profile {
-        var p = KachatNames.Profile()
-        p.avatar = avatarIn.source(.avatar)?.link
-        p.banner = bannerIn.source(.banner)?.link
-        p.bio = bioIn.source(.bio)?.link
-        p.linktree = KachatNames.Profile.linktreeLink(username: linktree)
-        p.primaryName = primary.isEmpty ? nil : primary
-        return p.sanitized()
-    }
-
-    /// A filled-in field whose lookup hasn't found what it shows (still looking, unreachable, or
-    /// nothing there). It doesn't block saving - a social site being slow or unreachable from
-    /// this phone must never stop a profile (or a primary name) from saving; the link is saved
-    /// as entered and every viewer's app looks it up itself. The editor just says so.
-    private func notReviewed(_ input: KachatSourceInput, _ lookup: KachatSocialLookup) -> Bool {
-        !input.isEmpty && lookup != .found
-    }
-
-    private var hasUncheckedLinks: Bool {
-        notReviewed(avatarIn, avatarLookup) || notReviewed(bannerIn, bannerLookup) || notReviewed(bioIn, bioLookup)
-    }
-
-    /// Only a malformed handle or Linktree username stops a save.
-    private var blocked: Bool {
-        avatarIn.isBad(.avatar) || bannerIn.isBad(.banner) || bioIn.isBad(.bio) || badLinktree
-    }
-
-    /// The Linktree field holds just the username (`linktr.ee/` is shown in front of it).
-    private var badLinktree: Bool {
-        let t = linktree.trimmingCharacters(in: .whitespacesAndNewlines)
-        return !t.isEmpty && KachatNames.Profile.linktreeLink(username: t) == nil
-    }
-
-    /// Once one field's account is found, the empty fields take the same account where its
-    /// platform can fill them - one handle sets up the whole profile, and each stays editable.
-    private func fillEmpty(from input: KachatSourceInput) {
-        let fits = { (kind: Kind) in KachatNames.SocialSource.Platform.choices(for: kind).contains(input.platform) }
-        if avatarIn.isEmpty, fits(.avatar) { avatarIn = input }
-        if bannerIn.isEmpty, fits(.banner) { bannerIn = input }
-        if bioIn.isEmpty, fits(.bio) { bioIn = input }
-    }
-
-    /// Platform picker, the handle after the platform's prefix, and the preview of what it shows.
-    private func sourceField(_ input: Binding<KachatSourceInput>, _ kind: Kind, _ lookup: Binding<KachatSocialLookup>) -> some View {
-        Group {
-            Picker("Account on", selection: input.platform) {
-                ForEach(KachatNames.SocialSource.Platform.choices(for: kind), id: \.self) { p in
-                    Text(verbatim: p.displayName).tag(p)
-                }
-            }
-            .pickerStyle(.menu)
-            HStack(spacing: 0) {
-                Text(verbatim: input.wrappedValue.platform.prefix).foregroundColor(.secondary)
-                TextField(input.wrappedValue.platform == .discord ? LocalizedStringKey("invite") : LocalizedStringKey("handle"), text: input.handle)
-                    .textInputAutocapitalization(.never).autocorrectionDisabled()
-                    .onChange(of: input.wrappedValue.handle) { _ in
-                        // A whole pasted link: switch the picker to its platform, keep the handle.
-                        if let pasted = input.wrappedValue.pastedSource(kind) {
-                            input.wrappedValue = KachatSourceInput(platform: pasted.platform, handle: pasted.displayHandle)
-                        }
-                    }
-                // One tap empties the field; saving then writes the profile without it.
-                if !input.wrappedValue.handle.isEmpty {
-                    Button {
-                        input.wrappedValue = KachatSourceInput()
-                        lookup.wrappedValue = .none
-                    } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundColor(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(Text("Clear"))
-                }
-            }
-            // Only while the handle names an account: no empty row, and the lookup starts when it
-            // appears.
-            if let link = input.wrappedValue.source(kind)?.link {
-                KachatSocialPreview(link: link, kind: kind, lookup: lookup)
-            }
-        }
-    }
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    Label {
-                        Text("Your profile belongs to your address, not to a name: it stays the same when you buy, sell or let a name go.")
-                            .font(.subheadline)
-                    } icon: {
-                        Image(systemName: "person.text.rectangle").foregroundColor(.accentColor)
-                    }
-                } footer: {
-                    Text("Each piece comes from a social profile you link, exactly as that platform shows it, so its moderation applies here too. You can use one account for all three, or mix them.")
-                }
-                Section {
-                    sourceField($avatarIn, .avatar, $avatarLookup)
-                } header: { Text("Avatar") } footer: {
-                    if avatarIn.isBad(.avatar) { invalidHandleNote }
-                }
-                Section {
-                    sourceField($bannerIn, .banner, $bannerLookup)
-                } header: { Text("Banner") } footer: {
-                    if bannerIn.isBad(.banner) { invalidHandleNote }
-                }
-                Section {
-                    sourceField($bioIn, .bio, $bioLookup)
-                } header: { Text("Bio") } footer: {
-                    if bioIn.isBad(.bio) { invalidHandleNote }
-                }
-                Section {
-                    HStack(spacing: 0) {
-                        Text(verbatim: "linktr.ee/").foregroundColor(.secondary)
-                        TextField("username", text: $linktree)
-                            .textInputAutocapitalization(.never).autocorrectionDisabled()
-                        if !linktree.isEmpty {
-                            Button {
-                                linktree = ""
-                            } label: {
-                                Image(systemName: "xmark.circle.fill").foregroundColor(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel(Text("Clear"))
-                        }
-                    }
-                } header: { Text("Links") } footer: {
-                    if badLinktree {
-                        Text("Enter your Linktree username: letters, numbers, dots, dashes or underscores.").foregroundColor(.red)
-                    } else {
-                        Text("Add your Linktree to point people to your other accounts and websites.")
-                    }
-                }
-                Section {
-                    // The primary name needs the registry: until it launches on this network
-                    // (mainnet) there's no name to pick, so the profile saves without one.
-                    if KachatNamesService.isLaunched {
-                        Picker("Primary name", selection: $primary) {
-                            Text("None").tag("")
-                            ForEach(activeNames, id: \.self) { n in Text(verbatim: "\(n).kachat").tag(n) }
-                        }
-                    } else {
-                        HStack {
-                            Text("Primary name")
-                            Spacer()
-                            Text("Coming soon").foregroundColor(.secondary)
-                        }
-                    }
-                } header: {
-                    Text(".kachat Name")
-                } footer: {
-                    if KachatNamesService.isLaunched {
-                        Text("KaChat shows you by your primary name while you own it and it's active; otherwise by your oldest active name, or your address.")
-                    } else {
-                        Text(".kachat names aren't on mainnet yet. Your avatar, banner, bio and links save now; you can pick a primary name once names launch.")
-                    }
-                }
-                Section {
-                    Button {
-                        showSave = true
-                    } label: {
-                        HStack { Spacer(); Text("Save Profile").font(.headline); Spacer() }
-                    }
-                    // Saves on every network: a profile is a self-send, with no registry behind it.
-                    .disabled(!loaded || blocked || !KachatNamesService.profilesEnabled)
-                } footer: {
-                    VStack(alignment: .leading, spacing: 6) {
-                        if hasUncheckedLinks {
-                            Text("Some links couldn't be checked from this phone right now. They're saved as entered, and people's apps load them when they can.")
-                        }
-                        Text("Saving writes your profile to the chain from your address to itself, for a network fee. Profiles are public.")
-                    }
-                }
-                Section {
-                    Button(role: .destructive) {
-                        showClear = true
-                    } label: {
-                        HStack { Spacer(); Text("Clear Profile").font(.headline); Spacer() }
-                    }
-                    // Same gate as saving: a clear IS a save, of the empty record.
-                    .disabled(!loaded || !KachatNamesService.profilesEnabled)
-                } footer: {
-                    Text("Clearing writes an empty profile to the chain from your address to itself, for a network fee, so KaChat shows nothing for your address again.")
-                }
-            }
-            .sheet(isPresented: $showSave) {
-                KachatProfileSaveSheet(title: "Save Profile", confirmTitle: "Save Profile", doneTitle: "Profile saved",
-                                       makeProfile: { profile }, onSaved: { dismiss() })
-            }
-            // The newest record is the whole profile, so the empty record IS "this address has
-            // nothing": the indexer and every app show nothing for it from then on.
-            .sheet(isPresented: $showClear) {
-                KachatProfileSaveSheet(title: "Clear Profile", confirmTitle: "Clear Profile", doneTitle: "Profile cleared",
-                                       makeProfile: { KachatNames.Profile() }, onSaved: { dismiss() })
-            }
-            .onChange(of: avatarLookup) { v in if v == .found { fillEmpty(from: avatarIn) } }
-            .onChange(of: bannerLookup) { v in if v == .found { fillEmpty(from: bannerIn) } }
-            .onChange(of: bioLookup) { v in if v == .found { fillEmpty(from: bioIn) } }
-            .navigationTitle("Edit KaChat Profile")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
-                }
-            }
-            .task { await load() }
-        }
-    }
-
-    private var invalidHandleNote: some View {
-        Text("That doesn't look like a handle on this platform.").foregroundColor(.red)
-    }
-
-    private func load() async {
-        guard let address = KachatNamesActions.shared.myAddress else { loaded = true; return }
-        await registry.refreshIfStale()
-        // start from the newest profile, wherever it was saved (another device included)
-        await registry.syncOwnProfile(address: address)
-        var p = registry.ownProfile(for: address)?.profile
-        if p == nil { p = try? await registry.identity(address: address).profile }
-        if let p {
-            avatarIn = KachatSourceInput(stored: p.avatar, .avatar)
-            bannerIn = KachatSourceInput(stored: p.banner, .banner)
-            bioIn = KachatSourceInput(stored: p.bio, .bio)
-            linktree = KachatNames.Profile.linktreeUsername(p.linktree)
-        }
-        if let key = KachatNamesRegistry.keyOf(address) {
-            activeNames = ((try? await registry.names(owner: key, includeInactive: false)) ?? []).map(\.name)
-        }
-        if let pn = p?.primaryName, activeNames.contains(pn) { primary = pn }
-        loaded = true
-    }
-
-}
 
 /// Review before a profile record goes out - what will be saved, the network fee, the main
 /// address's balance before and after - the same confirmation every other name action shows.
@@ -4229,7 +3194,8 @@ final class KachatExpiredNamesModel: ObservableObject {
         await registry.refreshIfStale(maxAge: 300)
         let grace = registry.graceMs
         let now = KachatNames.nowMs()
-        let owned = (try? await registry.names(owner: me, includeInactive: true)) ?? []
+        // a failed read keeps the banner as it is
+        guard let owned = try? await registry.names(owner: me, includeInactive: true) else { return }
         let inGrace = owned.filter { $0.status(graceMs: grace, nowMs: now) == .grace }.sorted { $0.expiresAt < $1.expiresAt }
         // assigned only on a change: each assignment redraws the whole Profile scroll
         if inGrace != expired { expired = inGrace }

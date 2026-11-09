@@ -1773,3 +1773,4 @@
 "Dislikes" = "عدم الإعجاب";
 "Reposts" = "إعادات النشر";
 "Quotes" = "الاقتباسات";
+"Couldn't look up %@ right now. Try again in a moment." = "تعذّر البحث في %@ الآن. حاول مرة أخرى بعد قليل.";

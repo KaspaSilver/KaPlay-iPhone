@@ -1,7 +1,7 @@
 # Online Chess (5.1): 1v1 and tournaments
 
 Public 1v1 games and eight-player single-elimination tournaments where **every move is a Kaspa
-transaction**. Lives in Kaspa Hub > **Chess Online**: choose 1v1 or Tournaments, each with its own Active, Finished and Leaderboard tabs. This document is the protocol (Android and desktop replicate it
+transaction**. In KaPlay it lives in Play > **Chess**: choose 1v1 or Tournaments, each with its own Active and Finished games; the boards are on the Leaderboard tab. This document is the protocol (Android and desktop replicate it
 byte for byte) and the indexer handoff for the leaderboard.
 
 ## 1. How it works
@@ -46,7 +46,10 @@ Example: `{"type":"chess_t","v":1,"t":"7c1e…","a":"move","g":"1-0","n":1,"from
   `join` to a room opens it, whichever number it names, and the app shows "Public tournament #N"
   with its seats at all times. Which room is taking players is the client's choice, the same
   rule on every platform: **the lowest-numbered room still open (not full); when none is, one
-  past the highest room the phone knows**. Two things keep every phone's view the same: the
+  past the highest room the phone knows**. Anyone can post a join naming any room, so the iPhone
+  ignores some when choosing (it still plays them): only a canonical id counts (`duel-01` is not
+  room 1), nothing past room 1,000,000,000, and of the runs of numbers at most 1,000 apart only
+  the longest, so a stray `duel-900000` can't move the queue. Two things keep every phone's view the same: the
   arena keeps the indexer's full 30-day window locally (never the short default retention -
   a phone that forgot yesterday's rooms overnight offered a room number the others had moved
   past), and a phone pulls the arena's newest rows from the indexer right before it picks a
@@ -112,8 +115,9 @@ Example: `{"type":"chess_t","v":1,"t":"7c1e…","a":"move","g":"1-0","n":1,"from
 - **Flagging:** when the side to move's remaining time reaches zero, the *opponent* posts
   `claim`. Everyone accepts it if, at the claim's block time, the mover's clock had indeed
   run out (the same allowance applies: elapsed − allowance ≥ remaining). A claim that
-  arrives early is ignored. (The app posts the claim itself the moment
-  it sees the opponent flagged.) A player may also resign.
+  arrives early is ignored. (The app posts the claim itself the moment it sees the opponent
+  flagged, and tries again at most four times per flag if it doesn't take; after that the board's
+  Claim win is still there.) A player may also resign.
 - **Game over:** checkmate (mover wins), resignation, time claim, or a draw (stalemate,
   insufficient material, fifty moves, threefold repetition). Knockout needs a winner, so a
   **draw goes to the player with more clock left**; if equal, to black.
@@ -207,7 +211,8 @@ by move: their transactions are how the phones talk, and there is no referee to 
 - Channel **`#chess-bots`**, not the arena. Payloads are `kchat:1:bcast:chess-bots:<json>`.
 - Every finished game is stamped: a win, a loss, a draw or a resignation. A game abandoned by
   closing the app is not, and costs nothing.
-- A failed send holds until Retry. A level unlocks on the phone the moment it is won, stamped or
+- A failed send holds until Retry. One a node may have taken without answering says the stamp may
+  have gone through, with no Retry, so a game is never stamped twice. A level unlocks on the phone the moment it is won, stamped or
   not; only a stamped win counts on the leaderboard.
 
 | Field | Meaning |

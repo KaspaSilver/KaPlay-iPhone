@@ -359,10 +359,12 @@ struct PaymentRequestSummary: View {
             Divider().padding(.vertical, 4)
 
             if let creator = request.creator {
-                // Who made it - checked against the signature in the link when it was opened.
-                Label("Requested by", systemImage: "checkmark.seal.fill")
+                // Who made it. The signature in the link was checked when it was opened, but it
+                // covers the address only: the name on the card comes from the indexer or the KNS
+                // API, so no green check sits over it.
+                Text("Requested by")
                     .font(.caption.weight(.semibold))
-                    .foregroundColor(.green)
+                    .foregroundColor(.secondary)
                 AddressResolutionCard(address: creator)
                 if creator.lowercased() != request.address.lowercased() {
                     Text("Signed by their chatting address. The payment goes to the address above.")

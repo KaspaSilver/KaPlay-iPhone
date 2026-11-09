@@ -42,15 +42,6 @@ final class AccountBackupStatus: ObservableObject {
         UserDefaults.standard.set(confirmedAt, forKey: Self.confirmedKey)
     }
 
-    /// The same account now lives at another address, after its chatting address changed.
-    func moveStatus(from oldAddress: String, to newAddress: String) {
-        if isPending(oldAddress) { markPending(newAddress) }
-        if let stamp = confirmedAt[oldAddress] {
-            for variant in WalletManager.accountAddressVariants(newAddress) { confirmedAt[variant] = stamp }
-        }
-        forget(oldAddress)
-    }
-
     /// The account is gone from this device.
     func forget(_ address: String) {
         markDone(address)

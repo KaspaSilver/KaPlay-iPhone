@@ -16,7 +16,7 @@ import P256K
 /// recovery).
 ///
 /// Reconstructed after this file's original implementation was accidentally lost to an
-/// uncommitted-work-discarding `git checkout` earlier in development (see conversation) -
+/// uncommitted-work-discarding `git checkout` earlier in development -
 /// rebuilt from every call site's exact usage, cross-checked against `Wallet`'s own
 /// `spendingAddressIndex`/`maxSpendingAddressIndex`/`effective*` fields (which survived, since
 /// they live in Models.swift, a file the bad checkout never touched) rather than guessed from
@@ -586,8 +586,11 @@ extension WalletManager {
         // Rule 1: the pointer from last time, while it is still untouched - and quantum. A
         // legacy pointer, even unused, carries its key in the address itself (P2PK), so the QR
         // moves to the quantum chain the first time it is opened after the upgrade.
+        // Asked of the network each time, not this session's memory of "unused": KaPlay gets no
+        // event when a spending address is paid. An address that has spent is out whatever it says.
         if let index = receiveAddressIndex, Self.isQuantumIndex(index), let address = spendingAddress(at: index),
-           await ChatService.shared.spendingAddressUsedState(address) != true {
+           !isQuantumAddressSpentLocally(address),
+           await ChatService.shared.spendingAddressUsedState(address, ignoringSessionCache: true) != true {
             chosen = (index, address)
         } else {
             // Rule 2: the lowest quantum slot never used (recycling a hidden unused one), else a
@@ -595,7 +598,9 @@ extension WalletManager {
             let index = await lowestUnusedQuantumAddress()
             guard currentWallet?.publicAddress == owner else { return nil }
             guard let address = spendingAddress(at: index) else { return currentSpendingAddress() }
-            receiveAddressIndex = index
+            // Only an address really shown is remembered. A warm-up's answer sits past the chain's
+            // end, where the next send's change or Request's Fresh Address would land on it too.
+            if revealing { receiveAddressIndex = index }
             chosen = (index, address)
         }
         guard currentWallet?.publicAddress == owner else { return nil }
@@ -614,7 +619,8 @@ extension WalletManager {
             guard entry.hidden else { continue }
             if entry.isCurrent { continue }
             if entry.balanceSompi > 0 { continue }
-            if await ChatService.shared.spendingAddressUsedState(entry.address) == false {
+            if isQuantumAddressSpentLocally(entry.address) { continue }
+            if await ChatService.shared.spendingAddressUsedState(entry.address, ignoringSessionCache: true) == false {
                 return entry.index
             }
         }
@@ -942,6 +948,13 @@ extension WalletManager {
     /// with current balances. `everUsed` is left at its default (false) - callers that need it
     /// check history separately (`ChatService.hasSpendingAddressBeenUsed`), same as before.
     func getSpendingAddressList() async -> [SpendingAddressEntry] {
+        await readSpendingAddressList().entries
+    }
+
+    /// `getSpendingAddressList`, saying whether the balances were read. A failed read is unknown,
+    /// never zero: its rows carry the last known balance, and `balancesRead` is false so nothing
+    /// saves them as a fresh snapshot or shows them as today's.
+    func readSpendingAddressList() async -> (entries: [SpendingAddressEntry], balancesRead: Bool) {
         let maxIndex = maxSpendingAddressIndex
         let activeIndex = currentSpendingAddressIndex
         let hidden = hiddenSpendingIndices
@@ -965,13 +978,19 @@ extension WalletManager {
             }
         }
 
-        let allUtxos = (try? await NodePoolService.shared.getUtxosByAddresses(Array(addressesByIndex.values))) ?? []
         var balanceByAddress: [String: UInt64] = [:]
-        for utxo in allUtxos {
-            balanceByAddress[utxo.address, default: 0] += utxo.amount
+        let allUtxos = try? await NodePoolService.shared.getUtxosByAddresses(Array(addressesByIndex.values))
+        if let allUtxos {
+            for utxo in allUtxos {
+                balanceByAddress[utxo.address, default: 0] += utxo.amount
+            }
+        } else {
+            for entry in cachedSpendingAddressList() {
+                balanceByAddress[entry.address] = entry.balanceSompi
+            }
         }
 
-        return addressesByIndex.keys.sorted().map { index in
+        let entries = addressesByIndex.keys.sorted().map { index -> SpendingAddressEntry in
             let address = addressesByIndex[index] ?? ""
             return SpendingAddressEntry(
                 index: index,
@@ -983,6 +1002,7 @@ extension WalletManager {
                 hidden: hidden.contains(index)
             )
         }
+        return (entries, allUtxos != nil)
     }
 
     /// Where a discovery scan currently is, so a UI can count up instead of showing an unmoving

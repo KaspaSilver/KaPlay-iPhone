@@ -186,6 +186,10 @@ struct ChessTournamentGameView: View {
         // Header, the other side's clock chip, the board as large as the screen allows, our
         // clock chip.
         VStack(spacing: 10) {
+            if service.arenaServerDown {
+                ChessServerDownNote(text: "Chess server unreachable. Moves are coming from the network, and the board may be a moment behind.")
+                    .padding(.horizontal)
+            }
             header(game)
             clockChip(game, color: flipped ? .white : .black)
                 .padding(.horizontal)

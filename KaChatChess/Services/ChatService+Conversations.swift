@@ -9,30 +9,6 @@ import Intents
 // MARK: - Conversation state, message sending, handshake sending, fee estimation
 
 extension ChatService {
-    func enterConversation(for address: String) {
-        activeConversationAddress = address
-        AppLog.log("[ChatService] Entered conversation for %@", String(address.suffix(12)))
-        startActiveChatPoll(for: address)
-        loadFullHistory(for: address)
-        // Straight away, not on the poll's first tick two seconds out: a chat opened from a
-        // tapped notification showed its stored history and nothing newer until the reader
-        // left and came back. The tapped push's own message lands through the push handler;
-        // everything else that arrived while the app was away comes from this fetch.
-        Task { [weak self] in
-            guard let self, self.activeConversationAddress == address else { return }
-            await self.fetchNewMessages(forActiveOnly: address)
-        }
-        loadReactions(for: address)
-        // Keep the Share Extension's "Recent" list fresh: opening a chat counts as touching it.
-        let alias = ContactsManager.shared.displayName(for: address)
-        SharedDataManager.recordRecentConversation(address: address, alias: alias)
-    }
-
-    /// Returns total number of stored messages using a background worker to avoid
-    /// blocking the main actor during expensive Core Data count queries.
-    func storedMessageCountAsync(for contactAddress: String) async -> Int {
-        await messageStore.countMessages(contactAddress: contactAddress)
-    }
 
     /// Async/background fetch variant that keeps Core Data page
     /// reads and decrypt work off the main actor. The final in-memory merge still happens on
@@ -51,203 +27,6 @@ extension ChatService {
     /// times over for a long chat, which is the lag right after opening one.
     private static let fullHistoryPageSize = 500
     private static let fullHistoryMergeBatch = 3_000
-
-    private func loadFullHistory(for address: String) {
-        fullHistoryLoadTask?.cancel()
-        fullHistoryLoadTask = Task { @MainActor [weak self] in
-            // Past the push transition, so the first frames of the chat are not competing.
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            guard let self, !Task.isCancelled, self.activeConversationAddress == address,
-                  !self.olderHistoryExhaustedContacts.contains(address),
-                  let key = self.messageEncryptionKey(),
-                  let index = self.conversations.firstIndex(where: { $0.contact.address == address }) else { return }
-
-            var cursor = self.oldestLoadedCursor(in: self.conversations[index])
-            var pending: [ChatMessage] = []
-            var exhausted = false
-            for _ in 0..<400 {
-                guard !Task.isCancelled, self.activeConversationAddress == address else { break }
-                let page = await self.messageStore.fetchMessagesPageAsync(
-                    contactAddress: address,
-                    decryptionKey: key,
-                    limit: Self.fullHistoryPageSize,
-                    olderThan: cursor
-                )
-                pending.append(contentsOf: page.messages)
-                guard let oldest = page.messages.min(by: Self.isMessageOrderedBefore), page.hasMore else {
-                    exhausted = true
-                    break
-                }
-                cursor = MessageStore.MessagePageCursor(
-                    blockTime: Int64(oldest.blockTime),
-                    timestamp: oldest.timestamp,
-                    txId: oldest.txId
-                )
-                if pending.count >= Self.fullHistoryMergeBatch {
-                    self.mergeOlderHistory(pending, into: address)
-                    pending.removeAll(keepingCapacity: true)
-                }
-            }
-            guard !Task.isCancelled, self.activeConversationAddress == address else { return }
-            if !pending.isEmpty { self.mergeOlderHistory(pending, into: address) }
-            if exhausted { self.olderHistoryExhaustedContacts.insert(address) }
-        }
-    }
-
-    /// One merge and one publish for a batch of older pages.
-    private func mergeOlderHistory(_ older: [ChatMessage], into address: String) {
-        guard let index = conversations.firstIndex(where: { $0.contact.address == address }) else { return }
-        var updatedConversations = conversations
-        var conversation = updatedConversations[index]
-        let merged = Self.dedupeMessages(older + conversation.messages)
-        guard merged.count != conversation.messages.count else { return }
-        conversation.messages = merged
-        updatedConversations[index] = conversation
-        conversations = updatedConversations
-    }
-
-    @discardableResult
-    func loadOlderMessagesPageAsync(for contactAddress: String, pageSize: Int) async -> Int {
-        guard pageSize > 0 else { return 0 }
-        guard !olderHistoryExhaustedContacts.contains(contactAddress) else { return 0 }
-        if let inFlight = olderHistoryPageTasks[contactAddress] {
-            return await inFlight.value
-        }
-
-        let task = Task { @MainActor [weak self] in
-            guard let self else { return 0 }
-            return await self.loadOlderMessagesPageInternal(for: contactAddress, pageSize: pageSize)
-        }
-        olderHistoryPageTasks[contactAddress] = task
-        let loaded = await task.value
-        olderHistoryPageTasks[contactAddress] = nil
-        return loaded
-    }
-
-    func loadOlderMessagesPageInternal(for contactAddress: String, pageSize: Int) async -> Int {
-        guard let index = conversations.firstIndex(where: { $0.contact.address == contactAddress }) else { return 0 }
-        guard let key = messageEncryptionKey() else { return 0 }
-        let cursor = oldestLoadedCursor(in: conversations[index])
-
-        let page = await messageStore.fetchMessagesPageAsync(
-            contactAddress: contactAddress,
-            decryptionKey: key,
-            limit: pageSize,
-            olderThan: cursor
-        )
-        guard !page.messages.isEmpty else {
-            olderHistoryExhaustedContacts.insert(contactAddress)
-            return 0
-        }
-
-        guard let conversationIndex = conversations.firstIndex(where: { $0.contact.address == contactAddress }) else {
-            return 0
-        }
-        var updatedConversations = conversations
-        var conversation = updatedConversations[conversationIndex]
-        let beforeCount = conversation.messages.count
-        conversation.messages = Self.dedupeMessages(page.messages + conversation.messages)
-        let loadedCount = max(0, conversation.messages.count - beforeCount)
-
-        if page.hasMore {
-            olderHistoryExhaustedContacts.remove(contactAddress)
-        } else {
-            olderHistoryExhaustedContacts.insert(contactAddress)
-        }
-
-        updatedConversations[conversationIndex] = conversation
-        conversations = updatedConversations
-        return loadedCount
-    }
-
-    func oldestLoadedCursor(in conversation: Conversation) -> MessageStore.MessagePageCursor? {
-        guard let oldest = conversation.messages.min(by: Self.isMessageOrderedBefore) else { return nil }
-        return MessageStore.MessagePageCursor(
-            blockTime: Int64(oldest.blockTime),
-            timestamp: oldest.timestamp,
-            txId: oldest.txId
-        )
-    }
-
-    /// Called when leaving a chat view - clears active conversation and flushes read status
-    func leaveConversation() {
-        // Flush read status for this conversation before clearing
-        if let address = activeConversationAddress {
-            ReadStatusSyncManager.shared.userLeftConversation(address)
-        }
-        activeChatPollTask?.cancel()
-        activeChatPollTask = nil
-        fullHistoryLoadTask?.cancel()
-        fullHistoryLoadTask = nil
-        if let left = activeConversationAddress { lastLeftConversationAddress = left }
-        activeConversationAddress = nil
-        AppLog.log("[ChatService] Left conversation")
-    }
-
-    /// Lets go of the history `loadFullHistory` pulled in, back to the normal in-memory window,
-    /// once the reader is really back on the chat list - called from `ChatListView.onAppear`.
-    /// Not from `leaveConversation`: a chat also "disappears" for a tab switch, the camera or a
-    /// call screen, and trimming there cut a reader scrolled far up a long chat back to the
-    /// newest messages, losing their place. Without any trim, every long chat opened in a
-    /// session stayed whole in memory, and every later `conversations` publish carried it.
-    func trimLeftConversationIfNeeded() {
-        guard let address = lastLeftConversationAddress, activeConversationAddress != address else { return }
-        lastLeftConversationAddress = nil
-        guard let index = conversations.firstIndex(where: { $0.contact.address == address }) else { return }
-        let current = conversations[index].messages
-        guard current.count > Self.inMemoryConversationWindowSize else { return }
-        let trimmed = Self.trimMessagesForMemory(current)
-        guard trimmed.count < current.count else { return }
-        var updatedConversations = conversations
-        updatedConversations[index].messages = trimmed
-        conversations = updatedConversations
-        // The store still has everything; paging back up must be allowed to find it.
-        olderHistoryExhaustedContacts.remove(address)
-    }
-
-    /// While a 1:1 chat is open and the app is foregrounded, poll the indexer for new messages
-    /// from that contact every ~2s (mirrors Android's live-UI DM loop). Idempotent with the
-    /// utxosChanged push — both dedupe by txId; this just guarantees prompt delivery for the
-    /// chat you're looking at instead of waiting on a confirmation-gated notification.
-    private func startActiveChatPoll(for address: String) {
-        activeChatPollTask?.cancel()
-        activeChatPollTask = Task { [weak self] in
-            AppLog.log("[ChatService] Active chat poll started")
-            defer { AppLog.log("[ChatService] Active chat poll stopped") }
-            while !Task.isCancelled {
-                guard let self else { return }
-                if self.activeConversationAddress != address { return }
-                if UIApplication.shared.applicationState == .active,
-                   let wallet = WalletManager.shared.currentWallet,
-                   let privateKey = WalletManager.shared.getPrivateKey() {
-                    _ = await self.fetchContextualMessagesFromContact(
-                        contactAddress: address, myAddress: wallet.publicAddress, privateKey: privateKey,
-                        reorgRewindMs: self.liveTailReorgBufferMs
-                    )
-                }
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-            }
-        }
-    }
-
-    /// Cancel the open-chat poll while the app is backgrounded. The loop already skips its fetch
-    /// when the app is not active, but it still woke every 2s to find that out; the scene-phase
-    /// handler stops it outright, the same way it stops the foreground contact sweep. The chat
-    /// stays "open" (`activeConversationAddress` is kept) so `resumeActiveChatPollIfNeeded()` can
-    /// bring the poll back on the next `.active`.
-    func stopActiveChatPollForBackground() {
-        guard let task = activeChatPollTask else { return }
-        task.cancel()
-        activeChatPollTask = nil
-    }
-
-    /// Restart the open-chat poll after `stopActiveChatPollForBackground()` if a conversation is
-    /// still open. No-op when no chat is open or the poll is already running.
-    func resumeActiveChatPollIfNeeded() {
-        guard let address = activeConversationAddress else { return }
-        if let task = activeChatPollTask, !task.isCancelled { return }
-        startActiveChatPoll(for: address)
-    }
 
     // MARK: - Foreground contact sweep (defense-in-depth for live 1:1 delivery)
 
@@ -1447,87 +1226,6 @@ extension ChatService {
         }
     }
 
-    func sendAudio(
-        to contact: Contact,
-        audioData: Data,
-        fileName: String = "audio.webm",
-        mimeType: String = "audio/webm"
-    ) async throws {
-        guard !audioData.isEmpty else {
-            throw KasiaError.networkError("Audio file is empty")
-        }
-
-        let resolvedFileName = fileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? "audio.webm"
-            : fileName
-        let resolvedMimeType = mimeType.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? "audio/webm"
-            : mimeType
-        let base64 = audioData.base64EncodedString()
-        // Deterministic field order (mimeType before the multi-MB content) so every client's
-        // head-window preview sniff can identify the media kind - see MediaFileEnvelope.
-        let jsonString = MediaFileEnvelope.json(
-            name: resolvedFileName,
-            size: audioData.count,
-            mimeType: resolvedMimeType,
-            dataUrlContent: "data:\(resolvedMimeType);base64,\(base64)"
-        )
-
-        try await sendMessage(to: contact, content: jsonString, messageType: .audio)
-    }
-
-    /// Sends a photo - same inline JSON envelope as `sendAudio`, just an image mimeType, matching
-    /// Android's `ImageMessage` (which itself reuses its `VoiceMessageContent` shape). Reuses the
-    /// `.audio` message type since rendering already keys off the JSON's `mimeType`, not this.
-    func sendImage(
-        to contact: Contact,
-        imageData: Data,
-        fileName: String = "photo.jpg",
-        mimeType: String = "image/jpeg"
-    ) async throws {
-        guard !imageData.isEmpty else {
-            throw KasiaError.networkError("Image is empty")
-        }
-
-        let resolvedFileName = fileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? "photo.jpg"
-            : fileName
-        let resolvedMimeType = mimeType.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? "image/jpeg"
-            : mimeType
-        let base64 = imageData.base64EncodedString()
-        let jsonString = MediaFileEnvelope.json(
-            name: resolvedFileName,
-            size: imageData.count,
-            mimeType: resolvedMimeType,
-            dataUrlContent: "data:\(resolvedMimeType);base64,\(base64)"
-        )
-
-        try await sendMessage(to: contact, content: jsonString, messageType: .audio)
-    }
-
-    func retryOutgoingMessage(_ message: ChatMessage, contact: Contact) async throws {
-        guard message.isOutgoing else { return }
-        switch message.messageType {
-        case .contextual, .audio:
-            try await enqueueOutgoingTxOperation {
-                try await self.sendMessageInternal(
-                    to: contact,
-                    content: message.content,
-                    messageType: message.messageType,
-                    pendingTxId: message.txId,
-                    pendingMessageId: message.id
-                )
-            }
-        case .handshake:
-            let isResponse = shouldRetryHandshakeAsResponse(for: contact.address)
-            let pendingTxId = message.txId.hasPrefix("pending_") ? message.txId : nil
-            try await sendHandshake(to: contact, isResponse: isResponse, pendingTxId: pendingTxId)
-        case .payment:
-            return
-        }
-    }
-
     func sendMessageInternal(
         to contact: Contact,
         content: String,
@@ -2136,6 +1834,7 @@ extension ChatService {
     }
 
     func prepareMessageUtxos(confirmed: [UTXO]) -> [UTXO] {
+        _ = unresolvedSends // after a relaunch, puts back the holds of "Not confirmed" sends
         let now = Date()
         pruneMessageUtxoCaches(confirmed: confirmed, now: now)
         let confirmedSpendable = confirmed
@@ -2372,41 +2071,6 @@ extension ChatService {
             } catch {
                 // Individual send handlers decide whether to reschedule or fail.
             }
-        }
-    }
-
-    /// Returns the submitted transaction id, or nil when the send was DEFERRED rather than
-    /// public chat (no confirmed inputs yet - it is retried on a timer). Discardable, since most
-    /// callers only care that it did not throw; the ones that show a sent confirmation use it.
-    @discardableResult
-    func sendPayment(
-        to contact: Contact,
-        amountSompi: UInt64,
-        note: String = "",
-        pendingTxId: String? = nil,
-        extraFeeSompi: UInt64 = 0,
-        /// Pay from this spending address instead of the primary (Chats Payment Privacy on; the
-        /// Send KAS sheet's Available pill). nil = the primary, as always.
-        sourceSpendingIndex: Int? = nil,
-        /// Coin control: spend only these coins of the source address. nil = automatic.
-        manualUtxos: [UTXO]? = nil,
-        /// A KaPosts tip: the payment names the post (KAPOSTS_INDEXER.md 5.11), always from the
-        /// chatting address.
-        tip: KaPostTip? = nil
-    ) async throws -> String? {
-        // Paying someone is reaching out to them, like writing to them.
-        acceptChat(contact.address)
-        return try await enqueueOutgoingTxOperation {
-            try await self.sendPaymentInternal(
-                to: contact,
-                amountSompi: amountSompi,
-                note: note,
-                pendingTxId: pendingTxId,
-                extraFeeSompi: extraFeeSompi,
-                sourceSpendingIndex: tip == nil ? sourceSpendingIndex : nil,
-                manualUtxos: manualUtxos,
-                tip: tip
-            )
         }
     }
 
@@ -2759,6 +2423,7 @@ extension ChatService {
         guard let privateKey = WalletManager.shared.getPrivateKey() else {
             throw KasiaError.keychainError("Could not get private key")
         }
+        try await refuseWhileSendUnresolved(to: toAddress)
 
         return try await enqueueOutgoingTxOperation {
             let rpcManager = NodePoolService.shared
@@ -2809,6 +2474,7 @@ extension ChatService {
             } catch let unknown as SendOutcomeUnknownError {
                 // It may have landed: its coins stay out of the next send and the next move.
                 self.recordPlainSend(tx, spent: spendable, txId: nil, changeScriptPubKey: nil)
+                self.holdUnknownOutcomeSend(tx, txId: unknown.txId, source: wallet.publicAddress, recipient: toAddress)
                 throw unknown
             }
             AppLog.log("[ChatService] Withdrawal submitted: \(txId) via \(endpoint)")
@@ -2995,6 +2661,7 @@ extension ChatService {
     /// Leaves out coins a transaction from this app has just spent (`reservedMessageOutpoints`):
     /// the node goes on listing them until that spend is in a block.
     func unreservedUtxos(_ utxos: [UTXO]) -> [UTXO] {
+        _ = unresolvedSends // after a relaunch, puts back the holds of "Not confirmed" sends
         let now = Date()
         return utxos.filter { utxo in
             guard let until = reservedMessageOutpoints[outpointKey(utxo.outpoint)] else { return true }
@@ -3023,12 +2690,88 @@ extension ChatService {
         cachedUtxosTimestamp = nil
     }
 
+    // MARK: - Sends that ended on "Not confirmed"
+
+    /// How long a send with an unknown outcome keeps its coins, and stops the same payment being
+    /// made again. A transaction a node really took is in a block within seconds, so one the
+    /// network still doesn't have after this, its coins all unspent, never landed.
+    static let unresolvedSendHold: TimeInterval = 600
+    private static let unresolvedSendsKey = "kaplay_unresolved_sends_v1"
+    private static var loadedUnresolvedSends: [UnresolvedSend]?
+
+    /// Saved, so a relaunch doesn't forget one; the coins' hold is put back on the first read.
+    private var unresolvedSends: [UnresolvedSend] {
+        get {
+            if let loaded = Self.loadedUnresolvedSends { return loaded }
+            let stored = UserDefaults.standard.data(forKey: Self.unresolvedSendsKey)
+                .flatMap { try? JSONDecoder().decode([UnresolvedSend].self, from: $0) } ?? []
+            Self.loadedUnresolvedSends = stored
+            let now = Date()
+            for send in stored {
+                let until = send.sentAt.addingTimeInterval(Self.unresolvedSendHold)
+                guard until > now else { continue }
+                for key in send.outpointKeys { reservedMessageOutpoints[key] = until }
+            }
+            return stored
+        }
+        set {
+            Self.loadedUnresolvedSends = newValue
+            UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: Self.unresolvedSendsKey)
+        }
+    }
+
+    /// A plain send that may have landed. Its coins stay out of every other send and move for the
+    /// whole hold, not the usual 120 s, and `refuseWhileSendUnresolved` watches for a repeat.
+    func holdUnknownOutcomeSend(_ tx: KaspaRpcTransaction, txId: String, source: String, recipient: String) {
+        let keys = tx.inputs.map { outpointKey($0.previousOutpoint) }
+        let until = Date().addingTimeInterval(Self.unresolvedSendHold)
+        for key in keys { reservedMessageOutpoints[key] = until }
+        var sends = unresolvedSends
+        sends.removeAll { $0.txId == txId }
+        sends.append(UnresolvedSend(txId: txId, source: source, recipient: recipient.lowercased(), outpointKeys: keys, sentAt: Date()))
+        unresolvedSends = sends
+    }
+
+    /// Reserving coins alone can't stop a repeat paying twice: it would pick other coins and both
+    /// could land. So before a send to someone a "Not confirmed" send went to, that send is looked
+    /// up. Landed: the person is told once, and sending again after that is what they meant.
+    /// Still undecided: nothing goes out. Never landed (the network doesn't have it and, after the
+    /// hold, every coin is still unspent): its coins are released and the send goes ahead.
+    func refuseWhileSendUnresolved(to recipient: String) async throws {
+        let lowered = recipient.lowercased()
+        for send in unresolvedSends {
+            let landed: Bool
+            if await NodePoolService.shared.networkHasTransaction(send.txId) {
+                landed = true
+            } else if let listed = try? await NodePoolService.shared.getUtxosByAddresses([send.source]) {
+                let unspent = Set(listed.map { outpointKey($0.outpoint) })
+                if send.outpointKeys.contains(where: { !unspent.contains($0) }) {
+                    landed = true
+                } else if Date().timeIntervalSince(send.sentAt) >= Self.unresolvedSendHold {
+                    for key in send.outpointKeys { reservedMessageOutpoints[key] = nil }
+                    unresolvedSends.removeAll { $0.txId == send.txId }
+                    continue
+                } else {
+                    landed = false
+                }
+            } else {
+                landed = false
+            }
+            if landed { unresolvedSends.removeAll { $0.txId == send.txId } }
+            guard send.recipient == lowered else { continue }
+            throw KasiaError.networkError(AppLocalization.string(landed
+                ? "Your last send to this address went through. Check your balance, then send again only if you meant to pay twice."
+                : "Your last send to this address isn't confirmed yet. Wait a few minutes before sending again, so it can't pay twice."))
+        }
+    }
+
     /// Sends a plain KAS transfer from a specific spending-chain address (Manage Addresses'
     /// per-row Withdraw action).
     ///
-    /// For a NON-primary index the change stays on the same address: that is a scoped,
+    /// For a NON-primary legacy index the change stays on the same address: that is a scoped,
     /// explicit single-address operation, and the row's own balance is what the user is
-    /// managing. The primary is different. A send from it puts its change on a fresh index and
+    /// managing. A quantum source's change always moves to a fresh slot (the spend reveals its
+    /// key), but only a send from the primary moves the primary. The primary is different. A send from it puts its change on a fresh index and
     /// rotates the primary to that index - exactly what a chat payment does - so the address
     /// you spend from and hand out next has never been used before. This path used to leave
     /// the primary sitting on the address it had just spent from. The old primary keeps
@@ -3049,6 +2792,8 @@ extension ChatService {
               let privateKey = WalletManager.shared.spendingPrivateKey(at: index) else {
             throw KasiaError.keychainError("Could not derive this spending address")
         }
+        try await refuseWhileSendUnresolved(to: toAddress)
+        let wasPrimary = index == WalletManager.shared.currentSpendingAddressIndex
         // Fresh change index for the primary only: past the all-time max, so it has never been
         // revealed, funded or offered (the same rule `sendPaymentInternal` uses). Decided up
         // front and applied only after the node accepts the transaction, so a failed send moves
@@ -3091,8 +2836,9 @@ extension ChatService {
             if spendable.isEmpty, let manualUtxos, !manualUtxos.isEmpty {
                 // The fresh fetch came back empty (transient pool/node condition) but the caller
                 // pinned an explicit set (e.g. a compound chunk) - fall back to it; the node will
-                // reject any of those inputs that were actually already spent.
-                spendable = ChatService.spendableUtxos(manualUtxos, virtualDaaScore: vds)
+                // reject any of those inputs that were actually already spent. Never a coin this
+                // app just spent, though: that's why the fetch can look empty.
+                spendable = self.unreservedUtxos(ChatService.spendableUtxos(manualUtxos, virtualDaaScore: vds))
             }
             guard !spendable.isEmpty else {
                 throw KasiaError.networkError("No spendable UTXOs available")
@@ -3134,6 +2880,16 @@ extension ChatService {
             )
             try self.checkFeeAgainstReview(tx, spending: spendable, expectedFeeSompi: expectedFeeSompi)
 
+            // These addresses are on chain now: never offered again as unused, though the "unused"
+            // remembered this session would still say so. (The Receive QR relies on this.)
+            @MainActor func markAddressesUsed() {
+                self.markSpendingAddressUsed(fromAddress)
+                if let changeAddress, let script = KaspaAddress.scriptPublicKey(from: changeAddress),
+                   tx.outputs.contains(where: { $0.scriptPublicKey.script == script }) {
+                    self.markSpendingAddressUsed(changeAddress)
+                }
+            }
+
             AppLog.log("[ChatService] Submitting spending-address withdrawal via RPC manager...")
             let txId: String
             let endpoint: String
@@ -3142,6 +2898,8 @@ extension ChatService {
             } catch let unknown as SendOutcomeUnknownError {
                 // It may have landed: its change may be on the fresh address, and its key on chain.
                 self.recordPlainSend(tx, spent: spendable, txId: nil, changeScriptPubKey: nil)
+                self.holdUnknownOutcomeSend(tx, txId: unknown.txId, source: fromAddress, recipient: toAddress)
+                markAddressesUsed()
                 if WalletManager.isQuantumIndex(index) {
                     WalletManager.shared.markQuantumAddressSpent(fromAddress, owner: owner)
                 }
@@ -3154,14 +2912,20 @@ extension ChatService {
             // its coins stay out of the next send from this address until the spend is in a block;
             // nothing here is offered to chess moves, which only spend the chatting address
             self.recordPlainSend(tx, spent: spendable, txId: nil, changeScriptPubKey: nil)
+            markAddressesUsed()
             if WalletManager.isQuantumIndex(index) {
                 // the spend put this address's key on chain for good (self-sends included)
                 WalletManager.shared.markQuantumAddressSpent(fromAddress, owner: owner)
             }
             if let freshChangeIndex {
-                // The primary follows its change onto the fresh address. Manage Addresses
-                // listens for this and moves its star at once.
-                await WalletManager.shared.setActiveSpendingAddress(freshChangeIndex, owner: owner)
+                if wasPrimary {
+                    // The primary follows its change onto the fresh address. Manage Addresses
+                    // listens for this and moves its star at once.
+                    await WalletManager.shared.setActiveSpendingAddress(freshChangeIndex, owner: owner)
+                } else {
+                    // another quantum address's change: listed, its slot never handed out again
+                    await WalletManager.shared.revealSpendingAddress(at: freshChangeIndex, owner: owner)
+                }
             }
             return txId
         }
@@ -3202,7 +2966,8 @@ extension ChatService {
     /// UI's "Max" uses this to reflect *one transaction's worth* of consolidatable value instead of
     /// the whole (over-mass) balance - the user consolidates that chunk, then repeats to reduce
     /// further. Returns the chunk so the send spends exactly those inputs.
-    func maxConsolidatableChunk(index: Int, extraFeeSompi: UInt64 = 0, feeMultiplier: UInt64 = 1, availableUtxos: [UTXO] = []) async throws -> (amountSompi: UInt64, utxos: [UTXO]) {
+    /// `selection`: the coins Coin Control picked, nil for all of them.
+    func maxConsolidatableChunk(index: Int, selection: [UTXO]? = nil, extraFeeSompi: UInt64 = 0, feeMultiplier: UInt64 = 1, availableUtxos: [UTXO] = []) async throws -> (amountSompi: UInt64, utxos: [UTXO]) {
         guard let fromAddress = WalletManager.shared.spendingAddress(at: index) else {
             throw KasiaError.keychainError("Could not derive this spending address")
         }
@@ -3232,7 +2997,8 @@ extension ChatService {
             throw KasiaError.networkError("No spendable UTXOs available")
         }
         // Largest-first, capped to what fits one transaction's mass.
-        let chunk = Array(spendable.sorted { $0.amount > $1.amount }.prefix(KasiaTransactionBuilder.maxInputsPerTransaction))
+        let candidates = try resolveReviewSelection(selection, against: spendable) ?? spendable
+        let chunk = Array(candidates.sorted { $0.amount > $1.amount }.prefix(KasiaTransactionBuilder.maxInputsPerTransaction))
         let amount = try await estimateMaxSpendingAddressAmount(index: index, toAddress: fromAddress, manualUtxos: chunk, extraFeeSompi: extraFeeSompi, feeMultiplier: feeMultiplier, availableUtxos: utxos, virtualDaaScore: virtualDaaScore).amountSompi
         return (amount, chunk)
     }
@@ -3268,8 +3034,19 @@ extension ChatService {
             extraFeeSompi: extraFeeSompi,
             virtualDaaScore: vds,
             signatureScriptSize: WalletManager.isQuantumIndex(index)
-                ? KasiaTransactionBuilder.kip22SignatureScriptSize : 66
+                ? KasiaTransactionBuilder.kip22SignatureScriptSize : 66,
+            changeScriptPubKey: plannedChangeScript(index: index, fromAddress: fromAddress, toAddress: toAddress)
         )
+    }
+
+    /// The change script `sendFromSpendingAddress` will use when it isn't the source's own: the
+    /// next fresh quantum slot's. Its slot can move on before the swipe, but every slot's script
+    /// is the same length, and length is all a fee sees. Nil when change stays on the source.
+    private func plannedChangeScript(index: Int, fromAddress: String, toAddress: String) -> Data? {
+        guard toAddress.lowercased() != fromAddress.lowercased(),
+              WalletManager.isQuantumIndex(index) || index == WalletManager.shared.currentSpendingAddressIndex,
+              let fresh = WalletManager.shared.spendingAddress(at: WalletManager.shared.nextFreshQuantumIndex()) else { return nil }
+        return KaspaAddress.scriptPublicKey(from: fresh)
     }
 
     /// Maximum sendable amount from a specific spending address (balance minus the send-all
@@ -3302,6 +3079,7 @@ extension ChatService {
         let totalBalance = try maxSet.totalAmount()
         let signatureScriptSize = WalletManager.isQuantumIndex(index)
             ? KasiaTransactionBuilder.kip22SignatureScriptSize : 66
+        let changeScript = plannedChangeScript(index: index, fromAddress: fromAddress, toAddress: toAddress)
 
         let amount = try Self.maxSendAmount(
             total: totalBalance,
@@ -3327,7 +3105,8 @@ extension ChatService {
                     senderScriptPubKey: senderScriptPubKey,
                     manualUtxos: resolvedManualUtxos,
                     virtualDaaScore: vds,
-                    signatureScriptSize: signatureScriptSize
+                    signatureScriptSize: signatureScriptSize,
+                    changeScriptPubKey: changeScript
                 ))?.networkFee
             }
         )
@@ -3367,9 +3146,6 @@ extension ChatService {
     /// Session-only memory of CONFIRMED-unused probe results. In-memory by design: it must
     /// die with the process so a stale "unused" can never survive into a later launch.
     private static var sessionUnusedAddresses: Set<String> = []
-    func hasSpendingAddressBeenUsed(_ address: String) async -> Bool {
-        await spendingAddressUsedState(address) ?? false
-    }
 
     /// Cache-only, synchronous view of used-ness: `true` = persistently confirmed used,
     /// `false` = confirmed unused earlier THIS session, `nil` = no cached answer (a network
@@ -3405,8 +3181,12 @@ extension ChatService {
     /// resolve_previous_outpoints=light`, which made the server assemble (and us download and
     /// decode) an entire transaction with resolved outpoints just to answer a yes/no question.
     /// A short per-request timeout keeps a hung host from pinning a sweep's concurrency slot.
-    func spendingAddressUsedState(_ address: String) async -> Bool? {
-        if let cached = cachedSpendingAddressUsedState(address) { return cached }
+    ///
+    /// `ignoringSessionCache`: ask the network even if this session remembers "unused". For an
+    /// address about to be handed out: a payment to a spending address raises no event in KaPlay,
+    /// so that memory can be out of date.
+    func spendingAddressUsedState(_ address: String, ignoringSessionCache: Bool = false) async -> Bool? {
+        if let cached = cachedSpendingAddressUsedState(address), cached || !ignoringSessionCache { return cached }
         guard let url = kaspaRestURL(path: "/addresses/\(address)/transactions-count") else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 8
@@ -3427,159 +3207,6 @@ extension ChatService {
         } catch {
             return nil
         }
-    }
-
-    func estimateMessageFee(to contact: Contact, content: String, feeOverride: UInt64? = nil) async throws -> UInt64 {
-        if let feeOverride { return feeOverride }
-        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            throw KasiaError.networkError("Message is empty")
-        }
-
-        guard let wallet = WalletManager.shared.currentWallet else {
-            throw KasiaError.walletNotFound
-        }
-
-        guard let recipientPublicKey = KaspaAddress.publicKey(from: contact.address) else {
-            throw KasiaError.invalidAddress
-        }
-
-        guard let senderScriptPubKey = KaspaAddress.scriptPublicKey(from: wallet.publicAddress) else {
-            throw KasiaError.invalidAddress
-        }
-
-        let privateKey = WalletManager.shared.getPrivateKey()
-        if let privateKey {
-            ensureRoutingState(for: contact.address, privateKey: privateKey)
-        }
-        let alias = outgoingAlias(for: contact.address)
-        // Account for the reply envelope's extra bytes, matching the wrapping `sendMessage` does.
-        let estimatedContent: String
-        if let reply = replyingTo {
-            let preview = MessageReplyCodec.previewText(for: reply.content)
-            estimatedContent = MessageReplyCodec.encode(
-                replyToId: reply.txId,
-                replyToSender: reply.senderAddress,
-                replyToPreview: preview,
-                text: trimmed
-            )
-        } else {
-            estimatedContent = trimmed
-        }
-        // Detached: ECDH + AEAD payload building is pure CPU work, and this whole method runs
-        // on the main actor on a 200ms debounce while the user is TYPING — doing the crypto
-        // inline was measurable keystroke lag on older devices.
-        let payload = try await Task.detached(priority: .userInitiated) {
-            try KasiaTransactionBuilder.buildContextualMessagePayload(
-                alias: alias,
-                message: estimatedContent,
-                recipientPublicKey: recipientPublicKey
-            )
-        }.value
-
-        // Use fallback method - doesn't require gRPC connection
-        let utxos = try await fetchUtxosWithFallback(for: wallet.publicAddress)
-
-        let availableUtxos = prepareMessageUtxos(confirmed: utxos)
-        guard !availableUtxos.isEmpty else {
-            throw KasiaError.networkError("No spendable UTXOs")
-        }
-
-        guard let privateKey else {
-            return KasiaTransactionBuilder.estimateContextualMessageFee(
-                payload: payload,
-                inputCount: 1,
-                senderScriptPubKey: senderScriptPubKey
-            )
-        }
-
-        let estimateFeeFromBuiltTx: (KaspaRpcTransaction, [UTXO]) -> UInt64 = { transaction, candidates in
-            let spent = self.spentMessageUtxos(from: transaction, candidates: candidates)
-            let totalInputSompi = spent.reduce(UInt64(0)) { partial, utxo in
-                self.addSompiSafely(partial, utxo.amount)
-            }
-            let totalOutputSompi = transaction.outputs.reduce(UInt64(0)) { partial, output in
-                self.addSompiSafely(partial, output.value)
-            }
-            return totalInputSompi > totalOutputSompi
-                ? totalInputSompi - totalOutputSompi
-                : 0
-        }
-
-        // Detached for the same reason: this fully builds AND Schnorr-signs a transaction.
-        let walletAddress = wallet.publicAddress
-        let contactAddress = contact.address
-        var messageTx = try await Task.detached(priority: .userInitiated) {
-            try KasiaTransactionBuilder.buildContextualMessageTx(
-                from: walletAddress,
-                to: contactAddress,
-                alias: alias,
-                message: trimmed,
-                senderPrivateKey: privateKey,
-                recipientPublicKey: recipientPublicKey,
-                utxos: availableUtxos
-            )
-        }.value
-        var messageFee = estimateFeeFromBuiltTx(messageTx, availableUtxos)
-        let singleInputFeeSompi = KasiaTransactionBuilder.estimateContextualMessageFee(
-            payload: messageTx.payload,
-            inputCount: 1,
-            senderScriptPubKey: senderScriptPubKey
-        )
-
-        // Mirror send-time heuristic: if message would be expensive, estimate post-compaction send fee.
-        if shouldAttemptMessageUtxoCompaction(
-            currentMessageTx: messageTx,
-            plannedFeeSompi: messageFee,
-            singleInputFeeSompi: singleInputFeeSompi,
-            availableUtxos: availableUtxos
-        ) {
-            let compactionTarget = messageCompactionTargetOutputSompi(
-                alias: alias,
-                content: trimmed,
-                recipientPublicKey: recipientPublicKey,
-                senderScriptPubKey: senderScriptPubKey
-            )
-
-            if let compaction = try? KasiaTransactionBuilder.buildMessageCompactionTx(
-                from: wallet.publicAddress,
-                senderPrivateKey: privateKey,
-                utxos: availableUtxos.filter { !$0.isCoinbase },
-                minOutputAmount: compactionTarget,
-                maxInputs: messageCompactionMaxInputs
-            ) {
-                let spentKeys = Set(compaction.selectedUtxos.map { outpointKey($0.outpoint) })
-                var compactedCandidates = availableUtxos.filter { !spentKeys.contains(outpointKey($0.outpoint)) }
-
-                if let compactionOutput = compaction.transaction.outputs.first {
-                    let syntheticCompactionUtxo = UTXO(
-                        address: "",
-                        outpoint: UTXO.Outpoint(
-                            transactionId: String(repeating: "a", count: 64),
-                            index: 0
-                        ),
-                        amount: compactionOutput.value,
-                        scriptPublicKey: senderScriptPubKey,
-                        blockDaaScore: 0,
-                        isCoinbase: false
-                    )
-                    compactedCandidates.insert(syntheticCompactionUtxo, at: 0)
-                }
-
-                messageTx = try KasiaTransactionBuilder.buildContextualMessageTx(
-                    from: wallet.publicAddress,
-                    to: contact.address,
-                    alias: alias,
-                    message: trimmed,
-                    senderPrivateKey: privateKey,
-                    recipientPublicKey: recipientPublicKey,
-                    utxos: compactedCandidates
-                )
-                messageFee = estimateFeeFromBuiltTx(messageTx, compactedCandidates)
-            }
-        }
-
-        return messageFee
     }
 
     /// The payload a payment will carry, for pricing it: a tip carries the larger `kchat:1:tip:`
@@ -3605,7 +3232,7 @@ extension ChatService {
         let payload = try estimationPayload(note: note, amount: amountSompi, recipientPublicKey: recipientPublicKey, tip: tip)
         // Use fallback method - doesn't require gRPC connection
         let utxos = try await fetchUtxosWithFallback(for: sourceAddress)
-        let candidates = utxos.filter { !$0.isCoinbase }
+        let candidates = unreservedUtxos(utxos.filter { !$0.isCoinbase })
         let spendable = resolveManualUtxos(manualUtxos, against: candidates) ?? candidates
         guard !spendable.isEmpty else {
             throw KasiaError.networkError("No spendable UTXOs")
@@ -3625,57 +3252,6 @@ extension ChatService {
             signatureScriptSize: sourceSpendingIndex.map(WalletManager.isQuantumIndex) == true
                 ? KasiaTransactionBuilder.kip22SignatureScriptSize : 66
         )
-    }
-
-    /// Calculate maximum sendable amount (balance - fee for send-all transaction with no change output)
-    func estimateMaxPaymentAmount(to contact: Contact, note: String = "", sourceSpendingIndex: Int? = nil, manualUtxos: [UTXO]? = nil, extraFeeSompi: UInt64 = 0, tip: KaPostTip? = nil) async throws -> UInt64 {
-        // Same toggle-aware sourcing as `estimatePaymentFee` above - see its doc comment.
-        let sourceAddress = try paymentFundingSourceAddress(spendingIndex: sourceSpendingIndex)
-        guard let recipientPublicKey = KaspaAddress.publicKey(from: contact.address) else {
-            throw KasiaError.invalidAddress
-        }
-
-        // Use fallback method - doesn't require gRPC connection
-        let utxos = try await fetchUtxosWithFallback(for: sourceAddress)
-        let candidates = utxos.filter { !$0.isCoinbase }
-        let spendable = resolveManualUtxos(manualUtxos, against: candidates) ?? candidates
-        guard !spendable.isEmpty else {
-            throw KasiaError.networkError("No spendable UTXOs")
-        }
-
-        let totalBalance = try spendable.totalAmount()
-
-        guard let recipientScriptPubKey = KaspaAddress.scriptPublicKey(from: contact.address),
-              let senderScriptPubKey = KaspaAddress.scriptPublicKey(from: sourceAddress) else {
-            throw KasiaError.invalidAddress
-        }
-
-        // Build payload with a placeholder amount (doesn't affect fee calculation significantly)
-        let payload = try estimationPayload(note: note, amount: totalBalance, recipientPublicKey: recipientPublicKey, tip: tip)
-
-        // Calculate fee for send-all (uses 2 outputs to match selectUtxosForPayment behavior)
-        let fee = KasiaTransactionBuilder.estimateSendAllFee(
-            utxos: spendable,
-            payload: payload,
-            recipientScriptPubKey: recipientScriptPubKey,
-            senderScriptPubKey: senderScriptPubKey,
-            signatureScriptSize: sourceSpendingIndex.map(WalletManager.isQuantumIndex) == true
-                ? KasiaTransactionBuilder.kip22SignatureScriptSize : 66
-        )
-
-        // Leave room for a Fast / Priority / custom extra on top of the base fee.
-        let totalFee = fee + extraFeeSompi
-        guard totalBalance > totalFee else {
-            throw KasiaError.networkError("Balance too low to cover fee")
-        }
-
-        return totalBalance - totalFee
-    }
-
-    func sendHandshake(to contact: Contact, isResponse: Bool, pendingTxId: String? = nil) async throws {
-        try await enqueueOutgoingTxOperation {
-            try await self.sendHandshakeInternal(to: contact, isResponse: isResponse, pendingTxId: pendingTxId)
-        }
     }
 
     func sendHandshakeInternal(to contact: Contact, isResponse: Bool, pendingTxId: String? = nil) async throws {
@@ -3887,18 +3463,6 @@ extension ChatService {
         }
     }
 
-    func respondToHandshake(for contact: Contact, accept: Bool) async throws {
-        if accept {
-            try await sendHandshake(to: contact, isResponse: true)
-            clearDeclined(contact.address)
-            // Everything they sent us before we accepted has to become readable now - see
-            // recoverPreRelationshipHistory for why the ordinary sync would never ask for it.
-            await recoverPreRelationshipHistory(for: contact.address)
-        } else {
-            declineContact(contact.address)
-        }
-    }
-
     /// Re-fetches a contact's ENTIRE contextual history from block time 0 and decrypts it, once,
     /// at the moment the relationship with them is established (we accept their handshake, or we
     /// message them back).
@@ -3932,47 +3496,6 @@ extension ChatService {
 
     func isConversationDeclined(_ address: String) -> Bool {
         declinedContacts.contains(address)
-    }
-
-    /// Drops the in-memory conversation and its routing bookkeeping for a permanently-deleted
-    /// contact - pairs with `ContactsManager.deleteContact`, which handles the persisted
-    /// contact/message/tombstone side of the same delete.
-    func removeConversation(for address: String) {
-        conversations.removeAll { $0.contact.address == address }
-        routingStates.removeValue(forKey: address)
-        conversationAliases.removeValue(forKey: address)
-        declinedContacts.remove(address)
-        setChatFetchState(nil, for: address)
-        chatFetchCounts.removeValue(forKey: address)
-        chatFetchFailed.remove(address)
-    }
-
-    /// Deletes the given messages from this device only - purely local (Core Data + in-memory),
-    /// never on-chain. The recipient still has their own copy, and the underlying transaction
-    /// remains permanently visible/scannable on the Kaspa blockchain - see the confirmation
-    /// alert's wording in `ChatDetailView` for why that distinction is surfaced to the user.
-    /// `unreadCount` isn't explicitly adjusted here even if a deleted message was unread - it's a
-    /// stored counter, but self-corrects the next time `buildMergedConversations` runs (a cold
-    /// start/reload), since it recomputes by filtering messages against `lastReadBlockTime` and a
-    /// deleted message simply won't be there to count anymore.
-    func deleteMessages(_ txIds: Set<String>, from contact: Contact) {
-        guard !txIds.isEmpty,
-              let index = conversations.firstIndex(where: { $0.contact.address == contact.address }) else { return }
-
-        updateConversation(at: index, persist: false) { updated in
-            updated.messages.removeAll { txIds.contains($0.txId) }
-        }
-
-        for txId in txIds {
-            messageStore.deleteMessage(txId: txId)
-        }
-
-        // Contact.lastMessageAt is a stored/denormalized field that's only ever bumped forward
-        // elsewhere - recompute it down here in case the deleted message(s) included the most
-        // recent one, so Chat Info / contact sort order don't keep showing a deleted message's time.
-        if let newest = conversations[index].messages.map({ $0.timestamp }).max() {
-            contactsManager.updateContactLastMessage(contact.id, at: newest)
-        }
     }
 
     /// The chat list: not declined, not blocked, and not a Message Request (those sit behind
@@ -4098,45 +3621,6 @@ extension ChatService {
         clearDeclined(address)
     }
 
-    /// Deleting a chat forgets that it was accepted (or Private): a new chat from that person,
-    /// after the deletion, lands in Message Requests. A block stays as it was.
-    func forgetChatAcceptance(_ address: String) {
-        let key = address.lowercased()
-        let state = chatRequestState()
-        guard state.accepted.contains(key) || state.privateChats.contains(key) else { return }
-        updateChatRequests {
-            $0.accepted.remove(key)
-            $0.privateChats.remove(key)
-        }
-    }
-
-    /// Reject: their messages are deleted from this device and the address is blocked - ignored
-    /// by discovery, fetching and notifications until the user writes to them.
-    func rejectChat(_ contact: Contact) {
-        let key = contact.address.lowercased()
-        updateChatRequests {
-            $0.blocked.insert(key)
-            $0.accepted.remove(key)
-            $0.privateChats.remove(key)
-        }
-        Task { await messageStore.deleteConversation(contactAddress: contact.address) }
-        removeConversation(for: contact.address)
-        contactsManager.deleteContact(contact)
-    }
-
-    /// Starting a chat as Private: it never carries the inbox tag, so nothing on chain links the
-    /// two people. The other side isn't notified; they see it once they start a private chat
-    /// with this address too (NO_HANDSHAKE_MESSAGING.md §3.1).
-    func setPrivateChat(_ address: String, _ isPrivate: Bool) {
-        let key = address.lowercased()
-        updateChatRequests {
-            if isPrivate { $0.privateChats.insert(key) } else { $0.privateChats.remove(key) }
-            $0.accepted.insert(key)
-            $0.blocked.remove(key)
-        }
-        clearDeclined(address)
-    }
-
     /// Whether the configured indexer answers inbox lookups - probed once per indexer URL; an
     /// unreachable indexer is asked again next time.
     func inboxSupported() async -> Bool {
@@ -4223,14 +3707,6 @@ extension ChatService {
             addresses.insert(candidate.lowercased())
         }
         return Array(addresses)
-    }
-
-    func hasOurAlias(for address: String) -> Bool {
-        routingStates[address] != nil || !(ourAliases[address]?.isEmpty ?? true)
-    }
-
-    func hasTheirAlias(for address: String) -> Bool {
-        routingStates[address] != nil || !(conversationAliases[address]?.isEmpty ?? true)
     }
 
     /// Generate a random alias for a new conversation
@@ -4323,8 +3799,13 @@ extension ChatService {
         }
     }
 
+    /// The address `cachedUtxos` was read for: the cache holds one address at a time, and another
+    /// address's coins must never be answered from it.
+    private static var cachedUtxosAddress: String?
+
     func fetchCachedUtxos(for address: String) async throws -> [UTXO] {
-        if let timestamp = cachedUtxosTimestamp,
+        if Self.cachedUtxosAddress == address,
+           let timestamp = cachedUtxosTimestamp,
            Date().timeIntervalSince(timestamp) < utxoCacheInterval,
            !cachedUtxos.isEmpty {
             return cachedUtxos
@@ -4334,6 +3815,7 @@ extension ChatService {
         updateWalletBalanceIfNeeded(address: address, utxos: utxos)
         cachedUtxos = utxos
         cachedUtxosTimestamp = Date()
+        Self.cachedUtxosAddress = address
         return utxos
     }
 
@@ -4341,7 +3823,8 @@ extension ChatService {
     /// This is useful for fee estimation where we don't want to block waiting for gRPC connection
     func fetchUtxosWithFallback(for address: String) async throws -> [UTXO] {
         // Check cache first
-        if let timestamp = cachedUtxosTimestamp,
+        if Self.cachedUtxosAddress == address,
+           let timestamp = cachedUtxosTimestamp,
            Date().timeIntervalSince(timestamp) < utxoCacheInterval,
            !cachedUtxos.isEmpty {
             return cachedUtxos
@@ -4352,6 +3835,7 @@ extension ChatService {
         updateWalletBalanceIfNeeded(address: address, utxos: utxos)
         cachedUtxos = utxos
         cachedUtxosTimestamp = Date()
+        Self.cachedUtxosAddress = address
         return utxos
     }
 
@@ -4855,125 +4339,6 @@ extension ChatService {
         return true
     }
 
-    func updateMostRecentPendingOutgoingMessage(
-        contactAddress: String,
-        newTxId: String,
-        messageType: ChatMessage.MessageType
-    ) -> Bool {
-        guard let convIndex = conversations.firstIndex(where: { $0.contact.address == contactAddress }) else {
-            return false
-        }
-
-        var didUpdate = false
-        updateConversation(at: convIndex) { conversation in
-            let candidates = conversation.messages
-                .filter { $0.isOutgoing && $0.deliveryStatus != .sent && $0.messageType == messageType }
-                .sorted(by: Self.isMessageOrderedBefore)
-
-            guard let candidate = candidates.first,
-                  let msgIndex = conversation.messages.firstIndex(where: { $0.id == candidate.id }) else { return }
-
-            conversation.messages.removeAll(where: { $0.txId == newTxId })
-            let newMessage = ChatMessage(
-                id: candidate.id,
-                txId: newTxId,
-                senderAddress: candidate.senderAddress,
-                receiverAddress: candidate.receiverAddress,
-                content: candidate.content,
-                timestamp: candidate.timestamp,
-                blockTime: candidate.blockTime,
-                acceptingBlock: candidate.acceptingBlock ?? "mempool",
-                isOutgoing: candidate.isOutgoing,
-                messageType: candidate.messageType,
-                deliveryStatus: .sent
-            )
-            conversation.messages[msgIndex] = newMessage
-            didUpdate = true
-        }
-
-        return didUpdate
-    }
-
-    func markConversationAsRead(_ conversation: Conversation) async {
-        Self.clearDeliveredNotifications(threadIdentifier: conversation.contact.address)
-        if let index = conversations.firstIndex(where: { $0.id == conversation.id }) {
-            // Use both in-memory window and persistent store cursor so pagination does not
-            // block read marker advancement.
-            let lastInMemoryIncoming = conversation.messages
-                .filter { !$0.isOutgoing }
-                .max(by: { $0.blockTime < $1.blockTime })
-            let storeCursor = await messageStore.fetchLatestIncomingCursor(contactAddress: conversation.contact.address)
-            let inMemoryBlockTime = Int64(lastInMemoryIncoming?.blockTime ?? 0)
-            let storeBlockTime = storeCursor?.blockTime ?? 0
-
-            updateConversation(at: index, persist: false) { updated in
-                updated.unreadCount = 0
-            }
-            // Persist unread reset immediately so reloads cannot resurrect
-            // a stale unread badge when the read cursor does not advance.
-            messageStore.updateConversationUnread(contactAddress: conversation.contact.address, unreadCount: 0)
-
-            // Persist the read position (debounced)
-            let targetBlockTime = max(inMemoryBlockTime, storeBlockTime)
-            if targetBlockTime > 0 {
-                // Keep the in-memory read cursor current so a later full re-sync doesn't re-mark
-                // these just-read messages as unread (see `readCursorByAddress`).
-                readCursorByAddress[conversation.contact.address] = max(readCursorByAddress[conversation.contact.address] ?? 0, targetBlockTime)
-                let targetTxId: String?
-                if storeBlockTime > inMemoryBlockTime {
-                    targetTxId = storeCursor?.txId
-                } else {
-                    targetTxId = lastInMemoryIncoming?.txId
-                }
-                AppLog.log(
-                    "[ChatService] Marking conversation %@ as read at blockTime=%lld (inMemory=%lld, store=%lld)",
-                    String(conversation.contact.address.suffix(8)),
-                    targetBlockTime,
-                    inMemoryBlockTime,
-                    storeBlockTime
-                )
-                // Awaited (not fire-and-forget) so this function's caller only returns once the
-                // read cursor is durably on disk - otherwise a force-quit landing between "read
-                // the chat" and the still-in-flight Core Data save could lose it, and a whole
-                // batch of already-read messages would come back as unread on next launch.
-                await ReadStatusSyncManager.shared.markAsReadAndWait(
-                    contactAddress: conversation.contact.address,
-                    lastReadTxId: targetTxId,
-                    lastReadBlockTime: UInt64(targetBlockTime)
-                )
-            }
-        }
-    }
-
-    /// Manually flags a whole conversation as unread again (chat list swipe/bulk action) - the
-    /// counterpart to `markConversationAsRead`. Sets a nominal unread count of 1 rather than
-    /// recomputing an exact unseen-message tally, matching how "mark as unread" works in other
-    /// mail/chat apps: a manual triage flag for the badge, not a literal count. Doesn't touch the
-    /// `lastReadTxId`/`lastReadBlockTime` read cursor - that cursor drives push-reliability/backfill
-    /// bookkeeping, a separate concern from this local, user-initiated triage flag.
-    func markConversationAsUnread(_ conversation: Conversation) {
-        guard let index = conversations.firstIndex(where: { $0.id == conversation.id }),
-              conversation.unreadCount == 0 else { return }
-        updateConversation(at: index, persist: false) { updated in
-            updated.unreadCount = 1
-        }
-        messageStore.updateConversationUnread(contactAddress: conversation.contact.address, unreadCount: 1)
-    }
-
-    /// Bulk "Mark as Read" for multi-selected conversations in the chat list.
-    func markConversationsAsRead(_ conversations: [Conversation]) async {
-        for conversation in conversations where conversation.unreadCount > 0 {
-            await markConversationAsRead(conversation)
-        }
-    }
-
-    /// Bulk "Mark as Unread" for multi-selected conversations in the chat list.
-    func markConversationsAsUnread(_ conversations: [Conversation]) {
-        for conversation in conversations where conversation.unreadCount == 0 {
-            markConversationAsUnread(conversation)
-        }
-    }
-
     // MARK: - Private Methods
 
     /// Check the Kasia indexer for a handshake matching the given txId
@@ -5001,4 +4366,13 @@ struct SendFeeChangedError: LocalizedError {
         String(format: AppLocalization.string("The network fee is now %@ KAS, more than the Review showed. Nothing was sent: check the new fee and swipe again."),
                locale: AppLocalization.locale, KaspaUnit.plain(feeSompi))
     }
+}
+
+/// A plain send that ended on "Not confirmed" (`ChatService.holdUnknownOutcomeSend`).
+private struct UnresolvedSend: Codable {
+    let txId: String
+    let source: String
+    let recipient: String
+    let outpointKeys: [String]
+    let sentAt: Date
 }

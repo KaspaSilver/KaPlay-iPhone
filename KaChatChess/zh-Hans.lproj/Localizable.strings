@@ -1773,3 +1773,4 @@
 "Dislikes" = "点踩";
 "Reposts" = "转发";
 "Quotes" = "引用";
+"Couldn't look up %@ right now. Try again in a moment." = "暂时无法查询 %@。请稍后重试。";

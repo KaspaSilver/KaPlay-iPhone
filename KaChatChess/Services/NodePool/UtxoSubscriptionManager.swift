@@ -68,6 +68,9 @@ final class UtxoSubscriptionManager: ObservableObject {
     /// Health check timer
     private var healthCheckTask: Task<Void, Never>?
 
+    /// Keeps trying after a resubscribe failed (`retryResubscribe`).
+    private var resubscribeRetryTask: Task<Void, Never>?
+
     /// Consecutive failures on primary
     private var primaryFailures: Int = 0
     private let maxPrimaryFailures = 1  // Immediate failover on first ping failure
@@ -285,6 +288,8 @@ final class UtxoSubscriptionManager: ObservableObject {
     func unsubscribe() {
         healthCheckTask?.cancel()
         healthCheckTask = nil
+        resubscribeRetryTask?.cancel()
+        resubscribeRetryTask = nil
         // a subscribe still queued or running must not re-subscribe after this
         subscribeInFlight?.cancel()
 
@@ -390,6 +395,7 @@ final class UtxoSubscriptionManager: ObservableObject {
             try await subscribe(addresses: subscribedAddresses)
         } catch {
             AppLog.log("[UtxoSub] Failed to reconnect to best node: %@", error.localizedDescription)
+            retryResubscribe()
         }
     }
 
@@ -427,6 +433,7 @@ final class UtxoSubscriptionManager: ObservableObject {
             try await subscribe(addresses: subscribedAddresses)
         } catch {
             AppLog.log("[UtxoSub] Failed to reconnect to better node: %@", error.localizedDescription)
+            retryResubscribe()
         }
     }
 
@@ -806,11 +813,44 @@ final class UtxoSubscriptionManager: ObservableObject {
 
         AppLog.log("[UtxoSub] Network epoch changed - resubscribing")
 
+        // This network change starts over; a retry from before it would only race this attempt.
+        resubscribeRetryTask?.cancel()
+        resubscribeRetryTask = nil
+
         // Resubscribe to current addresses
         do {
             try await subscribe(addresses: subscribedAddresses)
         } catch {
             AppLog.log("[UtxoSub] Resubscription after epoch change failed: %@", error.localizedDescription)
+            retryResubscribe()
+        }
+    }
+
+    /// A resubscribe tears the old subscription down first, health loop included, so one that
+    /// fails leaves nothing watching: balances and received notices would stay frozen until the
+    /// app was reopened. Keeps trying with capped backoff (2, 4, 8 ... 60 s) until something
+    /// subscribes or the subscription is no longer wanted.
+    private func retryResubscribe() {
+        resubscribeRetryTask?.cancel()
+        resubscribeRetryTask = Task { @MainActor [weak self] in
+            var delay: TimeInterval = 2
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                guard let self, !Task.isCancelled else { return }
+                guard self.state != .subscribed, !self.subscribedAddresses.isEmpty else { return }
+                // Something else is on it; look again after the wait.
+                if self.state == .connecting || self.state == .failover { continue }
+                do {
+                    try await self.subscribe(addresses: self.subscribedAddresses)
+                    AppLog.log("[UtxoSub] Resubscribed after a failed attempt")
+                    // What confirmed during the gap never reached us (see `resyncUtxoState`).
+                    NotificationCenter.default.post(name: .rpcSubscriptionsRestored, object: nil)
+                    return
+                } catch {
+                    AppLog.log("[UtxoSub] Resubscribe retry failed: %@", error.localizedDescription)
+                    delay = min(60, delay * 2)
+                }
+            }
         }
     }
 

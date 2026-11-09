@@ -76,15 +76,8 @@ struct KaChatChessApp: App {
 
     @MainActor
     private func handleScenePhaseChange(to newPhase: ScenePhase) {
-        // Covered the moment the app stops being the thing in front, uncovered when it is again.
-        // The cover is its own window (`PrivacyCoverWindow`), so it is over every sheet too: the
-        // balance, the 12 or 24 words and the private key would otherwise sit in iOS's snapshot
-        // of the app in plain view.
-        if newPhase == .active {
-            PrivacyCoverWindow.hide()
-        } else {
-            PrivacyCoverWindow.show()
-        }
+        // (The privacy cover isn't driven from here: this phase stays active while any window is
+        // active. Each window follows its own scene, `PrivacyCoverWindows`.)
         guard newPhase == .active else { return }
         let shouldResync = lastActiveResyncAt.map { Date().timeIntervalSince($0) > activeResyncDebounce } ?? true
         guard shouldResync else { return }
@@ -110,6 +103,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         Task.detached(priority: .utility) { CacheManager.sweepStaleTempFiles() }
+        PrivacyCoverWindows.shared.start()
         return true
     }
 }
@@ -119,28 +113,51 @@ extension Notification.Name {
     static let openPublicChat = Notification.Name("openBroadcast")
 }
 
-/// Puts `PrivacyCoverView` in a window of its own above the app, as KaPost does. An overlay on
-/// the root view sat underneath presented sheets, which is where the 12 or 24 words, the
-/// passphrase and the private key are shown. Hidden, the window is gone, so it never takes a touch.
+/// Puts `PrivacyCoverView` in a window of its own above each scene, as KaPost does: covered the
+/// moment that scene stops being active, uncovered when it is again. An overlay on the root view
+/// sat underneath presented sheets, which is where the 12 or 24 words, the passphrase and the
+/// private key are shown, and they would otherwise sit in iOS's snapshot in plain view.
+/// One cover per scene, from the scene's own notifications: an iPad can have several windows, each
+/// snapshotted, and SwiftUI's app-level `scenePhase` stays active while any of them is.
+/// Hidden, a cover's window is gone, so it never takes a touch.
 @MainActor
-private enum PrivacyCoverWindow {
-    private static var window: UIWindow?
+private final class PrivacyCoverWindows: NSObject {
+    static let shared = PrivacyCoverWindows()
 
-    static func show() {
-        guard window == nil,
-              let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first else { return }
+    private var covers: [ObjectIdentifier: UIWindow] = [:]
+
+    func start() {
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(sceneWillDeactivate(_:)), name: UIScene.willDeactivateNotification, object: nil)
+        center.addObserver(self, selector: #selector(sceneDidActivate(_:)), name: UIScene.didActivateNotification, object: nil)
+        center.addObserver(self, selector: #selector(sceneDidDisconnect(_:)), name: UIScene.didDisconnectNotification, object: nil)
+    }
+
+    @objc private func sceneWillDeactivate(_ notification: Notification) {
+        guard let scene = notification.object as? UIWindowScene else { return }
+        let id = ObjectIdentifier(scene)
+        guard covers[id] == nil else { return }
         let cover = UIWindow(windowScene: scene)
         cover.windowLevel = .alert + 1
         // the app's appearance (Settings' choice), which its own windows carry
         cover.overrideUserInterfaceStyle = scene.windows.first?.overrideUserInterfaceStyle ?? .unspecified
         cover.rootViewController = UIHostingController(rootView: PrivacyCoverView())
         cover.isHidden = false
-        window = cover
+        covers[id] = cover
     }
 
-    static func hide() {
-        window?.isHidden = true
-        window = nil
+    @objc private func sceneDidActivate(_ notification: Notification) {
+        removeCover(of: notification)
+    }
+
+    @objc private func sceneDidDisconnect(_ notification: Notification) {
+        removeCover(of: notification)
+    }
+
+    private func removeCover(of notification: Notification) {
+        guard let scene = notification.object as? UIWindowScene,
+              let cover = covers.removeValue(forKey: ObjectIdentifier(scene)) else { return }
+        cover.isHidden = true
     }
 }
 

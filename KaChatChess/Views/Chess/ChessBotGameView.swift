@@ -25,6 +25,26 @@ private struct ChessBotMatchView: View {
     /// The back button while the game is on: leaving means resigning, and it asks.
     @State private var showLeaveWarning = false
     @State private var showEnd = false
+    /// Done, Play again or Back with a win whose stamp failed: leaving loses the stamp, so it asks.
+    @State private var pendingLeave: LeaveAction?
+
+    private enum LeaveAction { case playAgain, done }
+
+    private var winStampFailed: Bool {
+        guard case .won? = game.result, case .failed = game.stamp else { return false }
+        return true
+    }
+
+    private func leave(_ action: LeaveAction) {
+        if winStampFailed { pendingLeave = action } else { perform(action) }
+    }
+
+    private func perform(_ action: LeaveAction) {
+        switch action {
+        case .playAgain: onPlayAgain()
+        case .done: dismiss()
+        }
+    }
 
     init(bot: ChessBot, playerColor: ChessColor, onPlayAgain: @escaping () -> Void) {
         _game = StateObject(wrappedValue: ChessBotGame(bot: bot, playerColor: playerColor))
@@ -73,8 +93,29 @@ private struct ChessBotMatchView: View {
                     }
                 }
             }
+            if winStampFailed {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button {
+                        leave(.done)
+                    } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.body.weight(.semibold))
+                    }
+                    .accessibilityLabel("Back")
+                }
+            }
         }
-        .navigationBarBackButtonHidden(isLockedIn)
+        .alert("Your win isn't on Kaspa yet", isPresented: Binding(
+            get: { pendingLeave != nil },
+            set: { if !$0 { pendingLeave = nil } }
+        ), presenting: pendingLeave) { action in
+            Button("Retry the stamp") { game.retry() }
+            Button("Leave anyway", role: .destructive) { perform(action) }
+            Button("Stay", role: .cancel) {}
+        } message: { _ in
+            Text("The stamp failed. If you leave now it can't be sent again, and this win won't count on the leaderboard.")
+        }
+        .navigationBarBackButtonHidden(isLockedIn || winStampFailed)
         .toolbar(isLockedIn ? .hidden : .visible, for: .tabBar)
         .sheet(isPresented: $showResignConfirm) {
             resignSheet(leaving: false)
@@ -294,7 +335,7 @@ private struct ChessBotMatchView: View {
                 }
                 HStack(spacing: 10) {
                     Button {
-                        onPlayAgain()
+                        leave(.playAgain)
                     } label: {
                         Text("Play again")
                             .font(.subheadline.weight(.semibold))
@@ -305,7 +346,7 @@ private struct ChessBotMatchView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 12))
                     }
                     Button {
-                        dismiss()
+                        leave(.done)
                     } label: {
                         Text("Done")
                             .font(.subheadline.weight(.semibold))
