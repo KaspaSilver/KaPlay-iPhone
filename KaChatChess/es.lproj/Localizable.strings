@@ -1774,3 +1774,13 @@
 "Reposts" = "Reposts";
 "Quotes" = "Citas";
 "Couldn't look up %@ right now. Try again in a moment." = "No se pudo consultar %@ ahora. Inténtalo de nuevo en un momento.";
+
+/* Import Account: finding the wallet the words belong to */
+"Standard Kaspa Wallet" = "Billetera Kaspa estándar";
+"Has history" = "Tiene historial";
+"See Every Wallet Type" = "Ver todos los tipos de billetera";
+"KaPlay checks your words against every kind of Kaspa wallet, so you don't need to know which one they came from." = "KaPlay comprueba tus palabras con todos los tipos de billetera Kaspa, así que no necesitas saber de cuál proceden.";
+"This address has history, so this looks like the right account." = "Esta dirección tiene historial, así que parece la cuenta correcta.";
+"No funds or history on this address." = "No hay fondos ni historial en esta dirección.";
+"We picked the most likely account. Tap another if that's not the one you use." = "Elegimos la cuenta más probable. Toca otra si no es la que usas.";
+"Your Account" = "Tu cuenta";

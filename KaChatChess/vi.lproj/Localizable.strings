@@ -1774,3 +1774,13 @@
 "Reposts" = "Lượt đăng lại";
 "Quotes" = "Trích dẫn";
 "Couldn't look up %@ right now. Try again in a moment." = "Hiện không thể tra cứu %@. Hãy thử lại sau giây lát.";
+
+/* Import Account: finding the wallet the words belong to */
+"Standard Kaspa Wallet" = "Ví Kaspa tiêu chuẩn";
+"Has history" = "Có lịch sử";
+"See Every Wallet Type" = "Xem mọi loại ví";
+"KaPlay checks your words against every kind of Kaspa wallet, so you don't need to know which one they came from." = "KaPlay đối chiếu các từ của bạn với mọi loại ví Kaspa, nên bạn không cần biết chúng đến từ ví nào.";
+"This address has history, so this looks like the right account." = "Địa chỉ này có lịch sử, nên có vẻ đây là tài khoản đúng.";
+"No funds or history on this address." = "Địa chỉ này không có tiền hoặc lịch sử.";
+"We picked the most likely account. Tap another if that's not the one you use." = "Chúng tôi đã chọn tài khoản có khả năng nhất. Hãy chạm vào tài khoản khác nếu đây không phải tài khoản bạn dùng.";
+"Your Account" = "Tài khoản của bạn";

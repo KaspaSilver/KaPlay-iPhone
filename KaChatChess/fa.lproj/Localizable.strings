@@ -1774,3 +1774,13 @@
 "Reposts" = "بازنشرها";
 "Quotes" = "نقل‌قول‌ها";
 "Couldn't look up %@ right now. Try again in a moment." = "اکنون جستجوی %@ ممکن نیست. کمی بعد دوباره تلاش کنید.";
+
+/* Import Account: finding the wallet the words belong to */
+"Standard Kaspa Wallet" = "کیف پول استاندارد Kaspa";
+"Has history" = "دارای سابقه";
+"See Every Wallet Type" = "دیدن همهٔ انواع کیف پول";
+"KaPlay checks your words against every kind of Kaspa wallet, so you don't need to know which one they came from." = "KaPlay کلمات شما را با همهٔ انواع کیف پول Kaspa بررسی می‌کند، پس لازم نیست بدانید از کدام کیف پول آمده‌اند.";
+"This address has history, so this looks like the right account." = "این آدرس سابقه دارد، پس به نظر می‌رسد حساب درست همین است.";
+"No funds or history on this address." = "این آدرس موجودی یا سابقه‌ای ندارد.";
+"We picked the most likely account. Tap another if that's not the one you use." = "محتمل‌ترین حساب را انتخاب کردیم. اگر از این حساب استفاده نمی‌کنید، روی حساب دیگری بزنید.";
+"Your Account" = "حساب شما";

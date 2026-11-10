@@ -1774,3 +1774,13 @@
 "Reposts" = "Репосты";
 "Quotes" = "Цитаты";
 "Couldn't look up %@ right now. Try again in a moment." = "Сейчас не удалось проверить %@. Повторите чуть позже.";
+
+/* Import Account: finding the wallet the words belong to */
+"Standard Kaspa Wallet" = "Стандартный кошелёк Kaspa";
+"Has history" = "Есть история";
+"See Every Wallet Type" = "Показать все типы кошельков";
+"KaPlay checks your words against every kind of Kaspa wallet, so you don't need to know which one they came from." = "KaPlay проверяет ваши слова по всем типам кошельков Kaspa, поэтому вам не нужно знать, из какого они.";
+"This address has history, so this looks like the right account." = "У этого адреса есть история, похоже, это нужный аккаунт.";
+"No funds or history on this address." = "На этом адресе нет средств и истории.";
+"We picked the most likely account. Tap another if that's not the one you use." = "Мы выбрали наиболее вероятный аккаунт. Нажмите на другой, если вы используете не этот.";
+"Your Account" = "Ваш аккаунт";

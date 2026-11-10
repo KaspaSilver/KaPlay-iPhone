@@ -1774,3 +1774,13 @@
 "Reposts" = "リポスト";
 "Quotes" = "引用";
 "Couldn't look up %@ right now. Try again in a moment." = "現在 %@ を確認できません。しばらくしてからもう一度お試しください。";
+
+/* Import Account: finding the wallet the words belong to */
+"Standard Kaspa Wallet" = "標準のKaspaウォレット";
+"Has history" = "履歴あり";
+"See Every Wallet Type" = "すべてのウォレットの種類を表示";
+"KaPlay checks your words against every kind of Kaspa wallet, so you don't need to know which one they came from." = "KaPlayがあらゆる種類のKaspaウォレットと照合するため、どのウォレットの単語かを知らなくても大丈夫です。";
+"This address has history, so this looks like the right account." = "このアドレスには履歴があるため、正しいアカウントのようです。";
+"No funds or history on this address." = "このアドレスには資金も履歴もありません。";
+"We picked the most likely account. Tap another if that's not the one you use." = "最も可能性の高いアカウントを選びました。使っているものと違う場合は、別のアカウントをタップしてください。";
+"Your Account" = "あなたのアカウント";

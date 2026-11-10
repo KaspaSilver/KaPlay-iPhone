@@ -1774,3 +1774,13 @@
 "Reposts" = "שיתופים מחדש";
 "Quotes" = "ציטוטים";
 "Couldn't look up %@ right now. Try again in a moment." = "לא ניתן לבדוק את %@ כרגע. נסו שוב בעוד רגע.";
+
+/* Import Account: finding the wallet the words belong to */
+"Standard Kaspa Wallet" = "ארנק Kaspa רגיל";
+"Has history" = "יש היסטוריה";
+"See Every Wallet Type" = "הצגת כל סוגי הארנקים";
+"KaPlay checks your words against every kind of Kaspa wallet, so you don't need to know which one they came from." = "KaPlay בודק את המילים שלך מול כל סוגי ארנקי Kaspa, כך שלא צריך לדעת מאיזה ארנק הן הגיעו.";
+"This address has history, so this looks like the right account." = "לכתובת הזו יש היסטוריה, כך שנראה שזה החשבון הנכון.";
+"No funds or history on this address." = "אין כספים או היסטוריה בכתובת הזו.";
+"We picked the most likely account. Tap another if that's not the one you use." = "בחרנו את החשבון הסביר ביותר. אם זה לא החשבון שבו משתמשים, אפשר להקיש על אחר.";
+"Your Account" = "החשבון שלך";

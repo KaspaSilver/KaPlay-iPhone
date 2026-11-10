@@ -1775,3 +1775,13 @@
 "Reposts" = "Reposts";
 "Quotes" = "Quotes";
 "Couldn't look up %@ right now. Try again in a moment." = "Couldn't look up %@ right now. Try again in a moment.";
+
+/* Import Account: finding the wallet the words belong to */
+"Standard Kaspa Wallet" = "Standard Kaspa Wallet";
+"Has history" = "Has history";
+"See Every Wallet Type" = "See Every Wallet Type";
+"KaPlay checks your words against every kind of Kaspa wallet, so you don't need to know which one they came from." = "KaPlay checks your words against every kind of Kaspa wallet, so you don't need to know which one they came from.";
+"This address has history, so this looks like the right account." = "This address has history, so this looks like the right account.";
+"No funds or history on this address." = "No funds or history on this address.";
+"We picked the most likely account. Tap another if that's not the one you use." = "We picked the most likely account. Tap another if that's not the one you use.";
+"Your Account" = "Your Account";

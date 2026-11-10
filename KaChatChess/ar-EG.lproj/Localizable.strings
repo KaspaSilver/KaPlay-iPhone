@@ -1774,3 +1774,13 @@
 "Reposts" = "إعادات النشر";
 "Quotes" = "الاقتباسات";
 "Couldn't look up %@ right now. Try again in a moment." = "مش قادرين ندوّر في %@ دلوقتي. جرّب تاني كمان شوية.";
+
+/* Import Account: finding the wallet the words belong to */
+"Standard Kaspa Wallet" = "محفظة Kaspa العادية";
+"Has history" = "ليه سجل";
+"See Every Wallet Type" = "اعرض كل أنواع المحافظ";
+"KaPlay checks your words against every kind of Kaspa wallet, so you don't need to know which one they came from." = "KaPlay بيفحص كلماتك على كل أنواع محافظ Kaspa، فمش محتاج تعرف جت من أنهي محفظة.";
+"This address has history, so this looks like the right account." = "العنوان ده ليه سجل، فشكله ده الحساب الصح.";
+"No funds or history on this address." = "مفيش أموال ولا سجل على العنوان ده.";
+"We picked the most likely account. Tap another if that's not the one you use." = "اخترنا الحساب الأقرب. دوس على حساب تاني لو ده مش اللي بتستخدمه.";
+"Your Account" = "حسابك";

@@ -1774,3 +1774,13 @@
 "Reposts" = "রিপোস্ট";
 "Quotes" = "উদ্ধৃতি";
 "Couldn't look up %@ right now. Try again in a moment." = "এখন %@ খোঁজা যাচ্ছে না। একটু পরে আবার চেষ্টা করুন।";
+
+/* Import Account: finding the wallet the words belong to */
+"Standard Kaspa Wallet" = "স্ট্যান্ডার্ড Kaspa ওয়ালেট";
+"Has history" = "ইতিহাস আছে";
+"See Every Wallet Type" = "সব ধরনের ওয়ালেট দেখুন";
+"KaPlay checks your words against every kind of Kaspa wallet, so you don't need to know which one they came from." = "KaPlay আপনার শব্দগুলো সব ধরনের Kaspa ওয়ালেটের সাথে মিলিয়ে দেখে, তাই সেগুলো কোন ওয়ালেট থেকে এসেছে তা আপনাকে জানতে হবে না।";
+"This address has history, so this looks like the right account." = "এই ঠিকানার ইতিহাস আছে, তাই এটিই সঠিক অ্যাকাউন্ট বলে মনে হচ্ছে।";
+"No funds or history on this address." = "এই ঠিকানায় কোনো তহবিল বা ইতিহাস নেই।";
+"We picked the most likely account. Tap another if that's not the one you use." = "আমরা সবচেয়ে সম্ভাব্য অ্যাকাউন্টটি বেছে নিয়েছি। এটি আপনার না হলে অন্যটিতে ট্যাপ করুন।";
+"Your Account" = "আপনার অ্যাকাউন্ট";

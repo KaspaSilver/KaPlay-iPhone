@@ -1774,3 +1774,13 @@
 "Reposts" = "Repost";
 "Quotes" = "Kutipan";
 "Couldn't look up %@ right now. Try again in a moment." = "Tidak dapat memeriksa %@ saat ini. Coba lagi sebentar lagi.";
+
+/* Import Account: finding the wallet the words belong to */
+"Standard Kaspa Wallet" = "Dompet Kaspa Standar";
+"Has history" = "Ada riwayat";
+"See Every Wallet Type" = "Lihat Semua Jenis Dompet";
+"KaPlay checks your words against every kind of Kaspa wallet, so you don't need to know which one they came from." = "KaPlay memeriksa kata-kata Anda pada setiap jenis dompet Kaspa, jadi Anda tidak perlu tahu asalnya dari dompet mana.";
+"This address has history, so this looks like the right account." = "Alamat ini punya riwayat, jadi sepertinya ini akun yang benar.";
+"No funds or history on this address." = "Tidak ada dana atau riwayat di alamat ini.";
+"We picked the most likely account. Tap another if that's not the one you use." = "Kami memilih akun yang paling mungkin. Ketuk yang lain jika bukan ini yang Anda gunakan.";
+"Your Account" = "Akun Anda";

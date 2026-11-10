@@ -93,9 +93,14 @@ The same as KaPay's; keep them in step. Create New Account makes an account in o
 no passphrase, the next free default name (`WalletManager.nextDefaultAccountName`). "Advanced:
 Create with a Passphrase" (`CreateWalletView`) is the only other way: also 24 words, through
 `PassphraseOptionView`, whose entry screen shows the address and its balance as you type
-(`PassphraseAddressPreview`). Import still takes 12 or 24 words; with a passphrase it checks the
-first 50 identity addresses, picks the first with funds, lists any others to choose from, and
-imports onto the chosen one (`WalletManager.findChattingAddresses`).
+(`PassphraseAddressPreview`). Import takes 12 or 24 words and works out the wallet type itself, as
+KaChat does: name, 12 or 24, the words, then "Did you use a passphrase?". No opens "Your Account",
+Yes runs the same search as the passphrase is typed (`WalletManager.findImportAccounts`): every
+`WalletSourceFamily` (Standard 50 addresses, KDX and OneKey 20, Chainge 1) in one UTXO call, plus
+each type's address #0's transaction count, keeping addresses with funds or history, the type with
+the most funds first. More than one found are listed to pick from; See Every Wallet Type adds each
+type's #0; nothing found or a failed search (12 s) opens Standard #0 with Search Again. There is no
+"where are your words from" list any more (`ImportSourceWalletView` is gone).
 
 Creating never shows the seed phrase: an account made here is owed a backup
 (`AccountBackupStatus`), and until the backup steps (`AccountBackupView`) are finished every tab's
@@ -122,7 +127,7 @@ Not cold storage: the card never generates or uses a key. The same as KaPay's an
 commands and backup format are that repo's `docs/PROTOCOL.md`, so change them there first. Settings
 > Back Up Account > Back Up to NFC Card (`NFCCardBackupView`, behind the seed phrase's biometric gate) only exists for
 an account with a passphrase, which is what protects it: it's never written to the card. The Import
-chooser's Restore from NFC Card (`NFCCardRestoreView`) reads with the 6-digit PIN, asks for the
+name screen's Restore from NFC Card, at its bottom (`NFCCardRestoreView`), reads with the 6-digit PIN, asks for the
 passphrase and checks it against the saved chatting address. Saving to a card never clears the
 backup strip. The App ID needs Near Field Communication Tag Reading on.
 

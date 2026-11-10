@@ -1774,3 +1774,13 @@
 "Reposts" = "Yeniden paylaşımlar";
 "Quotes" = "Alıntılar";
 "Couldn't look up %@ right now. Try again in a moment." = "%@ şu anda sorgulanamadı. Birazdan yeniden dene.";
+
+/* Import Account: finding the wallet the words belong to */
+"Standard Kaspa Wallet" = "Standart Kaspa Cüzdanı";
+"Has history" = "Geçmişi var";
+"See Every Wallet Type" = "Tüm Cüzdan Türlerini Gör";
+"KaPlay checks your words against every kind of Kaspa wallet, so you don't need to know which one they came from." = "KaPlay kelimelerinizi her tür Kaspa cüzdanıyla karşılaştırır, bu yüzden hangi cüzdandan geldiklerini bilmeniz gerekmez.";
+"This address has history, so this looks like the right account." = "Bu adresin geçmişi var, yani doğru hesap gibi görünüyor.";
+"No funds or history on this address." = "Bu adreste bakiye veya geçmiş yok.";
+"We picked the most likely account. Tap another if that's not the one you use." = "En olası hesabı seçtik. Kullandığınız bu değilse başka birine dokunun.";
+"Your Account" = "Hesabınız";

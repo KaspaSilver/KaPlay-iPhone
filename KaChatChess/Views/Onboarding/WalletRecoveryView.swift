@@ -81,9 +81,9 @@ struct WalletRecoveryView: View {
                 Task { await walletManager.loadWallet() }
             }
             .navigationDestination(isPresented: $showImport) {
-                // The same flow onboarding uses: pick the source wallet, then enter the seed.
-                // A successful import sets the current wallet and the app opens by itself.
-                ImportSourceWalletView()
+                // The same flow onboarding uses. A successful import sets the current wallet
+                // and the app opens by itself.
+                ImportNameStep()
             }
             .alert("Remove this account?", isPresented: $showRemoveConfirmation) {
                 // Face ID first, as on both Delete Account sheets.
