@@ -40,6 +40,11 @@ choice and bot games (`WalletManager.removeWalletTabData`), and the spending dat
 only, so spending addresses get no Received rows). A row opens the address
 (`OwnAddressHistorySheet`) or the name.
 
+.kachat names are shown through `KachatNameLabel.display`: "alice.kachat" by default, "alice"
+when Settings > Customization > Show .kachat Endings is off (as in KaChat). That covers player names
+in games and leaderboards (`ContactsManager.identityName`). Copying a name, typing one and anything
+sent keep working with either form.
+
 Every menu's title is the same as KaPosts': big and fixed above the content that scrolls
 (`fixedScreenTitle`), with the balance alone in the center of the bar (`BalanceToolbarLabel`). The
 game boards have no room for it, so `ScreenTitleToolbarLabel` puts their title over the balance in

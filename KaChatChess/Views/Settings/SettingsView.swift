@@ -2065,6 +2065,7 @@ struct SettingsView: View {
     @State private var showBackupOverDeleteWarning = false
     @ObservedObject private var backupStatus = AccountBackupStatus.shared
     @State private var showAccountBackup = false
+    @AppStorage(KachatNameLabel.showEndingsKey) private var showKachatEndings = true
     @State private var toastMessage: String?
 
     var body: some View {
@@ -2085,8 +2086,19 @@ struct SettingsView: View {
                 }
                 settingsCategoryRow("Customization", icon: "paintbrush.pointed", tint: .accentColor) {
                     Form {
-                        Section("Customization") {
+                        Section {
                             AppWideCustomizationPickers()
+
+                            // Off shows .kachat names bare ("alice"). On by default: the ending is how
+                            // a registered name tells itself apart from other services' names.
+                            Toggle("Show .kachat Endings", isOn: $showKachatEndings)
+                                .onChange(of: showKachatEndings) { _ in
+                                    NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+                                }
+                        } header: {
+                            Text("Customization")
+                        } footer: {
+                            Text("Turn off to show names like alice instead of alice.kachat. A name you gave someone yourself never has the ending.")
                         }
                     }
                     .navigationTitle("Customization")

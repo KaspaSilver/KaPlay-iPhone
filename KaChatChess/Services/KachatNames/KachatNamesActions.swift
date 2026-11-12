@@ -1169,7 +1169,7 @@ final class KachatNamesActions: ObservableObject {
             guard await isLiveOnChain(.registered(n)) else { throw unconfirmed }
             lapsed = n
         case .registered:
-            throw ActionError.notRegisterable(String(format: AppLocalization.string("%@ is already registered."), "\(name).kachat"))
+            throw ActionError.notRegisterable(String(format: AppLocalization.string("%@ is already registered."), KachatNameLabel.display(name)))
         case .free(let free, let gap):
             guard let gap, (try? await liveGap(gap, manifest)) != nil else {
                 AppLog.log("[KachatNames] no live gap for %@: not committing", free)
@@ -1463,7 +1463,7 @@ final class KachatNamesActions: ObservableObject {
             $0.reclaimTxId = txId
             $0.reclaimLo = KachatNames.hex(gaps.below.lo)
             $0.reclaimHi = KachatNames.hex(gaps.above.hi)
-            $0.lastError = String(format: AppLocalization.string("Freeing %@ for you..."), "\(p.name).kachat")
+            $0.lastError = String(format: AppLocalization.string("Freeing %@ for you..."), KachatNameLabel.display(p.name))
         }
     }
 
