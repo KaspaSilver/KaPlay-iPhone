@@ -13,20 +13,13 @@ struct ChessGameEndOverlay: View {
 
     private var headline: String {
         switch iWon {
-        case .some(true): return "You won!"
-        case .some(false): return "You lost"
-        case .none: return "\(winnerName) won"
+        case .some(true): return ChessText.string("You won!")
+        case .some(false): return ChessText.string("You lost")
+        case .none: return ChessText.format("%@ won", winnerName)
         }
     }
 
-    private var detail: String {
-        switch outcome {
-        case .checkmate: return "Checkmate"
-        case .resignation: return "By resignation"
-        case .timeout: return "On time"
-        case .drawTiebreak(let reason): return "Draw by \(reason) - won on clock"
-        }
-    }
+    private var detail: String { ChessText.outcomeDetail(outcome) }
 
     var body: some View {
         ZStack {
@@ -48,10 +41,10 @@ struct ChessGameEndOverlay: View {
                     .font(.scaled(size: 54))
                     .foregroundColor(iWon == true ? .yellow : .white)
                     .shadow(color: iWon == true ? .yellow.opacity(0.8) : .clear, radius: 18)
-                Text(headline)
+                Text(verbatim: headline)
                     .font(.scaled(size: 34, weight: .heavy, design: .rounded))
                     .foregroundColor(.white)
-                Text(detail)
+                Text(verbatim: detail)
                     .font(.subheadline.weight(.semibold))
                     .foregroundColor(.white.opacity(0.85))
             }
@@ -79,15 +72,19 @@ struct ChessGameResultView: View {
     @ObservedObject private var service = ChessTournamentService.shared
     @EnvironmentObject private var walletManager: WalletManager
     @State private var revealed = false
-    /// A tapped leaderboard row, for that player's card (`ChessPlayerView`).
-    @State private var profileContact: Contact?
+    /// A tapped leaderboard row's address, for that player's card (`ChessPlayerView`). KaPlay
+    /// has no contacts: nothing is saved for it.
+    @State private var profileAddress: String?
+    /// This game's board, sorted when the leaderboard changes - not on every tick of the
+    /// service's clock, which re-renders this screen once a second.
+    @State private var board: [ChessLeaderboardRow] = []
 
     private var tournament: ChessTournament? { service.tournaments[tournamentId] }
     private var game: ChessTournamentGame? { tournament?.games[gameId] }
     private var me: String? { walletManager.currentWallet?.publicAddress }
     private var isDuel: Bool { tournament?.isDuel ?? true }
-    private var board: [ChessLeaderboardRow] {
-        isDuel ? ChessTournamentEngine.duelLeaderboard(service.leaderboard) : ChessTournamentEngine.tournamentLeaderboard(service.leaderboard)
+    private func sortBoard() {
+        board = isDuel ? ChessTournamentEngine.duelLeaderboard(service.leaderboard) : ChessTournamentEngine.tournamentLeaderboard(service.leaderboard)
     }
     private var mine: ChessLeaderboardRow? { board.first { $0.address == me } }
     private var rank: Int? { board.firstIndex { $0.address == me }.map { $0 + 1 } }
@@ -110,7 +107,7 @@ struct ChessGameResultView: View {
                         Text(iWon ? "Victory" : "Defeat")
                             .font(.largeTitle.weight(.heavy))
                         if let game, let winner = game.winner {
-                            Text(outcomeText(game, winner: winner))
+                            Text(verbatim: outcomeText(game, winner: winner))
                                 .font(.subheadline)
                                 .foregroundColor(.secondary)
                         }
@@ -129,7 +126,7 @@ struct ChessGameResultView: View {
                             stat("Losses", value: revealed ? losses(mine) : losses(before), delta: iWon ? 0 : 1, color: .red)
                         }
                         if let rank {
-                            Text("#\(rank) on the \(isDuel ? "1v1" : "tournament") board")
+                            Text(isDuel ? "#\(rank) on the 1v1 board" : "#\(rank) on the tournament board")
                                 .font(.subheadline.weight(.semibold))
                         }
                     }
@@ -152,7 +149,7 @@ struct ChessGameResultView: View {
                 }
                 .padding(.bottom, 24)
             }
-            .navigationTitle(isDuel ? "1v1" : "Tournament")
+            .navigationTitle(isDuel ? Text("1v1") : Text("Tournament"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) { Button("Done") { onDone() } }
@@ -160,21 +157,24 @@ struct ChessGameResultView: View {
         }
         .onAppear {
             service.acquire()
+            sortBoard()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 withAnimation(.spring(response: 0.5, dampingFraction: 0.7)) { revealed = true }
             }
         }
         .onDisappear { service.release() }
+        .onChange(of: service.boardsRevision) { _ in sortBoard() }
+        .onChange(of: tournament?.isDuel) { _ in sortBoard() }
     }
 
-    private func stat(_ label: String, value: Int, delta: Int, color: Color) -> some View {
+    private func stat(_ label: LocalizedStringKey, value: Int, delta: Int, color: Color) -> some View {
         VStack(spacing: 2) {
-            Text("\(value)")
+            Text(verbatim: "\(value)")
                 .font(.scaled(size: 40, weight: .bold, design: .rounded).monospacedDigit())
                 .foregroundColor(color)
                 .contentTransition(.numericText())
             Text(label).font(.caption).foregroundColor(.secondary)
-            Text(delta > 0 ? "+\(delta)" : " ")
+            Text(verbatim: delta > 0 ? "+\(delta)" : " ")
                 .font(.caption.weight(.bold).monospacedDigit())
                 .foregroundColor(color)
                 .opacity(revealed && delta > 0 ? 1 : 0)
@@ -186,7 +186,7 @@ struct ChessGameResultView: View {
         let l = revealed ? losses(mine) : losses(before)
         let text = w + l == 0 ? "-" : String(format: "%.0f%%", Double(w) / Double(w + l) * 100)
         return VStack(spacing: 2) {
-            Text(text)
+            Text(verbatim: text)
                 .font(.scaled(size: 28, weight: .semibold, design: .rounded).monospacedDigit())
                 .contentTransition(.numericText())
             Text("Win rate").font(.caption).foregroundColor(.secondary)
@@ -204,11 +204,10 @@ struct ChessGameResultView: View {
                 .padding(.bottom, 8)
             ForEach(Array(top.enumerated()), id: \.element.id) { index, row in
                 Button {
-                    let contacts = ContactsManager.shared
-                    profileContact = contacts.getContact(byAddress: row.address) ?? contacts.getOrCreateContact(address: row.address)
+                    profileAddress = row.address
                 } label: {
                 HStack(spacing: 12) {
-                    Text("\(index + 1)")
+                    Text(verbatim: "\(index + 1)")
                         .font(.subheadline.monospacedDigit().weight(.semibold))
                         .foregroundColor(.secondary)
                         .frame(width: 24, alignment: .trailing)
@@ -226,7 +225,7 @@ struct ChessGameResultView: View {
                         Text("\(row.wins) W  \(row.losses) L")
                             .font(.subheadline.monospacedDigit().weight(.semibold))
                     } else {
-                        Label("\(row.tournamentsWon)", systemImage: "trophy.fill")
+                        Label { Text(verbatim: "\(row.tournamentsWon)") } icon: { Image(systemName: "trophy.fill") }
                             .font(.subheadline.monospacedDigit().weight(.semibold))
                             .foregroundColor(.yellow)
                         Text("\(row.tournamentsLost) L")
@@ -242,25 +241,19 @@ struct ChessGameResultView: View {
             }
         }
         .sheet(isPresented: Binding(
-            get: { profileContact != nil },
-            set: { if !$0 { profileContact = nil } }
+            get: { profileAddress != nil },
+            set: { if !$0 { profileAddress = nil } }
         )) {
-            if let contact = profileContact {
+            if let address = profileAddress {
                 NavigationStack {
-                    ChessPlayerView(address: contact.address)
+                    ChessPlayerView(address: address)
                 }
             }
         }
     }
 
     private func outcomeText(_ game: ChessTournamentGame, winner: String) -> String {
-        let who = ContactsManager.shared.displayName(for: winner)
-        switch game.outcome {
-        case .checkmate: return "Checkmate. \(who) won."
-        case .resignation: return "\(who) won by resignation."
-        case .timeout: return "\(who) won on time."
-        case .drawTiebreak(let reason): return "Draw by \(reason). \(who) won on clock."
-        case .none: return ""
-        }
+        guard let outcome = game.outcome else { return "" }
+        return ChessText.resultSentence(winner: ContactsManager.shared.displayName(for: winner), outcome: outcome)
     }
 }

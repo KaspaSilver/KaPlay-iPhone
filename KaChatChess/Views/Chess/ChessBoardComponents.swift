@@ -95,7 +95,7 @@ struct WaitingOnOpponentOverlay: View {
     @State private var dotCount = 1
 
     var body: some View {
-        Text("Waiting on opponent" + String(repeating: ".", count: dotCount))
+        (Text("Waiting on opponent") + Text(verbatim: String(repeating: ".", count: dotCount)))
             .font(.subheadline)
             .fontWeight(.semibold)
             .foregroundColor(.white)

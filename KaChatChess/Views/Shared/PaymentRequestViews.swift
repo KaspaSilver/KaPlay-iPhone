@@ -200,7 +200,7 @@ struct CreatePaymentRequestView: View {
                                 .monospacedDigit()
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.5)
-                            if let price = KaspaPriceStore.shared.currentPriceUsd, price > 0 {
+                            if let price = KaspaPriceStore.shared.networkPriceUsd, price > 0 {
                                 Text(verbatim: formatFiatAmount(Double(amountSompi) / 100_000_000.0 * price,
                                                                 currency: KaspaPriceStore.shared.currentCurrency))
                                     .font(.subheadline)

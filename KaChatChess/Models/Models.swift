@@ -93,7 +93,7 @@ struct SpendingAddressEntry: Identifiable, Equatable, Codable {
     /// The row's number on its own chain, both named "Address #n" (quantum numbering starts at
     /// 0 again; the shield is what tells the chains apart).
     var displayTitle: String {
-        "Address #\(WalletManager.addressNumber(forIndex: index))"
+        String(format: AppLocalization.string("Address #%@"), "\(WalletManager.addressNumber(forIndex: index))")
     }
     /// Whether this address is hidden from the main Manage Addresses list. Enforced
     /// server-side (WalletManager.setSpendingAddressHidden refuses to hide the primary
@@ -1655,8 +1655,8 @@ enum NetworkType: String, Codable, CaseIterable {
 
     var displayName: String {
         switch self {
-        case .mainnet: return "Mainnet"
-        case .testnet: return "Testnet"
+        case .mainnet: return AppLocalization.string("Mainnet")
+        case .testnet: return AppLocalization.string("Testnet")
         }
     }
 
@@ -1691,10 +1691,21 @@ extension KaspaAddress {
         isValid(address) && NetworkType(address: address) == AppSettings.load().networkType
     }
 
-    /// Why a valid address can't be used here: it's the other network's. nil for an address of
-    /// the running network or one that isn't valid at all.
+    /// Why an address can't be used here because of its network: a valid address of the other
+    /// network, or one with no `kaspa:` / `kaspatest:` prefix at all (unknown prefix, none, or
+    /// empty), which is never this network's. nil for an address that names the running network
+    /// (valid or not: a bad checksum is a format problem, `validityText`'s). Callers that pay an
+    /// address throw on any reason, so an unknown prefix can't slip through as "no reason".
     static func otherNetworkReason(_ address: String) -> String? {
         let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard NetworkType(address: trimmed) != nil else {
+            return AppLocalization.string("This address is not on the Kaspa network KaPlay is using.")
+        }
+        return knownOtherNetworkReason(trimmed)
+    }
+
+    /// A valid address of the other known network, with which one it is. nil otherwise.
+    private static func knownOtherNetworkReason(_ trimmed: String) -> String? {
         guard isValid(trimmed), let network = NetworkType(address: trimmed),
               network != AppSettings.load().networkType else { return nil }
         return AppLocalization.string(network == .testnet
@@ -1703,10 +1714,12 @@ extension KaspaAddress {
     }
 
     /// The line under an address field: "Valid address", the other-network reason, or "Invalid
-    /// address format".
+    /// address format" (a half-typed or prefix-less address too, so typing doesn't flash a
+    /// network warning).
     static func validityText(_ address: String, isValid: Bool) -> String {
         if isValid { return AppLocalization.string("Valid address") }
-        return otherNetworkReason(address) ?? AppLocalization.string("Invalid address format")
+        return knownOtherNetworkReason(address.trimmingCharacters(in: .whitespacesAndNewlines))
+            ?? AppLocalization.string("Invalid address format")
     }
 
     /// The same key's address on the network the app runs on, for an address with or without its
@@ -1838,11 +1851,12 @@ enum AppAppearance: String, Codable, CaseIterable {
     case light
     case dark
 
+    /// Translated, in the language picked in Settings (`AppLocalization`): show it verbatim.
     var displayName: String {
         switch self {
-        case .system: return "System"
-        case .light: return "Light"
-        case .dark: return "Dark"
+        case .system: return AppLocalization.string("System")
+        case .light: return AppLocalization.string("Light")
+        case .dark: return AppLocalization.string("Dark")
         }
     }
 
@@ -3086,7 +3100,7 @@ enum KasiaError: LocalizedError {
         case .invalidSeedPhrase:
             return "These words aren't valid. Please enter your 12 or 24 words."
         case .seedPhraseParsingFailed(let wordCount):
-            return "\(wordCount) words were entered. Please enter 12 or 24 words."
+            return String(format: AppLocalization.string("%lld words were entered. Please enter 12 or 24 words."), wordCount)
         case .mnemonicValidationFailed(let reason):
             return "These words aren't valid: \(reason)"
         case .invalidAddress:
@@ -3127,7 +3141,7 @@ struct SendOutcomeUnknownError: LocalizedError {
 
 enum UserFacingError {
     static func message(for error: Error) -> String {
-        if error is CancellationError { return "Cancelled." }
+        if error is CancellationError { return AppLocalization.string("Cancelled.") }
         if let kasia = error as? KasiaError {
             switch kasia {
             case .networkError(let text), .apiError(let text), .keychainError(let text), .encryptionError(let text):
@@ -3139,26 +3153,26 @@ enum UserFacingError {
         if let urlError = error as? URLError {
             switch urlError.code {
             case .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed, .internationalRoamingOff:
-                return "No internet connection. Check your connection and try again."
+                return AppLocalization.string("No internet connection. Check your connection and try again.")
             case .timedOut:
-                return "The connection timed out. Check your connection and try again."
+                return AppLocalization.string("The connection timed out. Check your connection and try again.")
             case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed, .badURL, .unsupportedURL:
-                return "Couldn't reach the server. Check the address in Settings and your connection."
+                return AppLocalization.string("Couldn't reach the server. Check the address in Settings and your connection.")
             case .secureConnectionFailed, .serverCertificateUntrusted, .serverCertificateHasBadDate,
                  .serverCertificateHasUnknownRoot, .serverCertificateNotYetValid, .clientCertificateRejected:
-                return "Couldn't make a secure connection to the server."
+                return AppLocalization.string("Couldn't make a secure connection to the server.")
             case .cancelled:
-                return "Cancelled."
+                return AppLocalization.string("Cancelled.")
             default:
-                return "A network error occurred. Check your connection and try again."
+                return AppLocalization.string("A network error occurred. Check your connection and try again.")
             }
         }
         if error is DecodingError {
-            return "The server sent something the app couldn't read. Try again; if it keeps happening, update the app."
+            return AppLocalization.string("The server sent something the app couldn't read. Try again; if it keeps happening, update the app.")
         }
         let typeName = String(describing: type(of: error))
         if typeName.hasPrefix("GRPC") {
-            return "The Kaspa node returned an error. The app will try another node; try again in a moment."
+            return AppLocalization.string("The Kaspa node returned an error. The app will try another node; try again in a moment.")
         }
         // LocalizedError conformers (NextcloudError, the swap client, ...) write their own
         // sentences; anything else gets Foundation's description with any prefix removed.
@@ -3172,7 +3186,7 @@ enum UserFacingError {
         for prefix in ["Network error: ", "API error: ", "Keychain error: ", "Encryption error: "] {
             if cleaned.hasPrefix(prefix) { cleaned = String(cleaned.dropFirst(prefix.count)) }
         }
-        return cleaned.isEmpty ? "Something went wrong. Please try again." : cleaned
+        return cleaned.isEmpty ? AppLocalization.string("Something went wrong. Please try again.") : AppLocalization.string(cleaned)
     }
 }
 
@@ -3186,9 +3200,9 @@ enum PoolType: Int, Codable, CaseIterable {
 
     var displayName: String {
         switch self {
-        case .hot: return "Hot"
-        case .warm: return "Warm"
-        case .cold: return "Cold"
+        case .hot: return AppLocalization.string("Hot")
+        case .warm: return AppLocalization.string("Warm")
+        case .cold: return AppLocalization.string("Cold")
         }
     }
 }

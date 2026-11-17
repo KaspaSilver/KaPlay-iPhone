@@ -541,6 +541,9 @@ final class ChatService: ObservableObject {
     var reservedMessageOutpoints: [String: Date] = [:]
     var pendingMessageUtxos: [String: (utxo: UTXO, expiresAt: Date)] = [:]
     let pendingMessageUtxoTTL: TimeInterval = 120
+    /// The longest a submitted transaction's coins stay held while it waits in a mempool
+    /// (`NodePoolService.holdSpentWhileInMempool` stretches the 120 s hold only while it's there).
+    static let spentOutpointMaxHold: TimeInterval = 600
     var outgoingAttemptsByMessageId: [UUID: OutgoingTxAttempt] = [:]
     var outgoingAttemptByPendingTxId: [String: UUID] = [:]
     var outgoingAttemptByRealTxId: [String: UUID] = [:]

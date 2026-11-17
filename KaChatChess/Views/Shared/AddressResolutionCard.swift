@@ -6,6 +6,11 @@ import SwiftUI
 /// `NameServicesClient.resolveEverywhere`); this card takes the outcome and shows the face and
 /// the name: the domain that was typed, else the address's own .kachat name. Nil address, no card - a half-typed
 /// address gets nothing rather than a card flickering through wrong faces.
+///
+/// Every screen with this card moves money, so the address's own .kachat name is never the
+/// cache's (any age, the indexer's word): it shows only once a lookup made for this card finds
+/// the name's owner on chain is this address (`KachatNamesRegistry.verifiedLabel`). Until then,
+/// or when that can't be checked, no .kachat name.
 struct AddressResolutionCard: View {
     /// The address the input stands for: a valid typed address, or a domain's resolved owner.
     let address: String?
@@ -15,15 +20,19 @@ struct AddressResolutionCard: View {
 
     @State private var profile: KNSAddressProfileInfo?
     @State private var isLoadingProfile = false
-    /// re-renders when the address's .kachat identity lands (`cachedIdentity` fills in the background)
-    @ObservedObject private var kachatRegistry = KachatNamesRegistry.shared
+    /// The address's .kachat name once checked on chain for this address, keyed by the address
+    /// it was checked for so a newer address never shows the previous one's name.
+    @State private var verifiedKachat: (address: String, label: String)?
+    @State private var isVerifyingName = false
 
-    /// The name to show: the domain typed, else the address's .kachat name.
+    /// The name to show: the domain typed, else the address's .kachat name checked on chain.
     private func displayName(for address: String) -> String? {
         if let domain { return domain }
-        if let label = kachatRegistry.cachedIdentity(for: address)?.label { return KachatNameLabel.display(label) }
+        if let verifiedKachat, verifiedKachat.address == address { return KachatNameLabel.display(verifiedKachat.label) }
         return profile?.domainName
     }
+
+    private var isLooking: Bool { isLoadingProfile || isVerifyingName }
 
     var body: some View {
         if let address, !address.isEmpty {
@@ -36,7 +45,7 @@ struct AddressResolutionCard: View {
                 )
                 VStack(alignment: .leading, spacing: 2) {
                     let name = displayName(for: address)
-                    Text(name ?? (isLoadingProfile ? "Looking up..." : "No domain"))
+                    Text(name ?? (isLooking ? AppLocalization.string("Looking up...") : AppLocalization.string("No domain")))
                         .font(.subheadline.weight(.semibold))
                         .foregroundColor(name == nil ? .secondary : .primary)
                         .lineLimit(1)
@@ -55,7 +64,7 @@ struct AddressResolutionCard: View {
                     }
                 }
                 Spacer(minLength: 0)
-                if isLoadingProfile { ProgressView().controlSize(.small) }
+                if isLooking { ProgressView().controlSize(.small) }
             }
             .padding(12)
             .background(
@@ -63,7 +72,21 @@ struct AddressResolutionCard: View {
                     .fill(Color.primary.opacity(0.05))
             )
             .task(id: address) { await loadProfile(for: address) }
+            .task(id: address) { await verifyKachatName(for: address) }
         }
+    }
+
+    /// Asks the registry for the address's .kachat name and checks it on chain; nothing is shown
+    /// from the cache meanwhile.
+    private func verifyKachatName(for address: String) async {
+        verifiedKachat = nil
+        isVerifyingName = false
+        guard domain == nil, KaspaAddress.isValid(address) else { return }
+        isVerifyingName = true
+        defer { if address == self.address { isVerifyingName = false } }
+        let label = await KachatNamesRegistry.shared.verifiedLabel(for: address)
+        guard !Task.isCancelled, address == self.address, let label else { return }
+        verifiedKachat = (address, label)
     }
 
     /// Cached by KNSService, so an address already looked at costs nothing.

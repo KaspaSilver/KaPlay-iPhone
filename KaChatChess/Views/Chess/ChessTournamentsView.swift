@@ -10,6 +10,8 @@ struct ChessTournamentsView: View {
         case duel = "1v1"
         case tournament = "Tournaments"
         var id: String { rawValue }
+        /// The raw value is the English key; this is what people read.
+        var title: LocalizedStringKey { LocalizedStringKey(rawValue) }
     }
     enum Tab: CaseIterable { case play, activeGames, finished }
     /// Both screens: play, Active (watch-only), Finished. The leaderboards have a tab of their
@@ -34,7 +36,11 @@ struct ChessTournamentsView: View {
     @State private var watchGame: (tournament: String, game: String)?
     /// The waiting room on screen (full-screen, nothing else reachable) - see ChessWaitingRoomView.
     @State private var waitingRoomId: String?
+    /// The note after the waiting room closed without a game; cleared by itself after a few
+    /// seconds, the same as the service's errors (`noticeToken` keeps a clear from wiping a
+    /// newer note).
     @State private var waitingNotice: String?
+    @State private var noticeToken = 0
 
     private var me: String? { walletManager.currentWallet?.publicAddress }
 
@@ -66,9 +72,9 @@ struct ChessTournamentsView: View {
             .listStyle(.insetGrouped)
             .gesture(tabSwipe())
         }
-        .fixedScreenTitle(Text(mode.rawValue))
+        .fixedScreenTitle(Text(mode.title))
         .background(Color(.systemGroupedBackground))
-        .navigationTitle(mode.rawValue)
+        .navigationTitle(Text(mode.title))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
@@ -107,15 +113,18 @@ struct ChessTournamentsView: View {
                             }
                         }
                     },
-                    onFinished: { expired in
+                    onFinished: { exit in
                         waitingRoomId = nil
-                        if expired { waitingNotice = "No one joined in time. You're out of the queue - join again whenever you like." }
+                        switch exit {
+                        case .quiet: break
+                        case .seatExpired: showNotice("No one joined in time. You're out of the queue - join again whenever you like.")
+                        case .joinNotLanded: showNotice(ChessTournamentService.joinNotLandedMessage)
+                        }
                     }
                 )
                 .environmentObject(walletManager)
             }
         }
-        .toast(message: waitingNotice, style: .error)
         // Back on this screen with a live seat (a relaunch, a tap on a public room card):
         // the waiting room is the only place to be.
         // Its status too: a room that fills keeps its id, and a player whose leave lost the race
@@ -174,14 +183,24 @@ struct ChessTournamentsView: View {
         } message: {
             Text("The eight-character code the creator shared. Joining is one transaction (fee: \(service.feeText(for: ChessTournamentCodec.join(id: "abcdefgh")) ?? "--")).")
         }
-        .toast(message: service.lastError, style: .error)
+        // One toast at a time: the waiting room's note first, then the service's error.
+        .toast(message: waitingNotice ?? service.lastError, style: .error)
         .onAppear { service.acquire() }
         .onDisappear { service.release() }
     }
 
-    private func tabTitle(_ tab: Tab) -> String {
+    private func showNotice(_ notice: String) {
+        noticeToken += 1
+        let token = noticeToken
+        waitingNotice = notice
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            if noticeToken == token { waitingNotice = nil }
+        }
+    }
+
+    private func tabTitle(_ tab: Tab) -> LocalizedStringKey {
         switch tab {
-        case .play: return mode.rawValue
+        case .play: return mode.title
         case .activeGames: return "Active"
         case .finished: return "Finished"
         }
@@ -251,7 +270,7 @@ struct ChessTournamentsView: View {
     private var duelSections: some View {
         Section {
             publicRoomCard(room: service.currentDuelRoom, id: service.currentDuelRoomId,
-                           title: "Public 1v1 #\(ChessTournamentCodec.duelNumber(of: service.currentDuelRoomId) ?? 1)",
+                           title: ChessText.format("Public 1v1 #%lld", ChessTournamentCodec.duelNumber(of: service.currentDuelRoomId) ?? 1),
                            capacity: 2) { await service.joinPublicDuelQueue() }
         } header: {
             Text("Public")
@@ -260,7 +279,7 @@ struct ChessTournamentsView: View {
         }
         Section {
             ForEach(service.myPrivateDuels) { duel in
-                tournamentRow(duel, action: duel.status == .open ? "Waiting" : (service.hasUnclaimedWin(duel) ? "Claim win" : "In play"))
+                tournamentRow(duel, action: ChessText.string(duel.status == .open ? "Waiting" : (service.hasUnclaimedWin(duel) ? "Claim win" : "In play")))
             }
             Button {
                 privateCode = ""
@@ -311,7 +330,7 @@ struct ChessTournamentsView: View {
             // of it, every game a tap away to see the board as it was left.
             Section {
                 ForEach(done) { tournament in
-                    tournamentRow(tournament, action: tournament.champion.map { "Won by \(name(for: $0))" } ?? "Finished")
+                    tournamentRow(tournament, action: tournament.champion.map { ChessText.format("Won by %@", name(for: $0)) } ?? ChessText.string("Finished"))
                 }
             } header: {
                 Text("Finished tournaments")
@@ -336,8 +355,8 @@ struct ChessTournamentsView: View {
                     }
                     .font(.subheadline)
                     .lineLimit(1)
-                    Text((tournament.isDuel ? tournament.name : (game.round == 3 ? "Final" : (game.round == 2 ? "Semifinal" : "Round 1")))
-                         + " · " + finishedText(game))
+                    Text(verbatim: (tournament.isDuel ? tournament.displayName : ChessText.roundTitle(game.round, isDuel: false))
+                         + " · " + ChessText.resultSummary(game, now: service.now, name: name(for:)))
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .lineLimit(1)
@@ -350,21 +369,6 @@ struct ChessTournamentsView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-    }
-
-    private func finishedText(_ game: ChessTournamentGame) -> String {
-        guard let winner = game.winner, let outcome = game.outcome else {
-            // Out of clock, claim not posted: the same result, said the same way.
-            if let winner = game.decidedWinner(at: service.now) { return "\(name(for: winner)) won on time" }
-            return "finished"
-        }
-        let who = name(for: winner)
-        switch outcome {
-        case .checkmate: return "\(who) won by checkmate"
-        case .resignation: return "\(who) won by resignation"
-        case .timeout: return "\(who) won on time"
-        case .drawTiebreak(let reason): return "\(who) won on clock after a draw (\(reason))"
-        }
     }
 
     // MARK: - Active games (watch only)
@@ -405,9 +409,9 @@ struct ChessTournamentsView: View {
                     ForEach(games) { game in
                         liveGameRow(game, in: tournament)
                     }
-                    tournamentRow(tournament, action: "Bracket")
+                    tournamentRow(tournament, action: ChessText.string("Bracket"))
                 } header: {
-                    Text(tournament.name)
+                    Text(verbatim: tournament.displayName)
                 }
             }
         }
@@ -430,13 +434,13 @@ struct ChessTournamentsView: View {
                     }
                     .font(.subheadline)
                     .lineLimit(1)
-                    Text((tournament.isDuel ? tournament.name : (game.round == 3 ? "Final" : (game.round == 2 ? "Semifinal" : "Round 1")))
-                         + " · move \(game.moves.count / 2 + 1) · \(game.sideToMove == .white ? "white" : "black") to move")
+                    Text(verbatim: (tournament.isDuel ? tournament.displayName : ChessText.roundTitle(game.round, isDuel: false))
+                         + " · " + ChessText.moveLine(game))
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
                 Spacer()
-                Text(clockText(game.remainingMs(game.sideToMove, at: service.now)))
+                Text(verbatim: ChessText.clock(game.remainingMs(game.sideToMove, at: service.now)))
                     .font(.caption.monospacedDigit().weight(.semibold))
                     .foregroundColor(.secondary)
                 Text("Watch")
@@ -451,18 +455,13 @@ struct ChessTournamentsView: View {
         .buttonStyle(.plain)
     }
 
-    private func clockText(_ ms: Int64) -> String {
-        let seconds = Int(ms / 1000)
-        return String(format: "%d:%02d", seconds / 60, seconds % 60)
-    }
-
     // MARK: - Tournaments
 
     @ViewBuilder
     private var tournamentSections: some View {
         Section {
             publicRoomCard(room: service.currentPublicRoom, id: service.currentPublicRoomId,
-                           title: "Public tournament #\(ChessTournamentCodec.publicNumber(of: service.currentPublicRoomId) ?? 1)",
+                           title: ChessText.format("Public tournament #%lld", ChessTournamentCodec.publicNumber(of: service.currentPublicRoomId) ?? 1),
                            capacity: ChessTournamentCodec.playerCount) { await service.joinPublicQueue() }
         } header: {
             Text("Public")
@@ -471,7 +470,9 @@ struct ChessTournamentsView: View {
         }
         Section {
             ForEach(service.myPrivateTournaments) { tournament in
-                tournamentRow(tournament, action: tournament.status == .open ? "\(tournament.seatsLeft) seat\(tournament.seatsLeft == 1 ? "" : "s") left" : (service.hasUnclaimedWin(tournament) ? "Claim win" : "In play"))
+                tournamentRow(tournament, action: tournament.status == .open
+                              ? ChessText.seatsLeft(tournament.seatsLeft)
+                              : ChessText.string(service.hasUnclaimedWin(tournament) ? "Claim win" : "In play"))
             }
             Button {
                 privateCode = ""
@@ -513,8 +514,8 @@ struct ChessTournamentsView: View {
                         Text(capacity == 2 ? "Public 1v1" : "Public tournament").font(.headline)
                         Text("Seats can't be checked right now").font(.caption).foregroundColor(.secondary)
                     } else {
-                        Text(title).font(.headline)
-                        Text("\(count) of \(capacity) player\(capacity == 1 ? "" : "s") waiting").font(.caption).foregroundColor(.secondary)
+                        Text(verbatim: title).font(.headline)
+                        Text(verbatim: ChessText.playersWaiting(count, of: capacity)).font(.caption).foregroundColor(.secondary)
                     }
                 }
                 Spacer()
@@ -529,15 +530,16 @@ struct ChessTournamentsView: View {
                 }
             }
             if inThisRoom, let room {
-                pill("You're in. Waiting for \(max(0, capacity - count)) more…", filled: false) { waitingRoomId = room.id }
+                let more = max(0, capacity - count)
+                pill(more == 1 ? ChessText.string("You're in. Waiting for 1 more…") : ChessText.format("You're in. Waiting for %lld more…", more), filled: false) { waitingRoomId = room.id }
             } else if let mine = service.myActiveTournament, busyElsewhere {
-                pill(mine.status == .open ? "You're waiting in \(mine.name)" : "You're playing in \(mine.name)", filled: false) {
+                pill(ChessText.whereYouAre(mine), filled: false) {
                     if mine.status == .open { waitingRoomId = mine.id } else { openTournamentId = mine.id }
                 }
             } else if unconfirmed {
-                pill("Waiting for the chess server", filled: false) {}
+                pill(ChessText.string("Waiting for the chess server"), filled: false) {}
             } else {
-                pill(isJoining ? "Joining…" : (service.historyReady ? service.joinLabel(roomId: id) : "Loading rooms…"), filled: service.historyReady) {
+                pill(isJoining ? ChessText.string("Joining…") : (service.historyReady ? service.joinLabel(roomId: id) : ChessText.string("Loading rooms…")), filled: service.historyReady) {
                     guard !isJoining, service.historyReady else { return }
                     Haptics.impact(.light)
                     isJoining = true
@@ -553,9 +555,10 @@ struct ChessTournamentsView: View {
         .padding(.vertical, 4)
     }
 
+    /// `text` is already in the app's language (`ChessText`).
     private func pill(_ text: String, filled: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Text(text)
+            Text(verbatim: text)
                 .font(.subheadline.weight(.semibold))
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 10)
@@ -581,16 +584,16 @@ struct ChessTournamentsView: View {
                     .foregroundColor(.accentColor)
                     .frame(width: 32)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(tournament.name)
+                    Text(verbatim: tournament.displayName)
                         .font(.headline)
                         .lineLimit(1)
-                    Text("\(tournament.players.count) of \(tournament.capacity) players" + (tournament.isPublic ? "" : " · code \(tournament.id)"))
+                    Text(verbatim: ChessText.playerCount(tournament))
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .lineLimit(1)
                 }
                 Spacer()
-                Text(action)
+                Text(verbatim: action)
                     .font(.caption.weight(.semibold))
                     .foregroundColor(.accentColor)
                 Image(systemName: "chevron.right")
@@ -611,13 +614,20 @@ struct ChessLeaderboardRows: View {
     let mode: ChessTournamentsView.Mode
     @ObservedObject private var service = ChessTournamentService.shared
     @EnvironmentObject private var walletManager: WalletManager
-    /// The player whose row was tapped, for their card (`ChessPlayerView`).
-    @State private var profileContact: Contact?
+    /// The address whose row was tapped, for their card (`ChessPlayerView`). KaPlay has no
+    /// contacts: nothing is saved for it.
+    @State private var profileAddress: String?
     @State private var period: ChessLeaderboardPeriod = .month
+    /// The board sorted for this kind, worked out when the board or the period changes - not on
+    /// every tick of the service's clock, which re-renders this view once a second. nil until
+    /// the first sort.
+    @State private var sortedRows: [ChessLeaderboardRow]?
 
-    private var rows: [ChessLeaderboardRow] {
+    private var rows: [ChessLeaderboardRow] { sortedRows ?? [] }
+
+    private func sortRows() {
         let board = service.board(for: period)
-        return mode == .duel
+        sortedRows = mode == .duel
             ? ChessTournamentEngine.duelLeaderboard(board)
             : ChessTournamentEngine.tournamentLeaderboard(board)
     }
@@ -634,11 +644,11 @@ struct ChessLeaderboardRows: View {
     private var periodNote: String {
         switch period {
         case .month:
-            return String(localized: "Resets on the 1st of every month (UTC).")
+            return AppLocalization.string("Resets on the 1st of every month (UTC).")
         case .allTime:
             let since = Date(timeIntervalSince1970: TimeInterval(ChessTournamentEngine.leaderboardFreshFromMs) / 1000)
-            let day = since.formatted(.dateTime.year().month(.wide).day())
-            return String(format: String(localized: "Counted from %@."), day)
+            let day = since.formatted(.dateTime.year().month(.wide).day().locale(AppLocalization.locale))
+            return ChessText.format("Counted from %@.", day)
         }
     }
 
@@ -656,23 +666,22 @@ struct ChessLeaderboardRows: View {
             .listRowBackground(Color.clear)
             .listRowInsets(EdgeInsets())
         } footer: {
-            Text(periodNote)
+            Text(verbatim: periodNote)
         }
         .onAppear { service.refreshIndexerLeaderboards() }
         .onChange(of: period) { _ in service.refreshIndexerLeaderboards() }
         Section {
-            if rows.isEmpty {
+            if sortedRows?.isEmpty == true {
                 Text(emptyText)
                     .font(.subheadline)
                     .foregroundColor(.secondary)
             }
             ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
                 Button {
-                    let contacts = ContactsManager.shared
-                    profileContact = contacts.getContact(byAddress: row.address) ?? contacts.getOrCreateContact(address: row.address)
+                    profileAddress = row.address
                 } label: {
                 HStack(spacing: 12) {
-                    Text("\(index + 1)")
+                    Text(verbatim: "\(index + 1)")
                         .font(.subheadline.monospacedDigit().weight(.semibold))
                         .foregroundColor(.secondary)
                         .frame(width: 28, alignment: .trailing)
@@ -700,7 +709,7 @@ struct ChessLeaderboardRows: View {
                         HStack(spacing: 10) {
                             HStack(spacing: 4) {
                                 Image(systemName: "trophy.fill").foregroundColor(.yellow)
-                                Text("\(row.tournamentsWon)").foregroundColor(.yellow)
+                                Text(verbatim: "\(row.tournamentsWon)").foregroundColor(.yellow)
                             }
                             Text("\(row.tournamentsLost) L").foregroundColor(.red)
                         }
@@ -717,13 +726,16 @@ struct ChessLeaderboardRows: View {
         } header: {
             Text(mode == .duel ? "Games won and lost - 1v1s and tournament games alike" : "Tournaments won and lost")
         }
+        .onAppear { sortRows() }
+        .onChange(of: service.boardsRevision) { _ in sortRows() }
+        .onChange(of: period) { _ in sortRows() }
         .sheet(isPresented: Binding(
-            get: { profileContact != nil },
-            set: { if !$0 { profileContact = nil } }
+            get: { profileAddress != nil },
+            set: { if !$0 { profileAddress = nil } }
         )) {
-            if let contact = profileContact {
+            if let address = profileAddress {
                 NavigationStack {
-                    ChessPlayerView(address: contact.address)
+                    ChessPlayerView(address: address)
                 }
             }
         }

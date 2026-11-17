@@ -240,7 +240,7 @@ struct ManageAddressesView: View {
                 .foregroundColor(.secondary)
             Text("No Spending Addresses")
                 .font(.headline)
-            Text("Generate one below to send payments from a separate address than your main one.")
+            Text("Generate one below to send payments from a separate address than your Chatting Address.")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
@@ -446,8 +446,8 @@ struct ManageAddressesView: View {
                     Text("Checking address #\(progress.checkingIndex)")
                         .font(.subheadline.weight(.semibold))
                     Text(progress.foundCount == 0
-                         ? "No addresses with a balance or domain yet"
-                         : "\(progress.foundCount) found so far")
+                         ? LocalizedStringKey("No addresses with a balance or domain yet")
+                         : LocalizedStringKey("\(progress.foundCount) found so far"))
                         .font(.caption)
                         .foregroundColor(.secondary)
                     Text("Checks the first thousand addresses whatever the gaps, then keeps going while it keeps finding.")
@@ -834,7 +834,8 @@ struct ManageAddressesView: View {
             // showToast auto-dismisses on the standard timer and replaces (never stacks or
             // extends) any toast a rapid earlier press put up. The old direct assignment
             // here never scheduled a dismissal, so the success toast lingered indefinitely.
-            showToast("Address #\(WalletManager.addressNumber(forIndex: index)) is ready.")
+            showToast(String(format: AppLocalization.string("Address #%d is ready."), locale: AppLocalization.locale,
+                             WalletManager.addressNumber(forIndex: index)))
             Task { await loadEntries() }
         }
     }
@@ -874,9 +875,14 @@ struct ManageAddressesView: View {
             discoveryProgress = nil
             // The count is addresses that hold a balance or a KNS domain - say so, rather than
             // "used", which is what the old high-water-mark number implied and was not.
+            // Singular and plural are separate keys (no .stringsdict); filled in here, in the
+            // in-app language, since the toast can't look up a finished sentence.
             let summary = discovered == 0
-                ? "No addresses with a balance or domain found."
-                : "Found \(discovered) address\(discovered == 1 ? "" : "es") with a balance or domain."
+                ? AppLocalization.string("No addresses with a balance or domain found.")
+                : String(format: AppLocalization.string(discovered == 1
+                                                        ? "Found %d address with a balance or domain."
+                                                        : "Found %d addresses with a balance or domain."),
+                         locale: AppLocalization.locale, discovered)
             discoverySummary = summary
             // Closed the sheet and carried on? Then the summary above has nowhere to render, so
             // say it here instead of finishing silently.
@@ -1096,7 +1102,8 @@ struct SpendingAddressWithdrawView: View {
     private var review: some View {
             SwipeUpToSendScrollView(
                 screenTitle: isCompoundMode ? "Compound UTXOs"
-                    : "Send Kaspa from Address #\(WalletManager.addressNumber(forIndex: source.index))",
+                    : String(format: AppLocalization.string("Send Kaspa from Address #%d"), locale: AppLocalization.locale,
+                             WalletManager.addressNumber(forIndex: source.index)),
                 onCancel: { dismiss() },
                 title: isCompoundMode ? "Swipe up to Consolidate" : "Swipe up to Send",
                 isBusy: isSending,
@@ -1239,7 +1246,7 @@ struct SpendingAddressWithdrawView: View {
                 } catch {
                     guard !Task.isCancelled else { return }
                     // not the base fee plus the extra: the send itself would fail the same way
-                    tippedFeeError = UserFacingError.message(for: error)
+                    tippedFeeError = AppLocalization.string(UserFacingError.message(for: error))
                 }
                 isEstimatingTippedFee = false
             }
@@ -1262,7 +1269,7 @@ struct SpendingAddressWithdrawView: View {
                 } catch {
                     guard !Task.isCancelled else { return }
                     // said, not just a swipe that never turns on
-                    feeError = UserFacingError.message(for: error)
+                    feeError = AppLocalization.string(UserFacingError.message(for: error))
                 }
                 isEstimatingFee = false
             }
@@ -1301,6 +1308,13 @@ struct SpendingAddressWithdrawView: View {
 
     private func handleInputChange(_ input: String) {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        // An upper-case address (a compact QR code's "KASPA:QR...") goes into the field in lower
+        // case; that change comes back here through the field's onChange. As in KaPay.
+        let lowered = lowercasedKaspaAddress(trimmed)
+        if lowered != trimmed {
+            addressInput = lowered
+            return
+        }
 
         resolvedAddress = nil
         resolvedDomain = nil
@@ -1314,7 +1328,7 @@ struct SpendingAddressWithdrawView: View {
             return
         }
 
-        if trimmed.hasPrefix("kaspa:") || trimmed.hasPrefix("kaspatest:") {
+        if trimmed.lowercased().hasPrefix("kaspa:") || trimmed.lowercased().hasPrefix("kaspatest:") {
             // the other network's address is the same key on another chain: refused
             isValidAddress = KaspaAddress.isValidOnActiveNetwork(trimmed)
             return
@@ -1377,6 +1391,7 @@ struct SpendingAddressWithdrawView: View {
             if let queryIndex = address.firstIndex(of: "?") {
                 address = String(address[..<queryIndex])
             }
+            address = lowercasedKaspaAddress(address)
         }
         addressInput = address
         handleInputChange(address)
@@ -1406,14 +1421,14 @@ struct SpendingAddressWithdrawView: View {
                     await MainActor.run {
                         guard maxRequest == request else { return }
                         manualUtxos = utxos
-                        amountInput = fiatAmountState.setMaxKas(Double(maxSompi) / 100_000_000.0, priceInCurrency: priceStore.currentPriceUsd)
+                        amountInput = fiatAmountState.setMaxKas(Double(maxSompi) / 100_000_000.0, priceInCurrency: priceStore.networkPriceUsd)
                         isEstimatingMax = false
                     }
                 } else {
                     let result = try await chatService.estimateMaxSpendingAddressAmount(index: source.index, toAddress: recipient, manualUtxos: manualUtxos, extraFeeSompi: fixedExtra, feeMultiplier: multiplier)
                     await MainActor.run {
                         guard maxRequest == request else { return }
-                        amountInput = fiatAmountState.setMaxKas(Double(result.amountSompi) / 100_000_000.0, priceInCurrency: priceStore.currentPriceUsd)
+                        amountInput = fiatAmountState.setMaxKas(Double(result.amountSompi) / 100_000_000.0, priceInCurrency: priceStore.networkPriceUsd)
                         maxAmountText = amountInput
                         cappedMaxAmount = result.cappedAtInputLimit ? amountInput : nil
                         isEstimatingMax = false
@@ -1422,7 +1437,7 @@ struct SpendingAddressWithdrawView: View {
             } catch {
                 await MainActor.run {
                     guard maxRequest == request else { return }
-                    errorMessage = UserFacingError.message(for: error)
+                    errorMessage = AppLocalization.string(UserFacingError.message(for: error))
                     isEstimatingMax = false
                 }
             }
@@ -1472,7 +1487,7 @@ struct SpendingAddressWithdrawView: View {
             } catch {
                 await MainActor.run {
                     isSending = false
-                    errorMessage = UserFacingError.message(for: error)
+                    errorMessage = AppLocalization.string(UserFacingError.message(for: error))
                     // nothing went out; Try Again goes back to a Review with the fee of today's coins
                     if error is SendFeeChangedError { feeRefresh += 1 }
                 }
@@ -1688,7 +1703,7 @@ private struct SpendingAddressPrivateKeyView: View {
     @State private var toastToken = UUID()
 
     private var privateKeyHex: String {
-        WalletManager.shared.spendingPrivateKey(at: entry.index)?.hexString ?? "Unavailable"
+        WalletManager.shared.spendingPrivateKey(at: entry.index)?.hexString ?? AppLocalization.string("Unavailable")
     }
 
     var body: some View {
@@ -1889,7 +1904,7 @@ struct SpendingAddressTransactionHistoryView: View {
                 onViewPrivateKey: {
                     afterAddressActions = {
                         if settingsViewModel.settings.biometricSpendingKeyEnabled {
-                            DeviceAuth.authenticate(reason: "Unlock to view this address's private key") {
+                            DeviceAuth.authenticate(reason: AppLocalization.string("Unlock to view this address's private key")) {
                                 showPrivateKeySheet = true
                             }
                         } else {
@@ -2148,7 +2163,7 @@ struct SpendingAddressTransactionHistoryView: View {
             utxoLoadError = nil
         } catch {
             // The list keeps what it had; an outage is not an empty address.
-            utxoLoadError = UserFacingError.message(for: error)
+            utxoLoadError = AppLocalization.string(UserFacingError.message(for: error))
         }
         isLoadingUtxos = false
     }

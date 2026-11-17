@@ -7,7 +7,7 @@ struct KNSDomainCard: View {
     var isPrimary: Bool = false
 
     var body: some View {
-        DomainNameCardView(title: domain.fullName, badge: isPrimary ? String(localized: "Primary") : nil)
+        DomainNameCardView(title: domain.fullName, badge: isPrimary ? AppLocalization.string("Primary") : nil)
     }
 }
 

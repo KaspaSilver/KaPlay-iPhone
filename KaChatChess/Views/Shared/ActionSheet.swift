@@ -179,6 +179,7 @@ extension KaspaFullTransactionResponse: Identifiable {
 /// own next to the action it belongs to, which is what someone about to log out or delete
 /// something is actually reading for.
 struct ConfirmActionSheet: View {
+    /// A key: looked up in the in-app language (as `ActionSheetRow` does its title).
     let title: String
     let confirmTitle: String
     /// What actually happens if they go ahead - the row's second line.
@@ -191,7 +192,7 @@ struct ConfirmActionSheet: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            Text(title)
+            Text(LocalizedStringKey(title))
                 .font(.headline)
                 .multilineTextAlignment(.center)
                 .padding(.top, 20)
@@ -209,12 +210,11 @@ struct ConfirmActionSheet: View {
                 subtitle: "Leave everything as it is.",
                 systemImage: "xmark"
             ) { dismiss() }
-
-            Spacer(minLength: 0)
         }
         .padding(.horizontal, 20)
         .padding(.bottom, 20)
-        .presentationDetents([.height(280)])
+        // Measured, not a fixed 280: larger text or a longer language pushed Cancel off the bottom.
+        .fittedSheetDetent(estimate: 280)
         .presentationDragIndicator(.visible)
     }
 }
@@ -451,7 +451,7 @@ struct UtxoLoadFailureRow: View {
             Label("Couldn't load the coins at this address", systemImage: "exclamationmark.triangle")
                 .font(.subheadline.weight(.semibold))
                 .foregroundColor(.red)
-            Text(detail)
+            Text(verbatim: AppLocalization.string(detail))
                 .font(.caption)
                 .foregroundColor(.secondary)
             Button("Try Again", action: retry)

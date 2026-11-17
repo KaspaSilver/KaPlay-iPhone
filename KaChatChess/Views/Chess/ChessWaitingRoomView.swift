@@ -6,11 +6,23 @@ import SwiftUI
 /// happening. Your avatar, a question mark for every empty seat (filled in as players arrive),
 /// the time your seat is held for, and Leave behind a warning.
 struct ChessWaitingRoomView: View {
+    /// Why the room closed without a game, for the note the host shows.
+    enum Exit {
+        /// Left, lost the race for the last seat (the service joins the next room), or
+        /// cancelled: nothing to say.
+        case quiet
+        /// The seat ran out with no one joining.
+        case seatExpired
+        /// The player's own join (or create) never reached the network and was dropped.
+        case joinNotLanded
+    }
+
     let tournamentId: String
     /// The room filled and the game exists: the host opens it and closes this screen.
     let onStarted: (String) -> Void
-    /// Left, or the seat ran out: the host closes this screen (with a note when it ran out).
-    let onFinished: (_ seatExpired: Bool) -> Void
+    /// Left, the seat ran out, or the join never landed: the host closes this screen (with a
+    /// note for the last two).
+    let onFinished: (Exit) -> Void
 
     @ObservedObject private var service = ChessTournamentService.shared
     @EnvironmentObject private var walletManager: WalletManager
@@ -24,6 +36,9 @@ struct ChessWaitingRoomView: View {
     /// board, if the room filled first.
     @State private var leftByChoice = false
     @State private var appearedAt: Int64?
+    /// When the seat seen here runs out (chain time): not seated before then means the seat was
+    /// never really ours - the join was dropped - not that it ran out.
+    @State private var seenSeatExpiry: Int64?
     /// A join that never shows up (ignored, or never mined) does not hold this screen forever.
     private static let seatWaitMs: Int64 = 30_000
 
@@ -42,7 +57,7 @@ struct ChessWaitingRoomView: View {
                         .font(.title.weight(.heavy))
                     seats
                     VStack(spacing: 6) {
-                        Text("\(matchFoundSecondsLeft)")
+                        Text(verbatim: "\(matchFoundSecondsLeft)")
                             .font(.scaled(size: 56, weight: .bold, design: .rounded).monospacedDigit())
                             .contentTransition(.numericText())
                             .animation(.easeInOut(duration: 0.2), value: matchFoundSecondsLeft)
@@ -93,7 +108,7 @@ struct ChessWaitingRoomView: View {
         .interactiveDismissDisabled()
         .sheet(isPresented: $showLeaveWarning) {
             leaveSheet
-                .presentationDetents([.height(300)])
+                .fittedSheetDetent(estimate: 300)
                 .presentationDragIndicator(.visible)
         }
         .onAppear { service.acquire(); appearedAt = service.now; check() }
@@ -121,7 +136,15 @@ struct ChessWaitingRoomView: View {
             Spacer(minLength: 0)
             VStack(spacing: 10) {
                 Button {
-                    guard let tournament, !isLeaving else { return }
+                    guard !isLeaving, !handedOff else { return }
+                    // No room on this phone (the join or create that made it was dropped):
+                    // there's no seat to give back - just close.
+                    guard let tournament else {
+                        showLeaveWarning = false
+                        handedOff = true
+                        onFinished(.quiet)
+                        return
+                    }
                     isLeaving = true
                     showLeaveWarning = false
                     Task {
@@ -173,13 +196,24 @@ struct ChessWaitingRoomView: View {
     }
 
     private func check() {
-        guard !handedOff, let tournament, let me else { return }
+        guard !handedOff, let me else { return }
+        let waited = service.now - (appearedAt ?? service.now) > Self.seatWaitMs
+        guard let tournament else {
+            // The room is on this phone only through this player's own create or first join,
+            // and that row was dropped (it never reached the network): it is gone, and so is
+            // the reason to hold this screen.
+            if wasSeated || waited {
+                handedOff = true
+                onFinished(wasSeated ? .joinNotLanded : .quiet)
+            }
+            return
+        }
         if tournament.status == .live || tournament.status == .finished {
             // Filled without us: our join lost the race for the last seat. Not a match - the
             // room closes, and the service joins the next room by itself.
             guard tournament.players.contains(me) else {
                 handedOff = true
-                onFinished(false)
+                onFinished(.quiet)
                 return
             }
             // Filled: hold for the match-found countdown (chain time, the same on every phone),
@@ -190,12 +224,21 @@ struct ChessWaitingRoomView: View {
             onStarted(tournament.id)
         } else if tournament.status == .cancelled {
             handedOff = true
-            onFinished(false)
+            onFinished(.quiet)
         } else if tournament.isSeated(me, at: service.now) {
             wasSeated = true
-        } else if wasSeated || service.now - (appearedAt ?? service.now) > Self.seatWaitMs {
+            seenSeatExpiry = tournament.seatExpiry(of: me)
+        } else if wasSeated || waited {
             handedOff = true
-            onFinished(wasSeated && !leftByChoice)
+            if leftByChoice || !wasSeated {
+                onFinished(.quiet)
+            } else if let expiry = seenSeatExpiry, service.now < expiry {
+                // Out of the room while the seat still had time: the seat rested on a join the
+                // network never took, and it was dropped.
+                onFinished(.joinNotLanded)
+            } else {
+                onFinished(.seatExpired)
+            }
         }
     }
 
@@ -260,7 +303,7 @@ struct ChessWaitingRoomView: View {
                 } label: {
                     Image(systemName: "doc.on.doc")
                 }
-                ShareLink(item: "Play me at chess in KaPlay: open Play > \(tournament.isDuel ? "1v1" : "Tournaments") > Join with a code, and enter \(tournament.id)") {
+                ShareLink(item: ChessText.invite(for: tournament)) {
                     Image(systemName: "square.and.arrow.up")
                 }
             }
@@ -271,7 +314,7 @@ struct ChessWaitingRoomView: View {
         let expiry = me.flatMap { tournament?.seatExpiry(of: $0) } ?? service.now
         let left = max(0, Int((expiry - service.now) / 1000))
         return VStack(spacing: 4) {
-            Text(String(format: "%d:%02d", left / 60, left % 60))
+            Text(verbatim: String(format: "%d:%02d", left / 60, left % 60))
                 .font(.scaled(size: 44, weight: .semibold, design: .rounded).monospacedDigit())
                 .foregroundColor(left < 30 ? .red : .primary)
             Text("Your seat is held this long. If no one joins in time, you leave the queue.")

@@ -161,9 +161,30 @@ final class PublicChatService: ObservableObject {
     /// claim waits for one newer than the flag.
     private(set) var arenaIndexerAnsweredAt: Int64 = 0
 
-    private func noteArenaAnswered(channel: String, askedAt: Int64) {
-        guard channel == ChessTournamentCodec.arenaChannel, deepBackfilledChannels.contains(channel) else { return }
+    /// The newest page of the arena answered at `arenaNewestAnsweredAt` (wall ms, when it was
+    /// asked for), and the rows from `arenaCoveredFrom` (block time) up to then are all in the
+    /// store: the newest page plus the older pages paged in after it. Kept while older history
+    /// is still being paged - or keeps failing - so a game that started inside that stretch can
+    /// be judged from a fresh answer (`arenaAnsweredAt(covering:)`).
+    private var arenaNewestAnsweredAt: Int64 = 0
+    private var arenaCoveredFrom: Int64 = .max
+
+    private func noteArenaAnswered(channel: String, askedAt: Int64, coveredFrom: Int64?) {
+        guard channel == ChessTournamentCodec.arenaChannel else { return }
+        if let coveredFrom {
+            arenaNewestAnsweredAt = max(arenaNewestAnsweredAt, askedAt)
+            arenaCoveredFrom = coveredFrom
+        }
+        guard deepBackfilledChannels.contains(channel) else { return }
         arenaIndexerAnsweredAt = max(arenaIndexerAnsweredAt, askedAt)
+    }
+
+    /// When the newest indexer answer that holds every arena row since `since` (block time) was
+    /// asked for (wall ms), or 0: the whole window paged in, or a newest page over a stretch
+    /// paged in without a gap that reaches back to `since`.
+    func arenaAnsweredAt(covering since: Int64) -> Int64 {
+        if arenaBackfillDone { return arenaIndexerAnsweredAt }
+        return since >= arenaCoveredFrom ? arenaNewestAnsweredAt : 0
     }
 
     /// The arena's history is paged in, as far as this session owes it.
@@ -205,16 +226,31 @@ final class PublicChatService: ObservableObject {
     /// Down: on cellular the block stream comes back on (`scanWantedChannels`). Back: the arena is
     /// paged in again, since the steady poll's newest rows can't reach back over an outage, and
     /// the indexer's block times replace what the stream gave meanwhile.
+    /// Only the outage is paged again when the history before it was all in: a flaky indexer
+    /// re-paged the whole 30 days on every return.
     private func arenaIndexerAvailabilityChanged(down: Bool) {
         arenaIndexerDown = down
-        if !down {
-            deepBackfilledChannels.remove(ChessTournamentCodec.arenaChannel)
-            deepBackfillResume[ChessTournamentCodec.arenaChannel] = nil
-            backfillFloor[ChessTournamentCodec.arenaChannel] = nil
-            arenaIndexerAnsweredAt = 0
+        let channel = ChessTournamentCodec.arenaChannel
+        let wallNow = Int64(Date().timeIntervalSince1970 * 1000)
+        if down {
+            arenaDownSince = wallNow
+        } else {
+            if deepBackfilledChannels.contains(channel), let since = arenaDownSince {
+                requestRepage(channel: channel, since: since - Self.repageMarginMs)
+            } else {
+                deepBackfilledChannels.remove(channel)
+                deepBackfillResume[channel] = nil
+                backfillFloor[channel] = nil
+                arenaIndexerAnsweredAt = 0
+                arenaNewestAnsweredAt = 0
+                arenaCoveredFrom = .max
+            }
+            arenaDownSince = nil
         }
         updateScanningStateIfNeeded()
     }
+    /// When the arena's indexer was last seen going down (wall ms).
+    private var arenaDownSince: Int64?
 
     /// When the app-wide indexer was last asked which rooms it tracks.
     private var trackedRoomsCheckedAt: (base: String, at: Date)?
@@ -260,8 +296,11 @@ final class PublicChatService: ObservableObject {
             // start from nothing.
             deepBackfilledChannels = []
             deepBackfillResume = [:]
+            failedBackfillResumes = [:]
             indexerFetchedChannels = []
             arenaIndexerAnsweredAt = 0
+            arenaNewestAnsweredAt = 0
+            arenaCoveredFrom = .max
             indexerCoveredUntil = [:]
             backfillFloor = [:]
             localStampSentAt = normalized.map { Self.loadLocalStamps(wallet: $0) } ?? [:]
@@ -366,7 +405,7 @@ final class PublicChatService: ObservableObject {
         repageIfPollingLapsed(channel: channel, now: askedAt)
         do {
             let page = try await PublicChatIndexerClient.fetchHistoryPage(baseURL: base, channel: channel, limit: 40)
-            defer { noteArenaAnswered(channel: channel, askedAt: askedAt) }
+            defer { noteArenaAnswered(channel: channel, askedAt: askedAt, coveredFrom: nil) }
             // Guarded: inserting an element that is already there still publishes, which
             // re-rendered an open room on every sweep for nothing.
             if !indexerFetchedChannels.contains(channel) { indexerFetchedChannels.insert(channel) }
@@ -671,6 +710,10 @@ final class PublicChatService: ObservableObject {
     /// busy room - restarted the whole pager from page 1 on the next 8s tick, and kept doing
     /// so until every page happened to succeed in one go.
     private var deepBackfillResume: [String: (before: Int64, pagesLeft: Int)] = [:]
+    /// Backfill attempts in a row that failed without paging anything, per channel; at
+    /// `maxFailedBackfillResumes` the failing page is passed over.
+    private var failedBackfillResumes: [String: Int] = [:]
+    private static let maxFailedBackfillResumes = 3
     private static let indexerPollIntervalNanos: UInt64 = 8 * 1_000_000_000
     /// When the newest answered poll of a room was asked for (wall ms). Anything older than this
     /// that a newest-rows poll can't reach (app in the background, room closed, polls failing)
@@ -697,7 +740,11 @@ final class PublicChatService: ObservableObject {
         } else if let floor = backfillFloor[channel] {
             backfillFloor[channel] = min(floor, since)
         }
-        if channel == ChessTournamentCodec.arenaChannel { arenaIndexerAnsweredAt = 0 }
+        if channel == ChessTournamentCodec.arenaChannel {
+            arenaIndexerAnsweredAt = 0
+            arenaNewestAnsweredAt = 0
+            arenaCoveredFrom = .max
+        }
     }
 
     /// While a room is open, the KaChat public chat indexer is polled every few seconds and new
@@ -754,6 +801,8 @@ final class PublicChatService: ObservableObject {
             // opened, not with it.
             await mergeIndexerRows(messages.messages, channel: channel, prune: true)
             indexerCoveredUntil[channel] = askedAt
+            // How far back the rows in the store run without a gap, as of this answer.
+            var coveredFrom: Int64? = messages.hasMore ? (messages.messages.map(\.blockTime).min() ?? askedAt) : 0
             // Deep backfill: page older history with `before` until the indexer runs out or we
             // reach its 30-day window, or the floor of a repeat after a gap. Without this, rooms
             // only ever showed the newest single page (200 rows) — busy rooms like
@@ -772,18 +821,20 @@ final class PublicChatService: ObservableObject {
                     hasMore = true
                     oldest = resume.before
                     pagesLeft = resume.pagesLeft
+                    if let from = coveredFrom { coveredFrom = min(from, resume.before) }
                 } else {
                     hasMore = messages.hasMore
                     oldest = messages.messages.map(\.blockTime).min()
                     pagesLeft = 50 // safety valve: 50 × 200 = 10k rows, far beyond any real room
                 }
                 var interrupted = false
+                var pagedSome = false
                 while hasMore, let before = oldest, before > cutoff, pagesLeft > 0 {
                     pagesLeft -= 1
                     let page: (messages: [PublicChatIndexerClient.IndexedPublicChat], hasMore: Bool)
                     do {
                         page = try await PublicChatIndexerClient.fetchHistoryPage(
-                            baseURL: baseURL, channel: channel, before: before
+                            baseURL: baseURL, channel: channel, before: before, isBackfill: true
                         )
                     } catch {
                         // Keep what this attempt did get: the pages already merged stay, and
@@ -791,26 +842,48 @@ final class PublicChatService: ObservableObject {
                         // resumes - not page 1.
                         AppLog.log("%@", "[PublicChat] Deep backfill for #\(channel) paused at before=\(before): \(error.localizedDescription)")
                         interrupted = true
+                        // The cursor this attempt stopped at, so a page that keeps failing is
+                        // known as one (`maxFailedBackfillResumes`).
+                        if deepBackfillResume[channel] == nil {
+                            deepBackfillResume[channel] = (before: before, pagesLeft: pagesLeft + 1)
+                        }
                         break
                     }
+                    pagedSome = true
                     guard !page.messages.isEmpty else { break }
                     // Each page merged as it arrives, oldest last.
                     await mergeIndexerRows(page.messages, channel: channel, prune: false)
                     hasMore = page.hasMore
                     oldest = page.messages.map(\.blockTime).min()
+                    if coveredFrom != nil { coveredFrom = hasMore ? (oldest ?? before) : 0 }
                     if hasMore, let next = oldest {
                         deepBackfillResume[channel] = (before: next, pagesLeft: pagesLeft)
                     }
                 }
-                // Marked done only once the pager actually finishes; a paused one keeps its
-                // resume cursor and the next poll continues from there.
+                if interrupted {
+                    // A page that fails attempt after attempt, with nothing paged past it, would
+                    // hold the backfill - and the arena's joins and timeout claims, which wait
+                    // for it - forever while the indexer reads as up. After a few such attempts
+                    // it's passed over: the rows older than it are left out (a gap at the old
+                    // end of the window, logged), and everything newer is in.
+                    failedBackfillResumes[channel] = pagedSome ? 1 : (failedBackfillResumes[channel] ?? 0) + 1
+                    if (failedBackfillResumes[channel] ?? 0) >= Self.maxFailedBackfillResumes {
+                        let at = deepBackfillResume[channel]?.before ?? oldest ?? 0
+                        AppLog.log("%@", "[PublicChat] Deep backfill for #\(channel) gave up at before=\(at): rows older than that are left out this session")
+                        interrupted = false
+                    }
+                }
+                // Marked done only once the pager actually finishes (or passed over a page that
+                // kept failing); a paused one keeps its resume cursor and the next poll
+                // continues from there.
                 if !interrupted {
                     deepBackfilledChannels.insert(channel)
                     deepBackfillResume[channel] = nil
                     backfillFloor[channel] = nil
+                    failedBackfillResumes[channel] = nil
                 }
             }
-            noteArenaAnswered(channel: channel, askedAt: askedAt)
+            noteArenaAnswered(channel: channel, askedAt: askedAt, coveredFrom: coveredFrom)
         } catch {
             // Best-effort on top of live scanning - the loop just tries again next tick.
             AppLog.log("%@", "[PublicChat] Indexer fetch failed for #\(channel): \(error.localizedDescription)")
@@ -1135,8 +1208,12 @@ final class PublicChatService: ObservableObject {
     /// throws instead of being retried later in the background, so the caller - which retries a
     /// few times itself and then shows the error - never reports a move as sent that is not.
     /// Returns the transaction id; nil only when the send was deferred.
+    /// `expectedSender` (the chess sends): the account that asked for this send. When the
+    /// signed-in account is another one - now, or by the time the send's turn in the queue comes -
+    /// nothing is sent (`SenderChangedError`), so a move, join, claim or stamp never goes out
+    /// signed by the next account.
     @discardableResult
-    func sendPublicChat(channel rawChannel: String, content: String, feeOverride: UInt64? = nil, deferNoInputRetry: Bool = true) async throws -> String? {
+    func sendPublicChat(channel rawChannel: String, content: String, feeOverride: UInt64? = nil, deferNoInputRetry: Bool = true, expectedSender: String? = nil) async throws -> String? {
         let channel = PublicChatChannelName.normalize(rawChannel)
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard PublicChatChannelName.isValid(channel) else {
@@ -1145,6 +1222,9 @@ final class PublicChatService: ObservableObject {
         guard !trimmed.isEmpty else { return nil }
         guard let wallet = WalletManager.shared.currentWallet else {
             throw KasiaError.walletNotFound
+        }
+        if let expectedSender, wallet.publicAddress != expectedSender {
+            throw SenderChangedError()
         }
         guard let privateKey = WalletManager.shared.getPrivateKey() else {
             throw KasiaError.keychainError("Could not get private key")
@@ -1180,7 +1260,11 @@ final class PublicChatService: ObservableObject {
 
         do {
             let txId = try await ChatService.shared.enqueueOutgoingTxOperation {
-                try await self.sendPublicChatInternal(
+                // Its turn came after other sends: the account may have switched meanwhile.
+                if let expectedSender, WalletManager.shared.currentWallet?.publicAddress != expectedSender {
+                    throw SenderChangedError()
+                }
+                return try await self.sendPublicChatInternal(
                     channel: channel,
                     content: payload,
                     walletAddress: wallet.publicAddress,
@@ -1205,6 +1289,13 @@ final class PublicChatService: ObservableObject {
         }
     }
 
+    /// A send asked for by one account, when another is signed in: nothing went out.
+    struct SenderChangedError: LocalizedError {
+        var errorDescription: String? {
+            AppLocalization.string("The account changed, so nothing was sent.")
+        }
+    }
+
     // MARK: - Own arena rows the chain has not shown yet
 
     /// When a due row may next be looked up (wall ms): one still in a mempool, or one the REST
@@ -1214,8 +1305,11 @@ final class PublicChatService: ObservableObject {
     private var droppedServiceRows: Set<String> = []
     private nonisolated static let localStampsKey = "publicChatLocalStampSentAt"
     /// A row a node says it doesn't hold still waits this long from sending, for a REST API
-    /// running behind. Short of the give-up: a move really lost must leave clock to replay it.
+    /// running behind - and never more than `restLagPastLookUpMs` past the caller's look-up
+    /// (`olderThan`): the arena's is 60 s, so a move that never landed is the player's to play
+    /// again by about 75 s, not two minutes on, with most of a five-minute clock still left.
     private static let restLagGraceMs: Int64 = 120_000
+    private static let restLagPastLookUpMs: Int64 = 15_000
 
     private func trackLocalStamp(_ txId: String) {
         localStampSentAt[txId] = Int64(Date().timeIntervalSince1970 * 1000)
@@ -1255,6 +1349,7 @@ final class PublicChatService: ObservableObject {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let due = localStampSentAt.filter { now - $0.value > bound && (localStampNextCheck[$0.key] ?? 0) <= now }
         guard !due.isEmpty else { return [] }
+        let restLagGrace = min(Self.restLagGraceMs, bound + Self.restLagPastLookUpMs)
         isCheckingLocalStamps = true
         defer { isCheckingLocalStamps = false }
         var failed: Set<String> = []
@@ -1277,6 +1372,9 @@ final class PublicChatService: ObservableObject {
                     localStampNextCheck[txId] = later
                     continue
                 }
+                // Asked again well before the grace runs out, so the drop lands at it and not
+                // up to a check interval after.
+                let nextCheck = min(later, sentAt + restLagGrace + 1_000)
                 // No mempool entry also comes back when no node could be asked, and a 404 from a
                 // REST API running behind: neither says the transaction is gone.
                 let address = WalletManager.shared.currentWallet?.publicAddress
@@ -1285,8 +1383,8 @@ final class PublicChatService: ObservableObject {
                         confirmLocalStamp(txId)
                         continue
                     }
-                    if now - sentAt <= Self.restLagGraceMs {
-                        localStampNextCheck[txId] = later
+                    if now - sentAt <= restLagGrace {
+                        localStampNextCheck[txId] = max(nextCheck, Int64(Date().timeIntervalSince1970 * 1000) + 1_000)
                         continue
                     }
                 } else if now - sentAt <= giveUp {
@@ -1569,7 +1667,11 @@ final class PublicChatService: ObservableObject {
             return AppLocalization.string("The network is still confirming your previous send. Please try again in a few seconds.")
         }
         if lower.contains("insufficient funds") { return notEnoughKasMessage }
-        return raw
+        // The app's own sentence as it was written, without "Network error: " in front - which
+        // `handleSendFailure`'s wrapping then doubled. That's how a builder's message (no coins
+        // on the chatting address, a balance spread over too many small coins to fit one
+        // transaction) reaches the player as is.
+        return UserFacingError.message(for: error)
     }
 
     // MARK: - Block scanning lifecycle
@@ -1994,11 +2096,16 @@ enum PublicChatIndexerClient {
     /// Same fetch, but keeps the server's `hasMore` so callers can page older history with
     /// `before` — the plain fetchHistory silently discarded it, which is why rooms only ever
     /// showed the newest single page.
+    /// `isBackfill`: an older page paged in right after the newest page answered. Its failure
+    /// says that page failed, not that the indexer is down (the next poll's newest page tells
+    /// that), so it doesn't count toward an outage - a heavy page that kept timing out took the
+    /// arena down and up again, re-paging it every time.
     static func fetchHistoryPage(
         baseURL: String,
         channel: String,
         limit: Int = 200,
-        before: Int64? = nil
+        before: Int64? = nil,
+        isBackfill: Bool = false
     ) async throws -> (messages: [IndexedPublicChat], hasMore: Bool) {
         guard PublicChatChannelName.normalize(channel) == ChessTournamentCodec.arenaChannel else {
             return try await requestHistoryPage(baseURL: baseURL, channel: channel, limit: limit, before: before)
@@ -2008,7 +2115,7 @@ enum PublicChatIndexerClient {
             await noteArenaResult(error: nil)
             return page
         } catch {
-            await noteArenaResult(error: error)
+            if !isBackfill { await noteArenaResult(error: error) }
             throw error
         }
     }
@@ -2101,17 +2208,28 @@ extension Notification.Name {
 }
 
 /// Whether an indexer is answering (the same as KaChat's). It only counts as down after several
-/// failures in a row, so one timeout never moves the arena off it. While it's down, one request a
-/// minute is let through to find out when it's back; any answer brings it back at once.
+/// failures in a row, so one timeout never moves the arena off it; failures under 5 s apart (the
+/// fast poll, the room's poll and a repage failing together) count as one, as the .kachat
+/// registry counts them. While it's down, one request a minute is let through to find out when
+/// it's back, and it is back after two answers in a row (the second asked for right away) or one
+/// answer after a long outage - so one lucky answer from a flaky indexer doesn't bring it back,
+/// and page the arena in again, only to fail the next minute.
 actor IndexerHealth {
     private var downSince: Date?
     private var failuresInARow = 0
     private var lastFailureAt = Date.distantPast
+    private var lastCountedFailureAt = Date.distantPast
     private var retryAt = Date.distantPast
+    private var answersInARow = 0
     private static let failuresToGoDown = 3
     /// Failures further apart than this aren't a run.
     private static let failureWindow: TimeInterval = 120
+    /// Failures closer together than this are one.
+    private static let failureMergeWindow: TimeInterval = 5
     private static let retryInterval: TimeInterval = 60
+    private static let answersToComeBack = 2
+    /// Down at least this long, one answer is enough.
+    private static let longOutage: TimeInterval = 5 * 60
 
     var isDown: Bool { downSince != nil }
 
@@ -2121,6 +2239,8 @@ actor IndexerHealth {
     func reset() {
         downSince = nil
         failuresInARow = 0
+        answersInARow = 0
+        lastCountedFailureAt = .distantPast
         retryAt = .distantPast
     }
 
@@ -2136,8 +2256,12 @@ actor IndexerHealth {
     /// True when this is the moment it went down.
     func recordFailure() -> Bool {
         let now = Date()
+        answersInARow = 0
         if now.timeIntervalSince(lastFailureAt) > Self.failureWindow { failuresInARow = 0 }
         lastFailureAt = now
+        // Part of a failure counted under 5 s ago: the same one.
+        guard now.timeIntervalSince(lastCountedFailureAt) >= Self.failureMergeWindow else { return false }
+        lastCountedFailureAt = now
         failuresInARow += 1
         guard downSince == nil, failuresInARow >= Self.failuresToGoDown else { return false }
         downSince = now
@@ -2148,8 +2272,19 @@ actor IndexerHealth {
     /// True when this is the moment it came back.
     func recordAnswer() -> Bool {
         failuresInARow = 0
-        defer { downSince = nil }
-        return downSince != nil
+        guard let since = downSince else {
+            answersInARow = 0
+            return false
+        }
+        answersInARow += 1
+        guard answersInARow >= Self.answersToComeBack || Date().timeIntervalSince(since) >= Self.longOutage else {
+            // One answer: the next read goes through at once to confirm it.
+            retryAt = .distantPast
+            return false
+        }
+        downSince = nil
+        answersInARow = 0
+        return true
     }
 }
 

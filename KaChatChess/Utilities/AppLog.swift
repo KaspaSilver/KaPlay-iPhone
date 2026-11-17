@@ -18,8 +18,10 @@ enum AppLog {
     )
 
     /// A full Kaspa address (`kaspa:`, `kaspatest:`, or the `_` form used in keys and file names).
+    /// Not `\b`: that missed an address right after `_` or a letter, as in a UserDefaults key
+    /// name the UserDefaults trim logs. As in KaPay.
     private static let addressPattern = try? NSRegularExpression(
-        pattern: "\\b(?:kaspa|kaspatest|kaspasim|kaspadev)[:_]([a-z0-9]{12,})", options: [.caseInsensitive]
+        pattern: "(?<![a-z0-9])(?:kaspa|kaspatest|kaspasim|kaspadev)[:_]([a-z0-9]{12,})", options: [.caseInsensitive]
     )
 
     /// Every address in a log line is cut to "…" and its last 8 characters, wherever it came from

@@ -63,7 +63,11 @@ enum ChessBotLinks {
     static func shareToKaPost(bot: ChessBot, moves: Int, gameId: String) {
         guard let address = WalletManager.shared.currentWallet?.publicAddress,
               let challenge = challengeURL(bot: bot, moves: moves, by: address, gameId: gameId) else { return }
-        let text = "I beat \(bot.name) (Level \(bot.level)) in \(moves) moves on KaPlay. Think you can do it in fewer?\n\n\(challenge.absoluteString)"
+        let boast = String(
+            format: AppLocalization.string("I beat %@ (Level %lld) in %lld moves on KaPlay. Think you can do it in fewer?"),
+            locale: AppLocalization.locale, bot.name, bot.level, moves
+        )
+        let text = "\(boast)\n\n\(challenge.absoluteString)"
         // Letters, digits and -._~ only: the whole post is one value, so the challenge link's own
         // & and = must not end it, and its own escapes get escaped again to come back intact.
         let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
@@ -80,12 +84,24 @@ struct ChessBotChallengeBanner: View {
     let challenge: ChessBotChallenge
     @ObservedObject private var progress = ChessBotProgress.shared
 
+    /// One whole text per case (who is known or not, moves or not, locked or not).
     private var message: String {
-        let who = challenge.by.map { ContactsManager.shared.displayName(for: $0) } ?? "Someone"
         let bot = challenge.bot
-        let claim = challenge.moves.map { "\(who) beat \(bot.name) in \($0) moves. Can you do it in fewer?" }
-            ?? "\(who) challenges you to beat \(bot.name)."
-        return progress.isUnlocked(bot) ? claim : "\(claim) \(bot.name) is still locked: climb the ladder to reach it."
+        let who = challenge.by.map { ContactsManager.shared.displayName(for: $0) }
+        let claim: String
+        switch (who, challenge.moves) {
+        case let (who?, moves?):
+            claim = ChessText.format("%@ beat %@ in %lld moves. Can you do it in fewer?", who, bot.name, moves)
+        case let (nil, moves?):
+            claim = ChessText.format("Someone beat %@ in %lld moves. Can you do it in fewer?", bot.name, moves)
+        case let (who?, nil):
+            claim = ChessText.format("%@ challenges you to beat %@.", who, bot.name)
+        case (nil, nil):
+            claim = ChessText.format("Someone challenges you to beat %@.", bot.name)
+        }
+        guard !progress.isUnlocked(bot) else { return claim }
+        // Its own sentence after the claim, never part of it.
+        return claim + " " + ChessText.format("%@ is still locked: climb the ladder to reach it.", bot.name)
     }
 
     var body: some View {
@@ -93,7 +109,7 @@ struct ChessBotChallengeBanner: View {
             Image(systemName: "flag.2.crossed.fill")
                 .font(.title3)
                 .foregroundColor(.orange)
-            Text(message)
+            Text(verbatim: message)
                 .font(.subheadline.weight(.semibold))
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)

@@ -23,6 +23,9 @@ actor NodeSelector {
     /// DAA delta window (in "seconds worth" of blocks at 10 bps)
     private let daaDeltaWindow: UInt64 = 100  // ~10 seconds worth
 
+    /// How fast the DAA score advances (10 bps)
+    private let daaPerSecond: Double = 10
+
     // MARK: - Initialization
 
     init(registry: NodeRegistry, epochMonitor: NetworkEpochMonitor) {
@@ -86,15 +89,18 @@ actor NodeSelector {
         relaxation: SelectionRelaxation = .strict
     ) async -> [Endpoint] {
         let nodes = await registry.allRecords()
+        refreshReferenceDaaScore(from: nodes)
+        let network = await registry.network
 
         // Filter by capability and exclusions
-        let eligible = nodes.filter { record in
+        let capable = nodes.filter { record in
             // Not excluded
             guard !excluding.contains(record.endpoint.key) else { return false }
 
             // Can handle this operation
             return record.canHandle(op, relaxation: relaxation)
         }
+        let eligible = withoutStaleNodes(capable, for: op, network: network)
 
         // Score and sort
         let scored: [(Endpoint, Double)] = eligible.map { record in
@@ -113,10 +119,12 @@ actor NodeSelector {
         excluding: Set<String> = []
     ) async -> [Endpoint] {
         let nodes = await registry.allRecords()
+        refreshReferenceDaaScore(from: nodes)
+        let network = await registry.network
 
         // Filter and score all nodes equally (no special treatment for seeds)
-        let scored: [(Endpoint, Double)] = nodes
-            .filter { !excluding.contains($0.endpoint.key) && $0.canHandle(op) }
+        let capable = nodes.filter { !excluding.contains($0.endpoint.key) && $0.canHandle(op) }
+        let scored: [(Endpoint, Double)] = withoutStaleNodes(capable, for: op, network: network)
             .map { record in
                 (record.endpoint, score(record, for: op))
             }
@@ -175,8 +183,10 @@ actor NodeSelector {
         }
 
         // 4. Freshness score (DAA delta, only as soft signal)
-        if let ref = referenceDaaScore, let daa = record.profile.virtualDaaScore {
-            let diff = Int64(ref) - Int64(daa)
+        if let ref = referenceDaaScore, let daa = projectedDaaScore(record, now: Date()) {
+            // Clamped: the score comes from a node found through peer gossip. Both are then
+            // non-negative, so the subtraction can't overflow.
+            let diff = Int64(clamping: ref) - Int64(clamping: daa)
             if diff > 0 {
                 // Node is behind
                 let penalty = min(5.0, Double(diff) / Double(daaDeltaWindow))
@@ -205,12 +215,53 @@ actor NodeSelector {
         return score
     }
 
+    /// For balances, subscriptions and sends: no node that reported another network, and none
+    /// trailing the active nodes' median by more than `NodeRecord.maxActiveDaaLag` - the latter
+    /// only while some node is left. The score's lag penalty alone let a fast lagging node win.
+    private func withoutStaleNodes(_ records: [NodeRecord], for op: OperationClass, network: NetworkType) -> [NodeRecord] {
+        guard op.requiresSynced else { return records }
+        let sameNetwork = records.filter { record in
+            guard let name = record.profile.networkName, !name.isEmpty else { return true }
+            return NodeRegistry.belongs(record, to: network)
+        }
+        guard let reference = referenceDaaScore else { return sameNetwork }
+        let now = Date()
+        let current = sameNetwork.filter { record in
+            guard let daa = projectedDaaScore(record, now: now), daa < reference else { return true }
+            return reference - daa <= NodeRecord.maxActiveDaaLag
+        }
+        return current.isEmpty ? sameNetwork : current
+    }
+
+    /// The median across active nodes, so a few lagging or lying nodes can't move it.
+    private func refreshReferenceDaaScore(from nodes: [NodeRecord]) {
+        let now = Date()
+        let scores = nodes
+            .filter { $0.state == .active }
+            .compactMap { projectedDaaScore($0, now: now) }
+            .sorted()
+        referenceDaaScore = scores.isEmpty ? nil : scores[scores.count / 2]
+    }
+
+    /// A node's reported DAA score carried forward to now. Nodes are profiled minutes apart, and
+    /// a score that old would read as lag. Nil when the report is missing or past its TTL.
+    private func projectedDaaScore(_ record: NodeRecord, now: Date) -> UInt64? {
+        guard let daa = record.profile.virtualDaaScore,
+              let profiledAt = record.profile.lastProfiledAt else { return nil }
+        let age = now.timeIntervalSince(profiledAt)
+        guard age >= 0, age <= record.profile.profileTTL else { return nil }
+        let (projected, overflow) = daa.addingReportingOverflow(UInt64(age * daaPerSecond))
+        return overflow ? UInt64.max : projected
+    }
+
     // MARK: - Utility
 
     /// Get nodes eligible for a specific operation (for UI display)
     func eligibleNodes(for op: OperationClass) async -> [NodeRecord] {
         let nodes = await registry.allRecords()
-        return nodes.filter { $0.canHandle(op) }
+        refreshReferenceDaaScore(from: nodes)
+        let network = await registry.network
+        return withoutStaleNodes(nodes.filter { $0.canHandle(op) }, for: op, network: network)
             .sorted { score($0, for: op) > score($1, for: op) }
     }
 

@@ -10,7 +10,7 @@ import UIKit
 /// The standard Settings category row: icon + title behind a NavigationLink. File-scope so the
 /// in-account SettingsView and the accounts-screen AppSettingsView render identical rows.
 fileprivate func settingsCategoryRow<Destination: View>(
-    _ title: String,
+    _ title: LocalizedStringKey,
     icon: String,
     tint: Color,
     @ViewBuilder destination: @escaping () -> Destination
@@ -50,12 +50,14 @@ struct SecuritySettingsPage: View {
     /// The Toggle is driven off a proxy binding rather than the setting: the write only happens
     /// after authentication succeeds, so a failed or cancelled prompt leaves the switch exactly
     /// where it was instead of flipping and flipping back.
-    private func biometricToggle(_ title: String, reason: String, isOn: Binding<Bool>) -> some View {
+    /// `title` and `reason` are keys: the title is a `LocalizedStringKey` so it follows the in-app
+    /// language, and the reason is looked up before it goes to the system prompt.
+    private func biometricToggle(_ title: LocalizedStringKey, reason: String, isOn: Binding<Bool>) -> some View {
         Toggle(title, isOn: Binding(
             get: { isOn.wrappedValue },
             set: { requested in
                 guard requested != isOn.wrappedValue else { return }
-                DeviceAuth.authenticate(reason: reason) {
+                DeviceAuth.authenticate(reason: AppLocalization.string(reason)) {
                     isOn.wrappedValue = requested
                     settingsViewModel.saveSettings()
                 } onFailure: {
@@ -102,7 +104,8 @@ struct AppWideCustomizationPickers: View {
         Group {
             Picker("Appearance", selection: $settingsViewModel.settings.appearance) {
                 ForEach(AppAppearance.allCases, id: \.self) { option in
-                    Text(option.displayName).tag(option)
+                    // displayName is already translated (AppLocalization).
+                    Text(verbatim: option.displayName).tag(option)
                 }
             }
             .onChange(of: settingsViewModel.settings.appearance) { _ in
@@ -111,7 +114,8 @@ struct AppWideCustomizationPickers: View {
 
             Picker("Language", selection: $settingsViewModel.settings.language) {
                 ForEach(AppLanguage.allCases, id: \.self) { option in
-                    Text(option.displayName).tag(option)
+                    // Each language's own name; only "System" is a key.
+                    Text(verbatim: option == .system ? AppLocalization.string(option.displayName) : option.displayName).tag(option)
                 }
             }
             .onChange(of: settingsViewModel.settings.language) { newValue in
@@ -268,6 +272,9 @@ struct SeedPhraseView: View {
 
     var body: some View {
         NavigationStack {
+            // Scrolls: the warning, the 24-word grid, the passphrase box and both copy buttons
+            // don't fit an iPhone SE or larger text sizes.
+            ScrollView {
             VStack(spacing: 24) {
                 // Warning
                 VStack(alignment: .leading, spacing: 12) {
@@ -396,10 +403,9 @@ struct SeedPhraseView: View {
                 } else {
                     ProgressView()
                 }
-
-                Spacer()
             }
             .padding()
+            }
             .navigationTitle("12 or 24 Words")
             .navigationBarTitleDisplayMode(.inline)
             .toast(message: toastMessage, style: toastStyle)
@@ -534,7 +540,7 @@ struct ConnectionSettingsView: View {
     @ViewBuilder
     private func httpsInlineError(for value: String) -> some View {
         if isCleartextHTTP(value) {
-            Text(Self.httpsRequiredError)
+            Text(LocalizedStringKey(Self.httpsRequiredError))
                 .font(.caption)
                 .foregroundColor(.red)
         }
@@ -612,7 +618,7 @@ struct ConnectionSettingsView: View {
             }
 
             if let trustedNodeValidationError {
-                Text(trustedNodeValidationError)
+                Text(verbatim: AppLocalization.string(trustedNodeValidationError))
                     .font(.caption)
                     .foregroundColor(.red)
             }
@@ -652,7 +658,7 @@ struct ConnectionSettingsView: View {
             }
 
             if let savedNodeAddressError {
-                Text(savedNodeAddressError)
+                Text(verbatim: AppLocalization.string(savedNodeAddressError))
                     .font(.caption)
                     .foregroundColor(.red)
             }
@@ -779,7 +785,7 @@ struct ConnectionSettingsView: View {
                     Text(verbatim: tld.suffix)
                         .font(.caption)
                         .foregroundColor(.secondary)
-                    Text(tld.apiBaseURL(for: settingsViewModel.settings.networkType) ?? String(localized: "Not available on this network"))
+                    Text(tld.apiBaseURL(for: settingsViewModel.settings.networkType) ?? AppLocalization.string("Not available on this network"))
                         .font(.system(.body, design: .monospaced))
                         .foregroundColor(.secondary)
                         .textSelection(.enabled)
@@ -818,7 +824,7 @@ struct ConnectionSettingsView: View {
     private func indexerPlaceholder(_ mainnetDefault: String) -> String {
         settingsViewModel.settings.networkType == .mainnet
             ? mainnetDefault
-            : String(localized: "No testnet indexer yet")
+            : AppLocalization.string("No testnet indexer yet")
     }
 
     /// One tab per kind of connection, so the page stays short as the app talks to more
@@ -1305,7 +1311,7 @@ struct ConnectionStatusDetailView: View {
                     Circle()
                         .fill(statusColor)
                         .frame(width: 10, height: 10)
-                    Text(chatService.connectionStatus.description)
+                    Text(verbatim: AppLocalization.string(chatService.connectionStatus.description))
                         .foregroundColor(.secondary)
                 }
             }
@@ -1336,7 +1342,7 @@ struct ConnectionStatusDetailView: View {
                     Text("Blocked")
                         .foregroundColor(.orange)
                 }
-                Text("Node connections appear blocked on this network. You can still receive and read messages through the indexer, but sending messages and payments needs a node connection.")
+                Text("Node connections appear blocked on this network. You can still see games through the indexer, but moves and payments need a node connection.")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -1394,7 +1400,7 @@ struct ConnectionStatusDetailView: View {
             HStack {
                 Text("Last Sync")
                 Spacer()
-                Text(lastSyncText)
+                Text(verbatim: AppLocalization.string(lastSyncText))
                     .foregroundColor(lastSyncColor)
             }
         } header: {
@@ -1454,7 +1460,7 @@ struct ConnectionStatusDetailView: View {
             HStack {
                 Text("Pool Health")
                 Spacer()
-                Text(poolHealthDescription)
+                Text(LocalizedStringKey(poolHealthDescription))
                     .foregroundColor(poolHealthColor)
             }
         } header: {
@@ -1794,7 +1800,7 @@ private struct ConnectionNodeRow: View {
 
                 Spacer()
 
-                Text(record.state.displayName)
+                Text(verbatim: AppLocalization.string(record.state.displayName))
                     .font(.caption2)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
@@ -1805,7 +1811,7 @@ private struct ConnectionNodeRow: View {
 
             HStack(spacing: 8) {
                 // Origin label
-                Text(record.origin.displayName)
+                Text(verbatim: AppLocalization.string(record.origin.displayName))
                     .font(.caption2)
                     .foregroundColor(originColor)
 
@@ -1976,7 +1982,7 @@ private struct AllNodesRow: View {
             }
 
             // State badge
-            Text(record.state.displayName)
+            Text(verbatim: AppLocalization.string(record.state.displayName))
                 .font(.caption2)
                 .padding(.horizontal, 4)
                 .padding(.vertical, 1)
@@ -2057,6 +2063,9 @@ struct SettingsView: View {
     @State private var showSeedPhrase = false
     @State private var showNFCCardBackup = false
     @State private var accountHasPassphrase = false
+    /// The account `accountHasPassphrase` was worked out for, so the seed is read once per
+    /// account rather than on every visit to the tab.
+    @State private var passphraseCheckedAddress: String?
     @State private var showLogoutConfirmation = false
     @State private var showDeleteAccountConfirmation = false
     /// The seed phrase over the Delete Account warning, which it closes back to.
@@ -2067,6 +2076,7 @@ struct SettingsView: View {
     @State private var showAccountBackup = false
     @AppStorage(KachatNameLabel.showEndingsKey) private var showKachatEndings = true
     @State private var toastMessage: String?
+    @State private var toastToken = UUID()
 
     var body: some View {
         NavigationStack {
@@ -2148,8 +2158,7 @@ struct SettingsView: View {
                 SeedPhraseView()
             }
             .task(id: walletManager.currentWallet?.publicAddress) {
-                let passphrase = (try? walletManager.getSeedPhrase())?.passphrase ?? ""
-                accountHasPassphrase = !passphrase.isEmpty
+                await refreshPassphraseFlag()
             }
             .sheet(isPresented: $showNFCCardBackup) {
                 #if canImport(CoreNFC) && !targetEnvironment(macCatalyst)
@@ -2181,7 +2190,9 @@ struct SettingsView: View {
                             do {
                                 try await walletManager.deleteWallet()
                             } catch {
-                                toastMessage = "Couldn't delete the account: \(UserFacingError.message(for: error))"
+                                showErrorToast(String(format: AppLocalization.string("Couldn't delete the account: %@"),
+                                                      locale: AppLocalization.locale,
+                                                      AppLocalization.string(UserFacingError.message(for: error))))
                             }
                         }
                     }
@@ -2194,6 +2205,34 @@ struct SettingsView: View {
                 }
             }
         }
+    }
+
+    /// Shows an error toast and clears it a few seconds later, unless a newer one replaced it.
+    private func showErrorToast(_ message: String) {
+        let token = UUID()
+        toastToken = token
+        withAnimation(.easeOut(duration: 0.2)) { toastMessage = message }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            guard toastToken == token else { return }
+            withAnimation(.easeIn(duration: 0.2)) { toastMessage = nil }
+        }
+    }
+
+    /// Whether the signed-in account has a passphrase (Back Up to NFC Card needs one). Asked
+    /// once per account: WalletManager answers from a stored flag, reading the words (off the
+    /// main thread) only for an older account that has none yet.
+    private func refreshPassphraseFlag() async {
+        guard let address = walletManager.currentWallet?.publicAddress else {
+            accountHasPassphrase = false
+            passphraseCheckedAddress = nil
+            return
+        }
+        guard passphraseCheckedAddress != address else { return }
+        let hasPassphrase = await walletManager.currentAccountHasPassphrase()
+        // The account may have changed while the seed was read.
+        guard walletManager.currentWallet?.publicAddress == address else { return }
+        accountHasPassphrase = hasPassphrase
+        passphraseCheckedAddress = address
     }
 
     /// The seed phrase, behind the biometric gate when enabled.
@@ -2250,7 +2289,7 @@ struct SettingsView: View {
 
     private func unlockSeedPhrase(_ show: @escaping () -> Void) {
         if settingsViewModel.settings.biometricSeedPhraseEnabled {
-            DeviceAuth.authenticate(reason: "Unlock to view your 12 or 24 words", onSuccess: show)
+            DeviceAuth.authenticate(reason: AppLocalization.string("Unlock to view your 12 or 24 words"), onSuccess: show)
         } else {
             show()
         }

@@ -62,7 +62,7 @@ struct ChessBotsView: View {
                 Text(bot.name)
                     .font(.headline)
                     .lineLimit(1)
-                Text("Level \(bot.level) · \(bot.title)")
+                Text("Level \(bot.level) · \(ChessText.string(bot.title))")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
                 if unlocked {
@@ -107,11 +107,11 @@ struct ChessBotDetailView: View {
                     Text(bot.name)
                         .font(.title2.weight(.bold))
                         .multilineTextAlignment(.center)
-                    Text("Level \(bot.level) · \(bot.title)")
+                    Text("Level \(bot.level) · \(ChessText.string(bot.title))")
                         .font(.subheadline.weight(.semibold))
                         .foregroundColor(.secondary)
                     ChessBotLevelStars(level: bot.level)
-                    Text(bot.bio)
+                    Text(verbatim: ChessText.string(bot.bio))
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
@@ -141,7 +141,7 @@ struct ChessBotDetailView: View {
                         .font(.subheadline.weight(.semibold))
                     Picker("Play as", selection: $side) {
                         ForEach(ChessBotSidePreference.allCases) { option in
-                            Text(option.rawValue).tag(option)
+                            Text(LocalizedStringKey(option.rawValue)).tag(option)
                         }
                     }
                     .pickerStyle(.segmented)
@@ -153,7 +153,7 @@ struct ChessBotDetailView: View {
                 HStack(alignment: .top, spacing: 10) {
                     Image(systemName: "link")
                         .foregroundColor(.accentColor)
-                    Text(feeLine)
+                    Text(verbatim: feeLine)
                         .font(.footnote)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -195,8 +195,10 @@ struct ChessBotDetailView: View {
     }
 
     private var feeLine: String {
-        let fee = ChessBotCodec.stampFeeText().map { "about \($0)" } ?? "one small fee"
-        return "The game itself is free. When it ends, win or lose, its result is stamped on Kaspa: one transaction from your wallet, \(fee)."
+        guard let fee = ChessBotCodec.stampFeeText() else {
+            return ChessText.string("The game itself is free. When it ends, win or lose, its result is stamped on Kaspa: one transaction from your wallet, one small fee.")
+        }
+        return ChessText.format("The game itself is free. When it ends, win or lose, its result is stamped on Kaspa: one transaction from your wallet, about %@.", fee)
     }
 }
 
@@ -213,7 +215,7 @@ struct ChessBotAvatar: View {
             .frame(width: size, height: size)
             .background(Circle().fill(LinearGradient(colors: bot.colors, startPoint: .top, endPoint: .bottom)))
             .overlay(alignment: .bottomTrailing) {
-                Text("\(bot.level)")
+                Text(verbatim: "\(bot.level)")
                     .font(.scaled(size: size * 0.2, weight: .heavy))
                     .foregroundColor(.primary)
                     .frame(width: size * 0.36, height: size * 0.36)

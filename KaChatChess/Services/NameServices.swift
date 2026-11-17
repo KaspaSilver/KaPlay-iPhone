@@ -144,6 +144,17 @@ struct NameResolution: Identifiable, Equatable {
     /// first as always, but nothing can resolve there.
     var notLive: Bool = false
 
+    /// Every answer passes here, so no path (`answer`, .kachat, one added later) can hand a screen
+    /// an address of another network: that answer is "Couldn't check", never an address to pay.
+    init(tld: NameServiceTLD, display: String, address: String?, failed: Bool, notLive: Bool = false) {
+        self.tld = tld
+        self.display = display
+        let usable = address.flatMap { KaspaAddress.isValidOnActiveNetwork($0) ? $0 : nil }
+        self.address = usable
+        self.failed = failed || (address != nil && usable == nil)
+        self.notLive = notLive
+    }
+
     var id: String { tld.rawValue }
 }
 
@@ -268,16 +279,28 @@ final class NameServicesClient: ObservableObject {
     }
 
     /// The .kachat names each of `addresses` holds (active or in grace), where the registry is
-    /// live; empty elsewhere. Kept apart from `ownedNames(of:)` because .kachat comes first
+    /// live; an empty list where it isn't, or for an address that can't hold one. An address
+    /// whose names couldn't be read is left out (nil), so the caller can say "Couldn't load"
+    /// rather than "0 names". Kept apart from `ownedNames(of:)` because .kachat comes first
     /// wherever names are listed.
     func kachatNames(of addresses: [String]) async -> [String: [OwnedServiceName]] {
-        guard NameServiceTLD.kachat.isLive, !addresses.isEmpty else { return [:] }
+        guard NameServiceTLD.kachat.isLive else {
+            return Dictionary(addresses.map { ($0, [OwnedServiceName]()) }, uniquingKeysWith: { a, _ in a })
+        }
+        guard !addresses.isEmpty else { return [:] }
         await KachatNamesRegistry.shared.refreshIfStale()
         var result: [String: [OwnedServiceName]] = [:]
         for address in addresses {
-            guard let key = KachatNamesRegistry.keyOf(address),
-                  let held = try? await KachatNamesRegistry.shared.heldNames(owner: key), !held.isEmpty else { continue }
-            result[address] = held.map { OwnedServiceName(name: $0.name, display: KachatNameLabel.display($0.name), tld: .kachat, isProvisional: false) }
+            guard let key = KachatNamesRegistry.keyOf(address) else {
+                result[address] = []
+                continue
+            }
+            do {
+                let held = try await KachatNamesRegistry.shared.heldNames(owner: key)
+                result[address] = held.map { OwnedServiceName(name: $0.name, display: KachatNameLabel.display($0.name), tld: .kachat, isProvisional: false) }
+            } catch {
+                AppLog.log("[NameServices] .kachat names of an address couldn't be read: %@", error.localizedDescription)
+            }
         }
         return result
     }
@@ -418,13 +441,13 @@ final class NameServicesClient: ObservableObject {
     static func notFoundMessage(typed input: String, results: [NameResolution]) -> String {
         let wanted = NameServiceTLD.splitTypedName(input).tld ?? .kachat
         if wanted == .kachat, results.contains(where: { $0.tld == .kachat && $0.notLive }) || !NameServiceTLD.kachat.isLive {
-            return String(localized: ".kachat names aren't live on this network yet")
+            return AppLocalization.string(".kachat names aren't live on this network yet")
         }
         // the service couldn't be asked: that says nothing about whether the name exists
         if results.contains(where: { $0.tld == wanted && $0.failed }) {
-            return String(localized: "Couldn't look up \(wanted.suffix) right now. Try again in a moment.")
+            return String(format: AppLocalization.string("Couldn't look up %@ right now. Try again in a moment."), wanted.suffix)
         }
-        return String(localized: "No \(wanted.suffix) domain found")
+        return String(format: AppLocalization.string("No %@ domain found"), wanted.suffix)
     }
 
     /// `.kachat`: the registry's owner of a name that is active or in its grace period - an owner
@@ -457,8 +480,31 @@ final class NameServicesClient: ObservableObject {
     private func resolveKas(_ label: String) async -> NameResolution? {
         guard let canonical = KNSService.shared.normalizeDomainLabel(label) else { return nil }
         let display = "\(canonical).kas"
-        let resolution = await KNSService.shared.resolveDomain(canonical)
-        return NameResolution(tld: .kas, display: display, address: resolution?.ownerAddress, failed: false)
+        switch await Self.knsLookup(canonical) {
+        case .found(let resolution): return Self.answer(.kas, display, address: resolution.ownerAddress)
+        case .missing: return NameResolution(tld: .kas, display: display, address: nil, failed: false)
+        case .failed: return NameResolution(tld: .kas, display: display, address: nil, failed: true)
+        }
+    }
+
+    /// KNS's answer for a .kas label, with an outage kept apart from "not registered".
+    private static func knsLookup(_ label: String) async -> KNSDomainLookup {
+        await KNSService.shared.lookupDomain(label)
+    }
+
+    /// A resolver's address, used only when it is a valid address of the network the app runs
+    /// on: a service answering with another network's address (or anything else) would send
+    /// coins where they can't arrive, so that answer counts as "Couldn't check". No address at
+    /// all is "not registered", as before.
+    private static func answer(_ tld: NameServiceTLD, _ display: String, address: String?) -> NameResolution {
+        guard let raw = address?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return NameResolution(tld: tld, display: display, address: nil, failed: false)
+        }
+        guard KaspaAddress.isValidOnActiveNetwork(raw) else {
+            AppLog.log("[NameServices] %@ answered an address that isn't on this network", tld.suffix)
+            return NameResolution(tld: tld, display: display, address: nil, failed: true)
+        }
+        return NameResolution(tld: tld, display: display, address: raw, failed: false)
     }
 
     private struct DotkNameResponse: Decodable {
@@ -472,7 +518,7 @@ final class NameServicesClient: ObservableObject {
         let display = "\(canonical).k"
         let outcome: LookupOutcome<DotkNameResponse> = await getJSONOrMissing(url)
         switch outcome {
-        case .found(let body): return NameResolution(tld: .k, display: display, address: body.address, failed: false)
+        case .found(let body): return Self.answer(.k, display, address: body.address)
         case .missing: return NameResolution(tld: .k, display: display, address: nil, failed: false)
         case .failed: return NameResolution(tld: .k, display: display, address: nil, failed: true)
         }
@@ -489,7 +535,7 @@ final class NameServicesClient: ObservableObject {
         let display = "\(canonical).kaspa"
         let outcome: LookupOutcome<KaspaNamesResolveResponse> = await getJSONOrMissing(url)
         switch outcome {
-        case .found(let body): return NameResolution(tld: .kaspa, display: display, address: body.address, failed: false)
+        case .found(let body): return Self.answer(.kaspa, display, address: body.address)
         case .missing: return NameResolution(tld: .kaspa, display: display, address: nil, failed: false)
         case .failed: return NameResolution(tld: .kaspa, display: display, address: nil, failed: true)
         }

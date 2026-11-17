@@ -87,13 +87,13 @@ struct PassphraseOptionView: View {
         .alert("Error", isPresented: .constant(error != nil)) {
             Button("OK") { error = nil }
         } message: {
-            if let error { Text(error) }
+            if let error { Text(verbatim: AppLocalization.string(error)) }
         }
     }
 
     // MARK: - 1. The question
 
-    private var questionTitle: String {
+    private var questionTitle: LocalizedStringKey {
         "Did you create these words with a passphrase?"
     }
 
@@ -425,7 +425,8 @@ struct PassphraseOptionView: View {
         }
     }
 
-    private func explainerSection(_ title: String, _ body: String) -> some View {
+    /// Keys: `Text(String)` would skip the translation.
+    private func explainerSection(_ title: LocalizedStringKey, _ body: LocalizedStringKey) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
                 .font(.headline)
@@ -526,7 +527,7 @@ struct PassphraseAddressPreview: View {
             // Every character, wrapped over as many lines as it takes. This is the one place the
             // address has to be readable in full: truncating it would hide exactly the part that
             // changes when the passphrase does, which is the whole reason it is on screen.
-            Text(previewAddress ?? "Checking...")
+            (previewAddress.map { Text(verbatim: $0) } ?? Text("Checking..."))
                 .font(.system(.footnote, design: .monospaced))
                 .foregroundColor(previewAddress == nil ? .secondary : .primary)
                 .lineLimit(nil)

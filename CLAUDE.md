@@ -34,11 +34,13 @@ contacts uses KaChat or KaPay, so KaPlay has no Address Book, Contacts pill or c
 
 Account removal clears what the app keeps per account, on both networks' addresses: the bell and
 what it compares against, .kachat reminders and saved names, the balance cache, added date, address
-choice and bot games (`WalletManager.removeWalletTabData`), and the spending data. The bell (`GlobalNotificationCenter`) lists .kachat news
+choice, bot games, the arena's pending stamps (`publicChatLocalStampSentAt`), pending .kachat commit
+salts and the passphrase flag (`WalletManager.removeWalletTabData`), and the spending data. The bell (`GlobalNotificationCenter`) lists .kachat news
 (`KachatNamesNotifier`) and Kaspa received on the chatting address from someone else
 (`WalletReceiptNotifier`, fed each live UTXO batch; KaPlay's subscription is the chatting address
 only, so spending addresses get no Received rows). A row opens the address
-(`OwnAddressHistorySheet`) or the name.
+(`OwnAddressHistorySheet`) or the name. Each transaction in a batch is judged alone
+(`confirmAndRecord`), so a payment arriving in the same batch as one of your own moves still shows.
 
 .kachat names are shown through `KachatNameLabel.display`: "alice.kachat" by default, "alice"
 when Settings > Customization > Show .kachat Endings is off (as in KaChat). That covers player names
@@ -62,8 +64,15 @@ button opens KaPlay (`ChessBotLinks`, ONLINE_CHESS.md §7.2).
 Online moves, joins, claims and bot stamps never wait in a silent background retry
 (`PublicChatService.sendPublicChat(deferNoInputRetry: false)`): no coins on the chatting address says
 "Not enough KAS on your Chatting Address", and only "change not mined yet" is retried, a few times.
-A move, join or claim the chain never shows is looked up after 60 s and dropped if it didn't land,
-so it can be played again. A timeout claim that doesn't take is retried automatically at most 4
+A move, join or claim the chain never shows is looked up after 60 s and dropped at about 75 s when
+the network says it doesn't hold it (or after 5 minutes when nothing can be asked), so it can be
+played again; a join that didn't land closes the waiting room with "Your join didn't reach the
+network". A queued public join is kept until the room has started with the player in it and the
+join has chain time. Your own move is refused once your clock is at zero. Every chess send is tied
+to the account that made it (`sendPublicChat(expectedSender:)`): an account switch mid-retry sends
+nothing, and bot results and stamped wins are filed under the account that played. A move uses at
+most `maxInputsPerTransaction` coins and 100,000 grams; past that the player is asked to compound.
+Chess error toasts clear after 3 s. A timeout claim that doesn't take is retried automatically at most 4
 times per flag, 30 s apart, paging the arena again first (`maxAutoClaims`); after that the board's
 Claim win is still there. A decided game can be left without resigning. Per-account arena state (queued join, pending moves, claims) clears when the
 account changes. The 30-day replay runs off the main thread (`reduceArena`).
@@ -76,14 +85,22 @@ the block stream, on cellular too while it's down. The player's own live games a
 10 s from that game's two players' addresses on the Kaspa REST API (`readArenaFromChain`), which fills gaps
 but can't find rooms or joiners, since a channel has no address: the arena's history can't be
 rebuilt without the indexer. So public rooms aren't joinable without its answer, and a timeout claim
-needs a read of the chain newer than the flag (`flagIsConfirmed`). When it's back the arena is paged
-in again and the indexer's block times replace the stream's.
+needs a read of the chain newer than the flag (`flagIsConfirmed`), or a fresh newest page when the
+game started inside the stretch already paged (`arenaAnsweredAt(covering:)`). `IndexerHealth`
+counts failures under 5 s apart as one; it's back after 2 answers in a row, or one after 5 minutes
+down, and then only the outage is paged in again, its block times replacing the stream's. A deep
+history page that fails doesn't count toward an outage, and one failing 3 times in a row is skipped
+(a gap at the old end).
 
 The .kachat registry has its own outage rule: it moves to the chain after 3 failed indexer requests
 within 2 minutes, failures under 5 s apart counting as one (`KachatNamesRegistry.indexerOutageConfirmed`).
 A .kachat name resolved to an address always has its record checked live on chain
 (`confirmOnChain`), and the chain copy only answers while its last full check is under 3 minutes old
-(`chainCopyIsCurrent`).
+(`chainCopyIsCurrent`). A record that can't be read throws, never reads as free. A failed lookup
+says "Couldn't check" / "Couldn't load", never "not registered" or "0": that covers KNS outages
+(`KNSService.lookupDomain`) and resolver addresses not on the active network. The address card on
+send screens (`AddressResolutionCard`) shows an address's own .kachat name only after
+`KachatNamesRegistry.verifiedLabel` confirms its owner on chain.
 
 ## Nothing players type reaches other players
 
@@ -121,8 +138,15 @@ The signed-in account's seed, private key and record are three Keychain writes, 
 `WalletManager.writeActiveSlot` files a `SlotWriteIntent` around them and the next load finishes a
 write the app was killed in, from the account's snapshot. Importing the words of an account already
 saved here keeps its data. The recovery screen's Remove refuses while a snapshot can't be read.
-Delete Account stops polling and the UTXO subscription first and removes the keys next; only once
-they're gone does the per-account data go, so a failed delete leaves the account signed in and whole.
+Delete Account stops polling and the UTXO subscription first, then removes the active slot's keys and
+record (put back if a step fails), then the account's snapshot on both networks' addresses (and, for
+the last account, the Secure Enclave key); only then does the per-account data go, so a failed delete
+leaves the account signed in and whole. The words and passphrase, and every saved account's snapshot,
+are Keychain items readable only while the phone is unlocked (`tightenAllSeedItems` moves older items
+at each `loadWallet`); on a phone with a Secure Enclave a key that fails to wrap is never saved
+(`wrappedForStorage`). Settings learns whether there's a passphrase from a per-address flag
+(`WalletManager.currentAccountHasPassphrase`), not by decrypting the words. After Log Out
+`getPrivateKey()` returns nil.
 
 **NFC card backup** (`Services/NFCCard.swift`, in App Store builds too since 2026-11-06, as in
 KaChat; `NFCCard.isAvailable` hides it where NFC can't read these cards, such as iPad): an extra copy of the words of a seed phrase
@@ -144,8 +168,12 @@ and Log Out, which KaChat keeps on Profile and KaPlay has no Profile for. Every 
 (`ContentView`'s `signInSession`), opening on Play. Biometrics for Account Login is off by default,
 and existing installs were switched off once (`AppSettings.accountLoginBiometricsOffMigration`).
 
-Face ID, as in KaChat: `SwipeUpToSendScrollView` asks `DeviceAuth` before every send (declined, the
-screen settles back filled in), and both Delete Account sheets ask too. Chess moves don't ask. A
+Face ID, as in KaChat (the owner's call, 2026-11-13): Kaspa sends never ask; the swipe sends at
+once, and `startSending` switching to `.sending` is the double-send guard. `DeviceAuth` still asks on
+both Delete Account sheets, the keys-missing screen's Remove, Send Domain, the KNS profile and
+primary-domain saves, .kachat name transactions (`KachatTxSheet` passes `authReason`, the only case
+the swipe asks; declined, it settles back filled in), and revealing the seed phrase or private keys.
+Chess moves and messages don't ask. A
 send a node may have taken without answering ends on "Not confirmed" with only Done
 (`SendOutcomeUnknownError`), never Try Again, which could pay twice.
 
@@ -182,9 +210,42 @@ review. A pre-filled recipient opens on From. A spending address's Send and comp
 `SpendingAddressWithdrawView` (Manage Addresses). Coin Control greys out what a send can't spend
 (`CoinControlView.hotWalletReason`: the chatting address's rule, or a spending address's, which can
 spend a mature mining reward). The .kachat transactions are `KachatTxSheet` (swipe up with its own
-Face ID reason, `authReason`).
-Prices come from `KaspaPriceStore` (KaPay's pieces read `PortfolioViewModel`). Your main address
-is the "Chatting Address", as in KaPay.
+Face ID reason, `authReason`; a Kaspa send has none and asks nothing).
+Prices come from `KaspaPriceStore` (KaPay's pieces read `PortfolioViewModel`). A price over 30
+minutes old is never used to turn a currency amount into KAS: the switch hides (on testnet always),
+and send screens call `refreshIfStale()`. Your main address is the "Chatting Address", as in KaPay.
+
+Sends, as in KaPay: a node's "sent" counts only if its id is the one computed here
+(`NodePoolService.checkedSubmit`), and the same transaction is resent twice, 5 s apart, while the
+network can't see it. Withdrawals, spending-address sends and KNS / .kachat combine commits never go
+into a node's orphan pool (`escalateOrphan: false`); moves do. A submit that never left the phone
+("Not connected to", "Circuit breaker open") isn't a lost answer. Withdrawals require the recipient
+to be on the active network. KNS profile saves, domain transfers and coin combines go through the
+send queue (`enqueueOutgoingTxOperation`) like moves. A .kas profile change files its 2 KAS commit
+before sending (`KNSRevealRecovery`); its reveal is retried whenever the app becomes active until the
+commit is spent (a commit never seen on chain is dropped after 30 days and two empty checks), and
+saving the same change again finishes it instead of locking another 2 KAS. A domain transfer whose
+commit is still in a mempool keeps its record and asks to try again. What a submitted
+transaction spends is held 120 s, extended a minute at a time while it is still in a mempool, up to
+10 minutes (`holdSpentWhileInMempool`); not a flat 10 minutes, since a dropped move must be playable
+again and a .kachat commit is resent at 130 s. Coins carrying a covenant are never spent by plain
+sends or moves.
+
+Also ported from KaPay (2026-11-13): a mempool entry counts only if its id hashes to the one asked
+for; "did it go out" ignores the orphan pool and the node that answered the submit, and after a
+rejection needs two nodes or the built-in REST server. Coins are held from before a submit and given
+back if it's rejected or never sent (unless the node says they're spent). Every send, estimate and
+payment requires a valid address on the active network (`requireActiveNetworkRecipient`);
+`KaspaAddress` refuses an unknown prefix, a wrong payload length or mixed case, and an all-upper-case
+address (a compact QR's "KASPA:QR…") is lower-cased first (`lowercasedKaspaAddress`). The UTXO
+subscription sends a stop on Log Out or an account switch and keeps retrying after a failover that
+finds nothing. Only active, primary and standby node connections stay open and reconnect; probes
+close afterwards, with least-recently-used eviction at 50. Active nodes must report the right network
+and be at most 600 DAA behind the median. Keychain saves update in place and add only when missing,
+so a failed write keeps the old copy. A .kachat claim follows whichever commit send landed, counts a
+late register as registered, and declines open offers only once a transfer or release is in a block;
+server-supplied times and counts are range-checked, never trapping. The bell's Received amount comes
+from the REST transaction's outputs to the chatting address, and nothing is shown when it can't be read.
 
 ## Build
 

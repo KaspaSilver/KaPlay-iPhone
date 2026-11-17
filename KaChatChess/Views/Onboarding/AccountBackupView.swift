@@ -66,7 +66,7 @@ struct AccountBackupView: View {
     /// Opens the steps behind the seed phrase's biometric gate, when enabled.
     static func unlock(_ show: @escaping () -> Void) {
         if AppSettings.load().biometricSeedPhraseEnabled {
-            DeviceAuth.authenticate(reason: "Unlock to view your 12 or 24 words", onSuccess: show)
+            DeviceAuth.authenticate(reason: AppLocalization.string("Unlock to view your 12 or 24 words"), onSuccess: show)
         } else {
             show()
         }

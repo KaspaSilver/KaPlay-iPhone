@@ -514,10 +514,10 @@ struct KachatRegistrationCard: View {
                 Text("About \(left) s to go").font(.caption).foregroundColor(.secondary)
             }
             if let message = error ?? (registration.stage == .failed ? registration.lastError : nil) {
-                Text(verbatim: message).font(.caption).foregroundColor(.red)
+                Text(verbatim: AppLocalization.string(message)).font(.caption).foregroundColor(.red)
             } else if registration.needsDriving, let note = registration.lastError {
                 // what the driver is doing or waiting on (a busy network, freeing an expired name)
-                Text(verbatim: note).font(.caption).foregroundColor(.secondary)
+                Text(verbatim: AppLocalization.string(note)).font(.caption).foregroundColor(.secondary)
             }
             buttons
         }
@@ -588,7 +588,7 @@ struct KachatRegistrationCard: View {
             working = true
             error = nil
             Task { @MainActor in
-                do { try await actions.cancel(registration) } catch { self.error = error.localizedDescription }
+                do { try await actions.cancel(registration) } catch { self.error = AppLocalization.string(error.localizedDescription) }
                 working = false
             }
         }
@@ -1391,7 +1391,7 @@ struct KachatTxSheet<Inputs: View>: View {
             // Cancelled (the choice changed): not an error to show, and the new build owns the
             // sheet. Showing it left "Swift.CancellationError" and a disabled button.
             guard !Task.isCancelled, !(error is CancellationError), (error as? URLError)?.code != .cancelled else { return }
-            planError = error.localizedDescription
+            planError = AppLocalization.string(error.localizedDescription)
         }
         building = false
     }
@@ -1418,7 +1418,7 @@ struct KachatTxSheet<Inputs: View>: View {
             txId = id
             onDone(id)
         } catch {
-            sendError = error.localizedDescription
+            sendError = AppLocalization.string(error.localizedDescription)
             // the price or the fee moved: show the new plan so the person can confirm it
             switch error as? KachatNamesActions.ActionError {
             case .priceChanged?, .feeChanged?:
@@ -1556,13 +1556,13 @@ struct KachatClaimSheet: View {
                                                                       feeTier: feeTier, customFeerate: customFeerate)
                 } catch let error as KachatNamesActions.ActionError {
                     if error.isNotOpenYet {
-                        notOpen = error.localizedDescription
+                        notOpen = AppLocalization.string(error.localizedDescription)
                         if case .registrationNotOpen = error { notOpenIsMigration = true } else { notOpenIsMigration = false }
                     } else {
-                        quoteError = error.localizedDescription
+                        quoteError = AppLocalization.string(error.localizedDescription)
                     }
                 } catch {
-                    quoteError = error.localizedDescription
+                    quoteError = AppLocalization.string(error.localizedDescription)
                 }
             }
             .task {
@@ -1853,7 +1853,7 @@ struct KachatClaimSheet: View {
             // no registration to follow (it finished at once): nothing left to show
             if progressId == nil { dismiss() }
         } catch {
-            startError = error.localizedDescription
+            startError = AppLocalization.string(error.localizedDescription)
         }
         starting = false
     }
@@ -2501,7 +2501,8 @@ struct KachatLiveOfferSheet: View {
                     fiatAmountState: fiatAmountState,
                     onAmountChange: { amountText = $0 },
                     showsMax: false,
-                    footnote: info.isListed ? "\(AppLocalization.string("Listed at")) \(KaspaUnit.amount(info.price))" : nil,
+                    footnote: info.isListed ? String(format: AppLocalization.string("Listed at %@"), locale: AppLocalization.locale,
+                                                     KaspaUnit.amount(info.price)) : nil,
                     onMax: {}
                 )
             }
@@ -2752,7 +2753,8 @@ struct KachatTransferSheet: View {
             QRScannerView { code in
                 var scanned = code.trimmingCharacters(in: .whitespacesAndNewlines)
                 if let q = scanned.firstIndex(of: "?") { scanned = String(scanned[..<q]) }
-                input = scanned
+                // a compact QR code's "KASPA:QR..." shows in lower case, as typed addresses do
+                input = lowercasedKaspaAddress(scanned)
                 showScanner = false
             }
         }
@@ -3117,7 +3119,7 @@ struct KachatProfileSaveSheet: View {
                 quoteError = Self.notEnoughFundsMessage
                 noteShortOfFunds()
             } else {
-                quoteError = error.localizedDescription
+                quoteError = AppLocalization.string(error.localizedDescription)
             }
         }
     }
@@ -3138,7 +3140,7 @@ struct KachatProfileSaveSheet: View {
                         sendError = Self.notEnoughFundsMessage
                         noteShortOfFunds()
                     } else {
-                        sendError = error.localizedDescription
+                        sendError = AppLocalization.string(error.localizedDescription)
                     }
                 }
                 sending = false

@@ -223,8 +223,10 @@ final class ChessBotProgress: ObservableObject {
         return record(for: previous).wins > 0
     }
 
-    func add(_ result: Result, against bot: ChessBot) {
-        var record = record(for: bot)
+    /// Filed under `address`, the account that played the game (`ChessBotGame.playerAddress`),
+    /// never whichever is signed in when it ends.
+    func add(_ result: Result, against bot: ChessBot, address: String) {
+        var record = records[address]?[bot.level] ?? Record()
         switch result {
         case .won: record.wins += 1
         case .lost: record.losses += 1
@@ -250,7 +252,8 @@ final class ChessBotProgress: ObservableObject {
         }
     }
 
-    func addStampedWin(moves: Int, against bot: ChessBot) {
+    /// Filed under `address`, the account that played and signed the stamp.
+    func addStampedWin(moves: Int, against bot: ChessBot, address: String) {
         let win = StampedWin(moves: moves, at: Int64(Date().timeIntervalSince1970 * 1000))
         stampedWins[address, default: [:]][bot.level, default: []].append(win)
         if let data = try? JSONEncoder().encode(stampedWins) {

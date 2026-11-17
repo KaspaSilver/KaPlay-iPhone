@@ -44,8 +44,8 @@ struct GamesView: View {
     }
 
     private func gameCard<Icon: View>(
-        title: String,
-        detail: String,
+        title: LocalizedStringKey,
+        detail: LocalizedStringKey,
         @ViewBuilder icon: () -> Icon,
         open: @escaping () -> Void
     ) -> some View {

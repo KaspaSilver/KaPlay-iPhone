@@ -85,8 +85,8 @@ struct NFCCardRestoreView: View {
         defer { busy = false }
         let enteredPIN = pin
         do {
-            let backup = try await NFCCard.run(success: "Backup read.") { connection in
-                connection.setMessage("Reading. Keep the card still.")
+            let backup = try await NFCCard.run(success: AppLocalization.string("Backup read.")) { connection in
+                connection.setMessage(AppLocalization.string("Reading. Keep the card still."))
                 let current = try await connection.select()
                 if current.pinBlocked { throw NFCCardError.pinBlocked }
                 if !current.pinSet { throw NFCCardError.noPIN }

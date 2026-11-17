@@ -121,14 +121,16 @@ struct ImportWalletView: View {
             .map { String($0).trimmingCharacters(in: CharacterSet(charactersIn: ".)")) }
             .filter { !$0.isEmpty && !$0.allSatisfy(\.isNumber) }
         guard pasted.count == 12 || pasted.count == 24 else {
-            error = "You need 12 or 24 words - the clipboard holds \(pasted.count)."
+            error = String(format: AppLocalization.string("You need 12 or 24 words - the clipboard holds %d."),
+                           locale: AppLocalization.locale, pasted.count)
             return
         }
         let unknown = pasted.filter { !BIP39.shared.isValidWord($0) }
         guard unknown.isEmpty else {
             error = unknown.count == 1
                 ? "One of the pasted words isn't a valid word. Check your copy and try again."
-                : "\(unknown.count) of the pasted words aren't valid words. Check your copy and try again."
+                : String(format: AppLocalization.string("%d of the pasted words aren't valid words. Check your copy and try again."),
+                         locale: AppLocalization.locale, unknown.count)
             return
         }
         seedWordCount = pasted.count
@@ -197,7 +199,8 @@ struct ImportWalletView: View {
             Button("OK") { error = nil }
         } message: {
             if let error = error {
-                Text(error)
+                // A key ("Nothing to paste.") or text already filled in from one.
+                Text(verbatim: AppLocalization.string(error))
             }
         }
     }

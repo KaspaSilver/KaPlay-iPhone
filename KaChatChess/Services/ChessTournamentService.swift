@@ -19,7 +19,26 @@ final class ChessTournamentService: ObservableObject {
     }
     /// Chain time as this phone estimates it: wall clock, for running clocks between blocks.
     @Published private(set) var now: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
-    @Published var lastError: String?
+    /// The error toast every chess screen shows. Cleared by itself `errorShownNanos` after it
+    /// was set; a newer error restarts that, and the clear never wipes an error newer than the
+    /// one it was for (`errorToken`).
+    @Published var lastError: String? {
+        didSet {
+            guard lastError != nil else { return }
+            errorToken += 1
+            let token = errorToken
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: Self.errorShownNanos)
+                guard let self, self.errorToken == token else { return }
+                self.lastError = nil
+            }
+        }
+    }
+    private var errorToken = 0
+    private static let errorShownNanos: UInt64 = 3_000_000_000
+    /// Bumped whenever a leaderboard changes, so a screen can re-sort only then and not on
+    /// every tick of `now`.
+    @Published private(set) var boardsRevision = 0
     /// Moves sent and not yet seen back from the chain, so the board shows them at once and
     /// the player cannot double-send.
     @Published private(set) var pendingMoveGames: Set<String> = []
@@ -126,6 +145,7 @@ final class ChessTournamentService: ObservableObject {
         guard address != stateAddress else { return }
         stateAddress = address
         queuedPublicRoomId = nil
+        queuedAt = 0
         pendingMoveGames = []
         pendingMoveSentAt = [:]
         claimedGames = [:]
@@ -241,9 +261,12 @@ final class ChessTournamentService: ObservableObject {
 
     /// Whether the chain has been read since this flag: the moves on this phone can be behind
     /// (just relaunched, or the indexer down), and a clock judged from those says nothing.
+    /// An indexer answer counts when every row since the game's start is in: the whole window
+    /// paged in, or - while older pages are still failing - a fresh newest page over a stretch
+    /// already paged that reaches back to the game's start (`arenaAnsweredAt(covering:)`).
     private func flagIsConfirmed(in tournament: ChessTournament, game: ChessTournamentGame, flagAt: Int64) -> Bool {
         guard !PublicChatService.indexerBaseURL(forChannel: ChessTournamentCodec.arenaChannel).isEmpty else { return true }
-        if PublicChatService.shared.arenaIndexerAnsweredAt >= flagAt + 1_500 { return true }
+        if PublicChatService.shared.arenaAnsweredAt(covering: game.startedAt) >= flagAt + 1_500 { return true }
         return (chainReadAt["\(tournament.id)|\(game.id)"] ?? 0) >= flagAt + Self.chainFlagMarginMs
     }
 
@@ -272,7 +295,7 @@ final class ChessTournamentService: ObservableObject {
             let localStamps = PublicChatService.shared.locallyStampedTxIds
             let me = myAddress
             let wallNow = Int64(Date().timeIntervalSince1970 * 1000)
-            let result = await Task.detached(priority: .userInitiated) { () -> (tournaments: [String: ChessTournament], gapSince: Int64?) in
+            let result = await Task.detached(priority: .userInitiated) { () -> (tournaments: [String: ChessTournament], gapSince: Int64?, locallyStampedJoins: Set<String>) in
                 let events: [ChessArenaEvent] = rows.compactMap { row in
                     guard row.deliveryStatus == .sent, !row.id.hasPrefix("pending_"),
                           let message = ChessTournamentCodec.decode(row.content) else { return nil }
@@ -280,10 +303,18 @@ final class ChessTournamentService: ObservableObject {
                 }
                 let tournaments = ChessTournamentEngine.reduce(ChessTournamentService.orderingLocalStamps(events, localStamps: localStamps))
                 let gapSince = me.flatMap { ChessTournamentService.earliestGap(events, in: tournaments, me: $0, now: wallNow) }
-                return (tournaments, gapSince)
+                // The rooms this player's join still carries this phone's clock in: where it
+                // stands against the other joins is not the chain's word yet.
+                var locallyStampedJoins: Set<String> = []
+                if let me, !localStamps.isEmpty {
+                    for event in events where event.sender == me && event.message.a == "join" && localStamps.contains(event.txId) {
+                        locallyStampedJoins.insert(event.message.t)
+                    }
+                }
+                return (tournaments, gapSince, locallyStampedJoins)
             }.value
             appliedReduce = target
-            apply(result.tournaments)
+            apply(result.tournaments, locallyStampedJoins: myAddress == me ? result.locallyStampedJoins : [])
             if let since = result.gapSince, wallNow - lastGapRepageAt >= Self.gapRepageGapMs {
                 lastGapRepageAt = wallNow
                 PublicChatService.shared.repageArena(since: since)
@@ -306,15 +337,37 @@ final class ChessTournamentService: ObservableObject {
         return since
     }
 
-    private func apply(_ reduced: [String: ChessTournament]) {
+    private func apply(_ reduced: [String: ChessTournament], locallyStampedJoins: Set<String>) {
         tournaments = reduced
         recomputeLocalBoards()
         resolveNames(for: Set(reduced.values.flatMap(\.players)))
+        // The queued room is still waiting, but this player's seat in it has run out (or a join
+        // that never showed is older than any seat): nothing races for that room any more. A
+        // fill much later is not this join's race, and must not send a join nobody asked for.
+        if let queued = queuedPublicRoomId, let me = myAddress, queuedAt > 0,
+           reduced[queued].map({ $0.status == .open }) ?? true {
+            let wallNow = Int64(Date().timeIntervalSince1970 * 1000)
+            // Only the seat this join took counts: an old one that ran out stays in `players`
+            // until the next join drops it (a returning player's).
+            let seatGone: Bool
+            if let expiry = reduced[queued]?.seatExpiry(of: me),
+               expiry - ChessTournamentCodec.seatTTLMs >= queuedAt - Self.joinClockSlackMs {
+                seatGone = expiry <= wallNow
+            } else {
+                seatGone = wallNow - queuedAt > ChessTournamentCodec.seatTTLMs
+            }
+            if seatGone {
+                queuedPublicRoomId = nil
+                queuedAt = 0
+                autoRejoinsLeft = 0
+            }
+        }
         // Asked to join a public room that filled first: queue into the next one. Bounded per
         // tap (`autoRejoinsLeft`), so a join can never turn into spending nobody asked for.
         if let queued = queuedPublicRoomId, let me = myAddress, let room = reduced[queued],
            room.isFull, !room.players.contains(me) {
             queuedPublicRoomId = nil
+            queuedAt = 0
             if autoRejoinsLeft > 0 {
                 autoRejoinsLeft -= 1
                 let wasDuel = ChessTournamentCodec.duelNumber(of: queued) != nil
@@ -322,8 +375,15 @@ final class ChessTournamentService: ObservableObject {
             } else {
                 lastError = Self.roomFilledMessage
             }
-        } else if let queued = queuedPublicRoomId, let me = myAddress, reduced[queued]?.players.contains(me) == true {
+        } else if let queued = queuedPublicRoomId, let me = myAddress, let room = reduced[queued],
+                  room.status != .open, room.players.contains(me), !locallyStampedJoins.contains(queued) {
+            // Settled: the room started with this player in it, and their join has the chain's
+            // time. Until then a seat that rests on this phone's clock can still turn out to
+            // have come after the last one (the indexer's block times reorder the race), and
+            // the branch above must still be able to queue into the next room.
             queuedPublicRoomId = nil
+            queuedAt = 0
+            autoRejoinsLeft = 0
         }
         // A move of ours that the chain now shows is no longer pending.
         let mine = myAddress
@@ -374,14 +434,27 @@ final class ChessTournamentService: ObservableObject {
                 olderThan: Self.unconfirmedRowMs, giveUpAfter: Self.unconfirmedGiveUpMs
             )
             guard !dropped.isEmpty else { return }
-            let wasMove = tournaments.values.contains { tournament in
-                tournament.games.values.contains { game in game.moves.contains { dropped.contains($0.txId) } }
+            let messages = PublicChatService.shared.messages(forChannel: ChessTournamentCodec.arenaChannel)
+                .filter { dropped.contains($0.id) }
+                .compactMap { ChessTournamentCodec.decode($0.content) }
+            // A join that never landed queues nothing: the room it named filling later is not
+            // this player's race.
+            if let queued = queuedPublicRoomId, messages.contains(where: { $0.a == "join" && $0.t == queued }) {
+                queuedPublicRoomId = nil
+                queuedAt = 0
+                autoRejoinsLeft = 0
             }
-            lastError = wasMove
-                ? "Your move didn't reach the network. Play it again."
-                : "That didn't reach the network. Try again."
+            if messages.contains(where: { $0.a == "move" }) {
+                lastError = "Your move didn't reach the network. Play it again."
+            } else if messages.contains(where: { $0.a == "join" || $0.a == "create" }) {
+                lastError = Self.joinNotLandedMessage
+            } else {
+                lastError = "That didn't reach the network. Try again."
+            }
         }
     }
+
+    static let joinNotLandedMessage = "Your join didn't reach the network. Join again whenever you like."
 
     /// A move the reducer never applied (it came too late for the clock, say): the board stops
     /// saying "Sending your move…".
@@ -512,16 +585,16 @@ final class ChessTournamentService: ObservableObject {
     }
 
     /// Too busy online for a challenge link to open a bot screen: the rooms are still loading
-    /// (a game in play may not be known yet), the player is seated or playing, or a game of
-    /// theirs was decided on the clock lately with the claim not on chain yet - its winner is
-    /// still on the board to claim it.
+    /// (a game in play may not be known yet), the player is seated or playing, or they won a
+    /// game on the clock lately with the claim not on chain yet - they're still on the board to
+    /// claim it. A game they lost on time keeps nobody busy: there's nothing left for them there.
     var isBusyOnline: Bool {
         guard historyReady else { return true }
         if myActiveTournament != nil { return true }
         guard let me = myAddress else { return false }
         return tournaments.values.contains { tournament in
             tournament.status == .live && tournament.games.values.contains { game in
-                guard game.color(of: me) != nil, let flagAt = game.flagAt else { return false }
+                guard !game.isOver, let flagAt = game.flagAt, game.decidedWinner(at: now) == me else { return false }
                 return now - flagAt < Self.autoClaimWindowMs
             }
         }
@@ -593,8 +666,10 @@ final class ChessTournamentService: ObservableObject {
         }
         let all = merged(.allTime)
         let month = merged(.month)
-        if all != leaderboard { leaderboard = all }
-        if month != monthlyLeaderboard { monthlyLeaderboard = month }
+        var changed = false
+        if all != leaderboard { leaderboard = all; changed = true }
+        if month != monthlyLeaderboard { monthlyLeaderboard = month; changed = true }
+        if changed { boardsRevision += 1 }
     }
 
     private struct IndexerLeaderboardResponse: Decodable {
@@ -685,10 +760,10 @@ final class ChessTournamentService: ObservableObject {
         return String(format: "%.4f %@", Double(sompi) / 100_000_000, KaspaUnit.symbol)
     }
 
-    /// The join button's label: "Join (Fee: 0.0017 KAS)".
+    /// The join button's label: "Join (Fee: 0.0017 KAS)", in the app's language.
     func joinLabel(roomId: String) -> String {
-        guard let fee = feeText(for: ChessTournamentCodec.join(id: roomId)) else { return "Join" }
-        return "Join (Fee: \(fee))"
+        guard let fee = feeText(for: ChessTournamentCodec.join(id: roomId)) else { return ChessText.string("Join") }
+        return ChessText.format("Join (Fee: %@)", fee)
     }
 
     // MARK: - Actions (each one a public chat transaction)
@@ -727,7 +802,7 @@ final class ChessTournamentService: ObservableObject {
             return
         }
         if let busy = myActiveTournament {
-            lastError = busy.status == .open ? "You're already waiting in \(busy.name)." : "You're still playing in \(busy.name)."
+            lastError = Self.busyMessage(busy)
             return
         }
         if let room = tournaments[id], room.isSeated(me, at: now) {
@@ -735,13 +810,31 @@ final class ChessTournamentService: ObservableObject {
             return
         }
         queuedPublicRoomId = id
+        queuedAt = Int64(Date().timeIntervalSince1970 * 1000)
         // A join that did not go out queues nothing: the next room must not be joined for it -
         // unless the queue has already moved on to another room while it was being sent.
-        if !(await send(ChessTournamentCodec.join(id: id))), queuedPublicRoomId == id { queuedPublicRoomId = nil }
+        if !(await send(ChessTournamentCodec.join(id: id))), queuedPublicRoomId == id {
+            queuedPublicRoomId = nil
+            queuedAt = 0
+        }
     }
 
-    /// The room this player asked to join and is waiting to appear in.
+    /// "You're already waiting in Public 1v1 #4." / "You're still playing in …", looked up
+    /// before the room's name goes in (the toast can't look up a filled-in sentence).
+    private static func busyMessage(_ busy: ChessTournament) -> String {
+        busy.status == .open
+            ? ChessText.format("You're already waiting in %@.", busy.displayName)
+            : ChessText.format("You're still playing in %@.", busy.displayName)
+    }
+
+    /// The room this player asked to join and is waiting to appear in. Kept until the room has
+    /// started with them in it and their join carries the chain's time (`apply`), so a seat won
+    /// on this phone's clock and lost on the chain's still moves on to the next room.
     private var queuedPublicRoomId: String?
+    /// When that join was sent (wall ms).
+    private var queuedAt: Int64 = 0
+    /// How far a join's block time may sit before the phone's own send time (clocks differ).
+    private static let joinClockSlackMs: Int64 = 60_000
     /// How many more rooms the app may try by itself before the player taps Join again.
     private var autoRejoinsLeft = 0
     private static let maxAutoRejoins = 2
@@ -814,7 +907,7 @@ final class ChessTournamentService: ObservableObject {
         guard let me = myAddress, tournament.status == .open else { return false }
         if tournament.isSeated(me, at: now) { return true }
         if let busy = myActiveTournament, busy.id != tournament.id {
-            lastError = busy.status == .open ? "You're already waiting in \(busy.name)." : "You're still playing in \(busy.name)."
+            lastError = Self.busyMessage(busy)
             return false
         }
         if tournament.isPublic, arenaServerDown {
@@ -830,6 +923,8 @@ final class ChessTournamentService: ObservableObject {
     func leave(_ tournament: ChessTournament) async -> Bool {
         guard let me = myAddress, tournament.status == .open, tournament.isSeated(me, at: now) else { return true }
         queuedPublicRoomId = nil
+        queuedAt = 0
+        autoRejoinsLeft = 0
         return await send(ChessTournamentCodec.leave(id: tournament.id))
     }
 
@@ -841,18 +936,28 @@ final class ChessTournamentService: ObservableObject {
     /// Plays a move if it is ours to make and legal; the board shows it as pending until the
     /// chain returns it.
     func play(_ move: ChessMove, in tournament: ChessTournament, game: ChessTournamentGame) async {
-        // Not once the clock has decided it: a move after the flag is void on chain.
+        // Not once the clock has decided it: a move after the flag is void on chain. For the
+        // player's own move that's the moment their clock reads zero, by the wall clock this
+        // instant - not `flaggedSide`'s three-second margin, which is there so a move in flight
+        // isn't beaten to the flag, never to let one more go out after it.
+        let wallNow = Int64(Date().timeIntervalSince1970 * 1000)
         guard let me = myAddress, game.playerToMove == me, !game.isDecided(at: now),
+              let mine = game.color(of: me), game.remainingMs(mine, at: max(now, wallNow)) > 0,
               !pendingMoveGames.contains("\(tournament.id)|\(game.id)"),
               ChessEngine.isLegal(move, in: game.board) else { return }
         let normalized = ChessEngine.normalizingPromotion(move, in: game.board)
         let key = "\(tournament.id)|\(game.id)"
         pendingMoveGames.insert(key)
+        // A retry (the last move's change not mined yet) waits a second or more: never one
+        // that would go out after the player's own clock ran out.
         let sent = await send(ChessTournamentCodec.move(
             id: tournament.id, game: game.id, ply: game.moves.count + 1,
             from: normalized.from.algebraic, to: normalized.to.algebraic,
             promotion: normalized.promotion?.promotionLetter
-        ))
+        ), stillWanted: { [weak self] in
+            let current = self?.tournaments[tournament.id]?.games[game.id] ?? game
+            return current.remainingMs(mine, at: Int64(Date().timeIntervalSince1970 * 1000)) > 0
+        })
         guard myAddress == me else { return }
         if sent {
             // Timed from the moment it went out, if the chain has not shown it already.
@@ -945,20 +1050,29 @@ final class ChessTournamentService: ObservableObject {
     /// Only that kind of error is retried (`PublicChatService.isRetryableSendError`): no KAS on
     /// the chatting address, or a send whose outcome is unknown, fails at once with its message.
     /// Never deferred to a background retry: true means the transaction went out.
-    private func send(_ message: ChessTournamentMessage) async -> Bool {
+    /// Every attempt is signed by the account that asked (`expectedSender`): one that switched
+    /// meanwhile - during a retry's sleep, or while the send waited its turn - sends nothing more.
+    /// `stillWanted`: asked before every attempt; false sends nothing more.
+    private func send(_ message: ChessTournamentMessage, stillWanted: () -> Bool = { true }) async -> Bool {
         let content = ChessTournamentCodec.encode(message)
-        let sender = myAddress
+        guard let sender = myAddress else { return false }
         var attempt = 0
         while true {
+            // A switched account: nothing more goes out for the old one.
+            guard myAddress == sender else { return false }
+            guard stillWanted() else {
+                lastError = "Your clock ran out before the move could be sent."
+                return false
+            }
             do {
                 try await PublicChatService.shared.sendPublicChat(
-                    channel: ChessTournamentCodec.arenaChannel, content: content, deferNoInputRetry: false
+                    channel: ChessTournamentCodec.arenaChannel, content: content, deferNoInputRetry: false,
+                    expectedSender: sender
                 )
-                lastError = nil
+                if myAddress == sender { lastError = nil }
                 return true
             } catch {
                 attempt += 1
-                // A switched account: nothing more goes out for the old one.
                 guard myAddress == sender else { return false }
                 if attempt > 5 || !PublicChatService.isRetryableSendError(error) {
                     lastError = PublicChatService.friendlySendErrorMessage(for: error)

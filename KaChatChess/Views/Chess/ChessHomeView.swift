@@ -41,7 +41,7 @@ struct ChessHomeView: View {
                                 .foregroundColor(.accentColor)
                                 .frame(width: 32)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(mine.status == .open ? "You're waiting in \(mine.name)" : "You're playing in \(mine.name)")
+                                Text(verbatim: ChessText.whereYouAre(mine))
                                     .font(.subheadline.weight(.semibold))
                                 Text("Tap to go back to it").font(.caption).foregroundColor(.secondary)
                             }
@@ -130,7 +130,7 @@ struct ChessHomeView: View {
         openChallenge = challenge
     }
 
-    private func gameCard(icon: String, title: String, detail: String, open: @escaping () -> Void) -> some View {
+    private func gameCard(icon: String, title: LocalizedStringKey, detail: LocalizedStringKey, open: @escaping () -> Void) -> some View {
         Button {
             Haptics.selection()
             open()

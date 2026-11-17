@@ -16,13 +16,23 @@ final class KeychainService {
     private let secureEnclaveTag = "com.kachat.chess.secure-enclave-key"
     private let secureEnclaveHeader = Data([0x4B, 0x53, 0x45, 0x31]) // "KSE1"
 
-    /// Device identifier derived from SE public key hash (cached)
-    private var cachedDeviceId: String?
+    /// Device identifier derived from SE public key hash (cached). Behind a lock: the seed is
+    /// also read off the main thread (`WalletManager.accountHasPassphrase`).
+    private var _cachedDeviceId: String?
+    private let deviceIdLock = NSLock()
+    private var cachedDeviceId: String? {
+        get { deviceIdLock.withLock { _cachedDeviceId } }
+        set { deviceIdLock.withLock { _cachedDeviceId = newValue } }
+    }
 
     /// When an unwrapped item was last tried for wrapping (`rewrapIfDue`), by key name.
     private var rewrapAttemptedAt: [String: Date] = [:]
     private let rewrapLock = NSLock()
     private static let rewrapRetryInterval: TimeInterval = 300
+
+    /// Words items already moved onto the unlocked-only rule this launch (`tightenSeedItem`).
+    private var tightenedSeedItems: Set<String> = []
+    private let seedTighteningLock = NSLock()
 
     private enum KeychainKey: String {
         case seedPhrase = "kachat_seed_phrase"
@@ -219,6 +229,25 @@ final class KeychainService {
         try deleteSensitiveDataRaw(keyName: Self.kachatSaltKeyName(id: id, walletAddress: walletAddress))
     }
 
+    /// Every pending .kachat commit salt of a wallet: its account is being removed. As in KaPay.
+    func deleteAllKachatCommitSalts(walletAddress: String) {
+        let prefix = "kachat_names_commit_salt_\(Self.walletHashSuffix(walletAddress.lowercased()))_"
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let items = result as? [[String: Any]] else { return }
+        for item in items {
+            guard let account = item[kSecAttrAccount as String] as? String, account.hasPrefix(prefix) else { continue }
+            try? deleteSensitiveDataRaw(keyName: account)
+        }
+    }
+
     private static func kachatSaltKeyName(id: String, walletAddress: String) -> String {
         "kachat_names_commit_salt_\(walletHashSuffix(walletAddress.lowercased()))_\(id)"
     }
@@ -354,11 +383,14 @@ final class KeychainService {
 
     // MARK: - Clear All
 
-    /// Clears only the active account's default wallet keys, preserving account snapshots.
+    /// Clears only the active account's default wallet keys, preserving account snapshots. The
+    /// keys go before the record: stopped part-way, a record left with no keys behind it is put
+    /// back together from the account's snapshot on the next load (`restoreKeysFromSnapshot`),
+    /// while keys with no record would be orphaned.
     func clearCurrentAccountData() throws {
         try deleteSeedPhrase()
-        try deleteWallet()
         try deletePrivateKey()
+        try deleteWallet()
         try? deleteLegacyPrivateKey(includeAccessGroup: true)
         try? deleteLegacyPrivateKey(includeAccessGroup: false)
     }
@@ -496,17 +528,70 @@ final class KeychainService {
         let deviceId = try deviceIdentifier()
         let keyName = "\(baseKey.rawValue).\(deviceId)"
 
-        // Wrap with Secure Enclave. When that fails the data is still saved, protected by the
-        // Keychain alone: failing the save could lose the seed, which is worse. The failure is
-        // logged in `tryWrapPrivateKey`, and a later read wraps it (`openSensitiveData`).
-        let wrapped: Data
-        if let wrappedData = tryWrapPrivateKey(data) {
-            wrapped = wrappedData
-        } else {
-            wrapped = data
-        }
+        try saveSensitiveDataRaw(try wrappedForStorage(data), keyName: keyName, accessible: Self.accessibility(for: baseKey))
+    }
 
-        try saveSensitiveDataRaw(wrapped, keyName: keyName)
+    /// The words and passphrase are readable only while the phone is unlocked: KaPlay has no
+    /// background modes, and nothing that runs while it's locked needs them. The other keys stay
+    /// readable after the first unlock, as in KaPay.
+    private static func accessibility(for baseKey: KeychainKey) -> CFString {
+        baseKey == .seedPhrase ? kSecAttrAccessibleWhenUnlockedThisDeviceOnly : kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    }
+
+    /// Moves a words item saved before that rule onto it, once per launch. Failing changes nothing.
+    private func tightenSeedItem(keyName: String) {
+        let isNew = seedTighteningLock.withLock { tightenedSeedItems.insert(keyName).inserted }
+        guard isNew else { return }
+        let update = [kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly] as CFDictionary
+        var moved = false
+        for includeAccessGroup in [true, false] {
+            let status = SecItemUpdate(genericPasswordQueryForKey(keyName, includeAccessGroup: includeAccessGroup) as CFDictionary, update)
+            if status == errSecSuccess { moved = true }
+        }
+        // refused (a locked phone, say): tried again on the next read or launch
+        if !moved {
+            seedTighteningLock.withLock { _ = tightenedSeedItems.remove(keyName) }
+        }
+    }
+
+    /// The private key filed for a saved account (`privateKey.<device>.<address>`), as against the
+    /// signed-in account's own (`privateKey.<device>`), which keeps the after-first-unlock rule.
+    private func isSavedAccountPrivateKey(_ account: String) -> Bool {
+        guard let deviceId = try? deviceIdentifier() else { return false }
+        return account.hasPrefix("\(KeychainKey.privateKey.rawValue).\(deviceId).")
+    }
+
+    /// Every words item (the signed-in account's and every saved account's) and every saved
+    /// account's private key onto the unlocked-only rule, at launch: one is otherwise moved only
+    /// when it's read, and an account nobody opens kept the older, looser rule. As in KaPay.
+    func tightenAllSeedItems() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let items = result as? [[String: Any]] else { return }
+        for item in items {
+            guard let account = item[kSecAttrAccount as String] as? String else { continue }
+            if account.hasPrefix(KeychainKey.seedPhrase.rawValue) || isSavedAccountPrivateKey(account) {
+                tightenSeedItem(keyName: account)
+            }
+        }
+    }
+
+    /// `data` wrapped by the Secure Enclave. Stored unwrapped only where there is no Secure Enclave
+    /// (the Simulator, for one): on a phone that has one, a wrap that fails is an error, not a
+    /// quiet downgrade of the keys it protects. As in KaPay.
+    private func wrappedForStorage(_ data: Data) throws -> Data {
+        if let wrapped = tryWrapPrivateKey(data) { return wrapped }
+        if SecureEnclave.isAvailable {
+            throw KasiaError.keychainError(AppLocalization.string("Couldn't protect your keys with this iPhone's Secure Enclave. Nothing was saved. Try again."))
+        }
+        return data
     }
 
     /// Loads sensitive data from device-specific storage, unwrapping if needed
@@ -517,6 +602,7 @@ final class KeychainService {
         guard let data = try loadSensitiveDataRaw(keyName: keyName) else {
             return nil
         }
+        if baseKey == .seedPhrase { tightenSeedItem(keyName: keyName) }
 
         return try openSensitiveData(data, keyName: keyName)
     }
@@ -577,15 +663,8 @@ final class KeychainService {
     private func saveSensitiveDataForAccount(_ data: Data, baseKey: KeychainKey, publicAddress: String) throws {
         let keyName = try accountScopedKeyName(baseKey: baseKey, publicAddress: publicAddress)
 
-        // As in `saveSensitiveData`: saved even if wrapping fails, since losing the seed is worse.
-        let wrapped: Data
-        if let wrappedData = tryWrapPrivateKey(data) {
-            wrapped = wrappedData
-        } else {
-            wrapped = data
-        }
-
-        try saveSensitiveDataRaw(wrapped, keyName: keyName)
+        // Only the signed-in account's private key keeps the after-first-unlock rule.
+        try saveSensitiveDataRaw(try wrappedForStorage(data), keyName: keyName, accessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly)
     }
 
     /// The accounts with saved keys on this device, read from the Keychain itself: the list of
@@ -615,6 +694,8 @@ final class KeychainService {
         guard let data = try loadSensitiveDataRaw(keyName: keyName) else {
             return nil
         }
+        // a saved account's private key too: only the signed-in account's keeps the looser rule
+        tightenSeedItem(keyName: keyName)
         return try openSensitiveData(data, keyName: keyName)
     }
 
@@ -631,25 +712,13 @@ final class KeychainService {
     }
 
     /// Low-level save for device-specific data (no sync, device-only access)
-    private func saveSensitiveDataRaw(_ data: Data, keyName: String) throws {
-        var query = genericPasswordQueryForKey(keyName, includeAccessGroup: true)
-
-        SecItemDelete(query as CFDictionary)
-
-        query[kSecValueData as String] = data
-        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        query[kSecAttrSynchronizable as String] = kCFBooleanFalse
-
-        let status = SecItemAdd(query as CFDictionary, nil)
+    /// Updated in place, added only when missing: a delete then a failed add (a locked phone, say)
+    /// lost the only copy. The update sets `accessible` too, so a save also moves an item onto it.
+    private func saveSensitiveDataRaw(_ data: Data, keyName: String, accessible: CFString = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly) throws {
+        let status = upsert(data, query: genericPasswordQueryForKey(keyName, includeAccessGroup: true), accessible: accessible)
         if status == errSecMissingEntitlement {
             // Fallback without access group
-            var fallbackQuery = genericPasswordQueryForKey(keyName, includeAccessGroup: false)
-            SecItemDelete(fallbackQuery as CFDictionary)
-            fallbackQuery[kSecValueData as String] = data
-            fallbackQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            fallbackQuery[kSecAttrSynchronizable as String] = kCFBooleanFalse
-
-            let fallbackStatus = SecItemAdd(fallbackQuery as CFDictionary, nil)
+            let fallbackStatus = upsert(data, query: genericPasswordQueryForKey(keyName, includeAccessGroup: false), accessible: accessible)
             guard fallbackStatus == errSecSuccess else {
                 throw KasiaError.keychainError("Failed to save sensitive data: \(fallbackStatus)")
             }
@@ -658,6 +727,22 @@ final class KeychainService {
         guard status == errSecSuccess else {
             throw KasiaError.keychainError("Failed to save sensitive data: \(status)")
         }
+    }
+
+    /// Writes `data` over the item `query` finds, or adds it (device-only, never synced) when there
+    /// is none. Never deletes: a failed write leaves the old copy where it was. As in KaPay.
+    private func upsert(_ data: Data, query: [String: Any], accessible: CFString) -> OSStatus {
+        let update: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: accessible,
+        ]
+        let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+        guard status == errSecItemNotFound else { return status }
+        var add = query
+        add[kSecValueData as String] = data
+        add[kSecAttrAccessible as String] = accessible
+        add[kSecAttrSynchronizable as String] = kCFBooleanFalse
+        return SecItemAdd(add as CFDictionary, nil)
     }
 
     /// Low-level load for device-specific data
@@ -762,18 +847,10 @@ final class KeychainService {
 
     @discardableResult
     private func save(data: Data, forKey key: KeychainKey) throws -> Bool {
+        // In place, added only when missing (`upsert`): the account record must never be
+        // deleted ahead of a write that then fails.
         let query = genericPasswordQuery(for: key, includeAccessGroup: true)
-
-        // Delete any existing item
-        SecItemDelete(query as CFDictionary)
-
-        // Add new item
-        var newQuery = query
-        newQuery[kSecValueData as String] = data
-        newQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        newQuery[kSecAttrSynchronizable as String] = kCFBooleanFalse
-
-        let status = SecItemAdd(newQuery as CFDictionary, nil)
+        let status = upsert(data, query: query, accessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
         if status == errSecMissingEntitlement {
             try saveLegacy(data: data, forKey: key)
             return false
@@ -1046,14 +1123,7 @@ final class KeychainService {
 
     private func saveLegacy(data: Data, forKey key: KeychainKey) throws {
         let query = genericPasswordQuery(for: key, includeAccessGroup: false)
-        SecItemDelete(query as CFDictionary)
-
-        var newQuery = query
-        newQuery[kSecValueData as String] = data
-        newQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        newQuery[kSecAttrSynchronizable as String] = kCFBooleanFalse
-
-        let status = SecItemAdd(newQuery as CFDictionary, nil)
+        let status = upsert(data, query: query, accessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
         guard status == errSecSuccess else {
             throw KasiaError.keychainError("Failed to save to keychain: \(status)")
         }

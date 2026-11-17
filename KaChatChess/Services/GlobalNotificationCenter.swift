@@ -21,7 +21,7 @@ final class GlobalNotificationCenter: ObservableObject {
 
             var label: String {
                 switch self {
-                case .wallet: return "Wallet"
+                case .wallet: return AppLocalization.string("Wallet")
                 case .kachat: return ".kachat"
                 }
             }
@@ -41,6 +41,33 @@ final class GlobalNotificationCenter: ObservableObject {
         let timestamp: Int64 // ms
         /// The address that got the Kaspa, or the .kachat name - what tapping the row opens.
         let targetId: String?
+        /// A "Received" row's amount. Its title and body are written in the in-app language when
+        /// shown (`displayTitle`, `displayBody`), so a language switch applies to rows already
+        /// saved; `title` and `body` are only the fallback. Nil on rows an older build saved.
+        var amountSompi: UInt64? = nil
+
+        var displayTitle: String {
+            guard source == .wallet else { return title }
+            if let amountSompi {
+                return Self.receivedTitle(WalletReceiptNotifier.formatKas(amountSompi))
+            }
+            // an older build's English "Received 1.5 KAS": its amount, in today's words
+            if let match = title.range(of: #"^Received ([0-9.]+) T?KAS$"#, options: .regularExpression) {
+                let amount = title[match].dropFirst("Received ".count).split(separator: " ").first.map(String.init) ?? ""
+                if !amount.isEmpty { return Self.receivedTitle(amount) }
+            }
+            return title
+        }
+
+        var displayBody: String {
+            guard source == .wallet, let targetId, !targetId.isEmpty,
+                  amountSompi != nil || body.hasPrefix("Chatting address ") else { return body }
+            return String(format: AppLocalization.string("Chatting address %@"), WalletReceiptNotifier.shortAddress(targetId))
+        }
+
+        private static func receivedTitle(_ amount: String) -> String {
+            String(format: KaspaUnit.label(AppLocalization.string("Received %@ KAS")), amount)
+        }
     }
 
     /// One stored entry; nil for a row this build no longer lists (KaChat's chat, group and
@@ -98,9 +125,11 @@ final class GlobalNotificationCenter: ObservableObject {
 
     // MARK: - Feed mutations
 
-    func record(id: String, source: Entry.Source, title: String, body: String, timestamp: Int64, targetId: String?) {
+    func record(id: String, source: Entry.Source, title: String, body: String, timestamp: Int64, targetId: String?,
+                amountSompi: UInt64? = nil) {
         guard !id.isEmpty, !entries.contains(where: { $0.id == id }) else { return }
-        entries.insert(Entry(id: id, source: source, title: title, body: body, timestamp: timestamp, targetId: targetId), at: 0)
+        entries.insert(Entry(id: id, source: source, title: title, body: body, timestamp: timestamp, targetId: targetId,
+                             amountSompi: amountSompi), at: 0)
         if entries.count > maxEntries { entries = Array(entries.prefix(maxEntries)) }
         persist()
     }
@@ -147,10 +176,10 @@ struct GlobalNotificationListView: View {
                                 .foregroundColor(.accentColor)
                                 .frame(width: 24)
                             VStack(alignment: .leading, spacing: 3) {
-                                Text(entry.title)
+                                Text(entry.displayTitle)
                                     .font(.subheadline.weight(.semibold))
-                                if !entry.body.isEmpty {
-                                    Text(entry.body)
+                                if !entry.displayBody.isEmpty {
+                                    Text(entry.displayBody)
                                         .font(.caption)
                                         .foregroundColor(.secondary)
                                         .lineLimit(2)
@@ -216,11 +245,11 @@ struct GlobalNotificationListView: View {
 
 /// "Received" rows for the bell: Kaspa that reached the chatting address from someone else. Fed
 /// every live UTXO batch (`ChatService.handleUtxoChangeNotification`). A transaction counts as ours,
-/// and never shows, when the same batch spent one of our coins, when this app sent it, or when any
-/// of its inputs (the Kaspa REST API's resolved previous outpoints) is one of our addresses - so a
+/// and never shows, when this app sent it or when any of its inputs (the Kaspa REST API's resolved previous outpoints) is one of our addresses - so a
 /// move's change, a send's change, a compound, a .kachat name transaction and anything another app
 /// on the same seed sends stay out. A transaction that can't be read isn't shown: a missed row is
-/// better than a wrong one. One row per transaction, the outputs to us summed.
+/// better than a wrong one. One row per transaction, its amount the REST transaction's own outputs
+/// to the chatting address summed, never the node's batch alone (one node's word).
 @MainActor
 final class WalletReceiptNotifier {
     static let shared = WalletReceiptNotifier()
@@ -238,53 +267,77 @@ final class WalletReceiptNotifier {
             NotificationCenter.default.post(name: .ownAddressUtxoActivity, object: nil,
                                             userInfo: [Self.utxoActivityAddressesKey: Array(involved)])
         }
-        // The same batch spent one of our coins: whatever it added is our own change.
-        guard !parsed.removed.contains(where: { $0.address.map { own.contains($0.lowercased()) } ?? false }) else { return }
-        var amounts: [String: UInt64] = [:]
-        for entry in parsed.added where !entry.isCoinbase && entry.address?.lowercased() == wallet.lowercased() {
-            amounts[entry.transactionId, default: 0] += entry.amount
+        // No batch-level "we spent a coin, so skip it all": every chess move spends a chatting-address
+        // coin, and a payment arriving in the same batch would be lost. Each transaction is judged
+        // alone: this app's own sends by txid here, anything else by its inputs (`confirmAndRecord`).
+        // the batch only says which transactions paid the chatting address; what they paid is read
+        // from each transaction itself (`confirmAndRecord`)
+        var txIds: [String] = []
+        for entry in parsed.added where !entry.isCoinbase && entry.address?.lowercased() == wallet.lowercased()
+            && !txIds.contains(entry.transactionId) {
+            txIds.append(entry.transactionId)
         }
-        for (txId, amount) in amounts where !handled.contains(txId) {
+        for txId in txIds where !handled.contains(txId) {
             handled.insert(txId)
             guard !ChatService.shared.isKnownOutgoingAttemptTxId(txId) else { continue }
-            Task { await self.confirmAndRecord(txId: txId, amount: amount, wallet: wallet) }
+            Task { await self.confirmAndRecord(txId: txId, wallet: wallet) }
         }
     }
 
-    private func confirmAndRecord(txId: String, amount: UInt64, wallet: String) async {
+    private func isSignedIn(_ wallet: String) -> Bool {
+        WalletManager.shared.currentWallet?.publicAddress == wallet
+    }
+
+    private func confirmAndRecord(txId: String, wallet: String) async {
         // The API can be a moment behind the node: asked again a few times.
         var transaction: KaspaFullTransactionResponse?
         for attempt in 0..<4 {
             if attempt > 0 { try? await Task.sleep(nanoseconds: 4_000_000_000) }
+            // signed out or switched while waiting: this account's check is over
+            guard isSignedIn(wallet) else { return }
             if let tx = await ChatService.shared.fetchFullTransaction(txId: txId),
+               tx.transactionId.lowercased() == txId.lowercased(), tx.isAccepted != false,
                let inputs = tx.inputs, !inputs.isEmpty,
                inputs.allSatisfy({ !($0.previousOutpointAddress ?? "").isEmpty }) {
                 transaction = tx
                 break
             }
         }
-        guard let transaction, WalletManager.shared.currentWallet?.publicAddress == wallet else { return }
+        guard let transaction, isSignedIn(wallet) else { return }
         let own = WalletManager.shared.ownAddressSetLowercased()
         guard !(transaction.inputs ?? []).contains(where: { own.contains(($0.previousOutpointAddress ?? "").lowercased()) }) else { return }
+        // The amount from the transaction's own outputs to the chatting address, not the node's
+        // batch: none there (an answer that doesn't match) and nothing is shown.
+        var amount: UInt64 = 0
+        for output in transaction.outputs where output.scriptPublicKeyAddress?.lowercased() == wallet.lowercased() {
+            let (sum, overflow) = amount.addingReportingOverflow(output.amount)
+            guard !overflow else { return }
+            amount = sum
+        }
+        guard amount > 0 else {
+            AppLog.log("[WalletReceipt] %@ pays nothing to the chatting address by its outputs; not shown", String(txId.prefix(12)))
+            return
+        }
+        // the words are written when the row is shown (`Entry.displayTitle`); these are the fallback
         GlobalNotificationCenter.shared.record(
             id: "wallet-\(txId)", source: .wallet,
-            title: "Received \(Self.formatKas(amount)) \(KaspaUnit.symbol)",
-            body: "Chatting address \(Self.shortAddress(wallet))",
-            timestamp: Int64(Date().timeIntervalSince1970 * 1000), targetId: wallet
+            title: String(format: KaspaUnit.label(AppLocalization.string("Received %@ KAS")), Self.formatKas(amount)),
+            body: String(format: AppLocalization.string("Chatting address %@"), Self.shortAddress(wallet)),
+            timestamp: Int64(Date().timeIntervalSince1970 * 1000), targetId: wallet, amountSompi: amount
         )
     }
 
     /// UserInfo key carrying the involved own addresses on a `.ownAddressUtxoActivity` post.
     static let utxoActivityAddressesKey = "addresses"
 
-    static func formatKas(_ sompi: UInt64) -> String {
+    nonisolated static func formatKas(_ sompi: UInt64) -> String {
         var formatted = String(format: "%.8f", Double(sompi) / 100_000_000)
         while formatted.hasSuffix("0") { formatted.removeLast() }
         if formatted.hasSuffix(".") { formatted.removeLast() }
         return formatted
     }
 
-    private static func shortAddress(_ address: String) -> String {
+    nonisolated static func shortAddress(_ address: String) -> String {
         address.count > 16 ? "\(address.prefix(12))...\(address.suffix(4))" : address
     }
 }

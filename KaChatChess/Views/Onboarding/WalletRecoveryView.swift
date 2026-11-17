@@ -103,7 +103,7 @@ struct WalletRecoveryView: View {
             .alert("Couldn't remove", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
                 Button("OK", role: .cancel) {}
             } message: {
-                Text(errorMessage ?? "")
+                Text(verbatim: AppLocalization.string(errorMessage ?? ""))
             }
         }
     }

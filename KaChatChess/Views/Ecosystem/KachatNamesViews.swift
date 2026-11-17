@@ -542,18 +542,22 @@ struct AddressDomainsTab: View {
         async let services = NameServicesClient.shared.ownedNamesByService(of: address)
         async let kns = KNSService.shared.fetchInfo(for: address, network: network)
 
-        let kachatNames = (await kachat)[address] ?? []
-        set(.kachat, kachatNames.map(\.display))
+        // nil: the names couldn't be read - "Couldn't load", never "0"
+        if let kachatNames = (await kachat)[address] {
+            set(.kachat, kachatNames.map(\.display))
+        } else {
+            markFailed(.kachat)
+        }
 
         let byService = await services
         for tld in [NameServiceTLD.k, .kaspa] {
-            if let list = byService[tld] { set(tld, list.map(\.display)) } else { failed.insert(tld) }
+            if let list = byService[tld] { set(tld, list.map(\.display)) } else { markFailed(tld) }
         }
 
         if let info = await kns {
             set(.kas, info.allDomains.map(\.fullName))
         } else {
-            failed.insert(.kas)
+            markFailed(.kas)
         }
     }
 
@@ -561,6 +565,14 @@ struct AddressDomainsTab: View {
         names[tld] = list
         counts[tld] = list.count
         failed.remove(tld)
+    }
+
+    /// A lookup that failed drops what an earlier one found, so the card shows the failure
+    /// rather than an old count.
+    private func markFailed(_ tld: NameServiceTLD) {
+        names[tld] = nil
+        counts[tld] = nil
+        failed.insert(tld)
     }
 }
 

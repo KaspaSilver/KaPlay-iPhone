@@ -54,13 +54,21 @@ final class KachatNamesService: ObservableObject {
                 return AppLocalization.string("The .kachat registry is being upgraded. Names open here again once the new registry is live.")
             case .testnetOnly: return AppLocalization.string(".kachat names aren't live on this network yet")
             case .wrongAddressNetwork: return AppLocalization.string("This address is on a different network than the app.")
-            case .noManifest(let why): return "No .kachat registry manifest: \(why)"
-            case .dryRunManifest: return "The .kachat manifest is from a dry run; that registry does not exist"
-            case .wrongNodeNetwork(let n): return "The node is on \(n), not \(KachatNamesService.networkName)"
-            case .keyMismatch: return "The signing key is not the key the transaction was built for"
-            case .notOnChain(let what): return "\(what) is not on chain (or not with the registry covenant id)"
-            case .badProfile(let why): return "Profile: \(why)"
-            case .submitMismatch(let e, let g): return "The node accepted \(g), expected \(e)"
+            // the details filled in (`why`, `what`) are diagnostics and stay as written
+            case .noManifest(let why):
+                return String(format: AppLocalization.string("No .kachat registry manifest: %@"), why)
+            case .dryRunManifest:
+                return AppLocalization.string("The .kachat manifest is from a dry run; that registry does not exist")
+            case .wrongNodeNetwork(let n):
+                return String(format: AppLocalization.string("The node is on %@, not %@"), n, KachatNamesService.networkName)
+            case .keyMismatch:
+                return AppLocalization.string("The signing key is not the key the transaction was built for")
+            case .notOnChain(let what):
+                return String(format: AppLocalization.string("%@ is not on chain (or not with the registry covenant id)"), what)
+            case .badProfile(let why):
+                return String(format: AppLocalization.string("Profile: %@"), why)
+            case .submitMismatch(let e, let g):
+                return String(format: AppLocalization.string("The node accepted %@, expected %@"), g, e)
             }
         }
     }
@@ -198,7 +206,8 @@ final class KachatNamesService: ObservableObject {
         return KachatNames.Env(
             me: try Self.xonlyKey(privateKey: privateKey),
             blockDaa: dag.virtualDaaScore,
-            blockTimeMs: dag.pastMedianTimeMs,
+            // a node's answer is held to a real time, so the Int64 sums on it never trap
+            blockTimeMs: min(dag.pastMedianTimeMs, UInt64(KachatNames.maxTimeMs)),
             wallMs: Int64(Date().timeIntervalSince1970 * 1000),
             feerate: max(feerate, KachatNames.minFeerate),
             // the v5 gap is bigger and costs more script units per spend
@@ -256,6 +265,15 @@ final class KachatNamesService: ObservableObject {
         let live = try Self.convert(u)
         guard live.entry.script == script else { throw ServiceError.notOnChain("\(txidHex):\(outpoint.index) with that state") }
         return live
+    }
+
+    /// Every live UTXO holding `script`, whatever transaction made it: a commit's salt makes its
+    /// script unique, so this finds a commit sent more than once by whichever send landed.
+    func liveUtxos(script: Data) async throws -> [KachatNames.Utxo] {
+        try requireLaunched()
+        guard let address = Self.p2shAddress(script: script) else { throw ServiceError.notOnChain("a non-P2SH script") }
+        let utxos = try await NodePoolService.shared.getUtxosByAddresses([address])
+        return utxos.compactMap { try? Self.convert($0) }.filter { $0.entry.script == script }
     }
 
     /// `liveUtxo` for a gap or name, which must also carry the registry covenant id.

@@ -119,12 +119,12 @@ private struct ChessBotMatchView: View {
         .toolbar(isLockedIn ? .hidden : .visible, for: .tabBar)
         .sheet(isPresented: $showResignConfirm) {
             resignSheet(leaving: false)
-                .presentationDetents([.height(300)])
+                .fittedSheetDetent(estimate: 300)
                 .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $showLeaveWarning) {
             resignSheet(leaving: true)
-                .presentationDetents([.height(300)])
+                .fittedSheetDetent(estimate: 300)
                 .presentationDragIndicator(.visible)
         }
         .sheet(item: $pendingPromotion) { move in
@@ -153,7 +153,9 @@ private struct ChessBotMatchView: View {
                     Text(bot.name)
                         .font(.headline)
                         .lineLimit(1)
-                    Text("Level \(bot.level) · \(bot.title) · You play \(game.playerColor == .white ? "white" : "black")")
+                    Text(verbatim: game.playerColor == .white
+                         ? ChessText.format("Level %lld · %@ · You play white", bot.level, ChessText.string(bot.title))
+                         : ChessText.format("Level %lld · %@ · You play black", bot.level, ChessText.string(bot.title)))
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .lineLimit(1)
@@ -163,7 +165,7 @@ private struct ChessBotMatchView: View {
                     ProgressView()
                 }
             }
-            Text(statusText)
+            Text(verbatim: statusText)
                 .font(.subheadline.weight(.semibold))
                 .foregroundColor(game.isOver ? .secondary : .primary)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -171,19 +173,34 @@ private struct ChessBotMatchView: View {
         .padding(.horizontal)
     }
 
+    /// One whole sentence per way the game can end (`ChessBotGame.finish`'s reasons).
     private var statusText: String {
         if let result = game.result {
             switch result {
-            case .won(let why): return "You won by \(why) in \(game.playerMoveCount) moves."
-            case .lost(let why): return why == "resignation" ? "You resigned. \(bot.name) wins." : "\(bot.name) won by \(why)."
-            case .drawn(let why): return "Draw by \(why)."
+            case .won:
+                // The player wins only by checkmate.
+                return game.playerMoveCount == 1
+                    ? ChessText.string("You won by checkmate in 1 move.")
+                    : ChessText.format("You won by checkmate in %lld moves.", game.playerMoveCount)
+            case .lost(let why):
+                return why == "resignation"
+                    ? ChessText.format("You resigned. %@ wins.", bot.name)
+                    : ChessText.format("%@ won by checkmate.", bot.name)
+            case .drawn(let why):
+                switch why {
+                case "stalemate": return ChessText.string("Draw by stalemate.")
+                case "insufficient material": return ChessText.string("Draw by insufficient material.")
+                case "the fifty-move rule": return ChessText.string("Draw by the fifty-move rule.")
+                case "threefold repetition": return ChessText.string("Draw by threefold repetition.")
+                default: return ChessText.string("Draw.")
+                }
             }
         }
-        if game.isThinking { return "\(bot.name) is thinking…" }
+        if game.isThinking { return ChessText.format("%@ is thinking…", bot.name) }
         if game.board.sideToMove == game.playerColor {
-            return ChessEngine.isKingInCheck(color: game.playerColor, board: game.board) ? "Check. Your move." : "Your move"
+            return ChessText.string(ChessEngine.isKingInCheck(color: game.playerColor, board: game.board) ? "Check. Your move." : "Your move")
         }
-        return "\(bot.name) to move"
+        return ChessText.format("%@ to move", bot.name)
     }
 
     // MARK: - Board
@@ -294,13 +311,14 @@ private struct ChessBotMatchView: View {
             }
             Spacer(minLength: 0)
         }
-        .presentationDetents([.height(180)])
+        .padding(.bottom, 16)
+        .fittedSheetDetent(estimate: 180)
     }
 
     // MARK: - End of game
 
     private func endOverlay(_ result: ChessBotProgress.Result) -> some View {
-        let (icon, headline, tint): (String, String, Color) = {
+        let (icon, headline, tint): (String, LocalizedStringKey, Color) = {
             switch result {
             case .won: return ("trophy.fill", "You won!", .orange)
             case .lost: return ("flag.fill", "You lost", .red)
@@ -320,7 +338,7 @@ private struct ChessBotMatchView: View {
                 Text(headline)
                     .font(.title2.weight(.bold))
                     .foregroundColor(.white)
-                Text(statusText)
+                Text(verbatim: statusText)
                     .font(.subheadline)
                     .foregroundColor(.white.opacity(0.85))
                     .multilineTextAlignment(.center)
@@ -379,7 +397,7 @@ private struct ChessBotMatchView: View {
 
     /// Share to KaPost, once the win is on chain: what the post shows off can be looked up.
     private var shareButton: some View {
-        let title: String = {
+        let title: LocalizedStringKey = {
             switch game.stamp {
             case .stamped: return "Share to KaPost"
             case .failed: return "Retry the stamp"
@@ -413,7 +431,10 @@ private struct ChessBotMatchView: View {
     // MARK: - Resign
 
     private func resignSheet(leaving: Bool) -> some View {
-        let consequence = "It counts as a loss against \(bot.name), and the result goes on Kaspa in one transaction."
+        // One whole text per case, so a translation can order it as its language needs.
+        let consequence = leaving
+            ? ChessText.format("If you leave, you resign the game. It counts as a loss against %@, and the result goes on Kaspa in one transaction.", bot.name)
+            : ChessText.format("It counts as a loss against %@, and the result goes on Kaspa in one transaction.", bot.name)
         return VStack(spacing: 16) {
             Image(systemName: leaving ? "rectangle.portrait.and.arrow.right" : "flag.fill")
                 .font(.scaled(size: 34))
@@ -421,7 +442,7 @@ private struct ChessBotMatchView: View {
                 .padding(.top, 28)
             Text(leaving ? "Leave the game?" : "Resign this game?")
                 .font(.title3.weight(.bold))
-            Text(leaving ? "If you leave, you resign the game. \(consequence)" : consequence)
+            Text(verbatim: consequence)
                 .font(.subheadline)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
@@ -492,13 +513,13 @@ private struct ChessBotMatchView: View {
                 }
             }
             if case .failed(let error) = game.stamp {
-                Text(error)
+                Text(verbatim: AppLocalization.string(error))
                     .font(.caption2)
                     .foregroundColor(.red)
                     .lineLimit(3)
             }
             if case .unconfirmed(let note) = game.stamp {
-                Text(note)
+                Text(verbatim: AppLocalization.string(note))
                     .font(.caption2)
                     .foregroundColor(.secondary)
                     .lineLimit(3)
@@ -508,7 +529,7 @@ private struct ChessBotMatchView: View {
         .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
     }
 
-    private var chainText: String {
+    private var chainText: LocalizedStringKey {
         switch game.stamp {
         case .none: return "The result goes on Kaspa when the game ends"
         case .sending: return "Stamping the result on Kaspa…"
@@ -544,9 +565,9 @@ private struct ChessBotMatchView: View {
                     }
                     ForEach(pairs) { pair in
                         HStack(spacing: 5) {
-                            Text("\(pair.number).").foregroundColor(.secondary)
-                            Text(pair.white)
-                            if let black = pair.black { Text(black) }
+                            Text(verbatim: "\(pair.number).").foregroundColor(.secondary)
+                            Text(verbatim: pair.white)
+                            if let black = pair.black { Text(verbatim: black) }
                         }
                         .id(pair.number)
                     }

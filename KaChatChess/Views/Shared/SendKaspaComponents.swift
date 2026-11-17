@@ -83,7 +83,8 @@ struct SendRecipientCard: View {
                 HStack(spacing: 6) {
                     inputPill("Paste", systemImage: "doc.on.clipboard") {
                         if let pasted = UIPasteboard.general.string {
-                            input = pasted.trimmingCharacters(in: .whitespacesAndNewlines)
+                            // an upper-case address ("KASPA:QR...") in lower case, as scans are
+                            input = lowercasedKaspaAddress(pasted.trimmingCharacters(in: .whitespacesAndNewlines))
                         }
                     }
                     inputPill("Scan QR", systemImage: "qrcode.viewfinder", action: onScan)
@@ -136,7 +137,8 @@ struct SendRecipientCard: View {
             .font(.caption)
             .foregroundColor(.secondary)
         } else if let lookupError {
-            Label(lookupError, systemImage: "xmark.circle.fill")
+            // A key or an already-translated message: looked up either way.
+            Label { Text(verbatim: AppLocalization.string(lookupError)) } icon: { Image(systemName: "xmark.circle.fill") }
                 .font(.caption)
                 .foregroundColor(.red)
         } else if let resolvedAddress {
@@ -223,8 +225,8 @@ struct OtherDomainsDropdown: View {
     }
 
     static func missingText(_ r: NameResolution) -> String {
-        if r.notLive { return String(localized: "Coming soon") }
-        return r.failed ? String(localized: "Couldn't check") : String(localized: "Not registered")
+        if r.notLive { return AppLocalization.string("Coming soon") }
+        return r.failed ? AppLocalization.string("Couldn't check") : AppLocalization.string("Not registered")
     }
 }
 
@@ -253,7 +255,7 @@ struct KaspaAmountEntry: View {
     var body: some View {
         let display = Self.grouped(fiatAmountState.displayText)
         let fontSize: CGFloat = display.count <= 7 ? 52 : (display.count <= 10 ? 40 : 30)
-        let price = priceStore.currentPriceUsd
+        let price = priceStore.networkPriceUsd
         VStack(spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 TextField(
@@ -327,9 +329,26 @@ struct KaspaAmountEntry: View {
             }
         }
         .onAppear {
+            priceStore.refreshIfStale()
             guard focusOnAppear else { return }
             // The field doesn't exist yet on the tap that presented the screen.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { isFocused = true }
+        }
+        .leavesCurrencyModeWhenPriceGoes(fiatAmountState, price: price, onAmountChange: onAmountChange)
+    }
+}
+
+extension View {
+    /// A price that ages out (or a switch to testnet) while an amount is typed in your currency
+    /// hides the KAS / currency switch, which would leave the screen stuck in currency mode with
+    /// no price to convert by: back to KAS, and the amount cleared.
+    func leavesCurrencyModeWhenPriceGoes(_ fiatAmountState: KaspaFiatAmountState, price: Double?,
+                                         onAmountChange: @escaping (String) -> Void) -> some View {
+        onChange(of: price) { newPrice in
+            if newPrice == nil, fiatAmountState.isFiatMode {
+                fiatAmountState.reset()
+                onAmountChange("")
+            }
         }
     }
 }
@@ -526,10 +545,22 @@ struct SendFeeControls: View {
     }
 }
 
+extension KaspaPriceStore {
+    /// The price the send screens use: `currentPriceUsd` on mainnet, nil on testnet, whose coins
+    /// have no price. The KAS / currency switch hides with it, as the balance's value does.
+    var networkPriceUsd: Double? {
+        AppSettings.load().networkType == .mainnet ? currentPriceUsd : nil
+    }
+}
+
 /// "Automatic" or "3 UTXOs selected", for the coin control row.
 func coinControlSummary(_ manualUtxos: [UTXO]?) -> String {
     guard let manualUtxos else { return AppLocalization.string("Automatic") }
-    return "\(manualUtxos.count) UTXO\(manualUtxos.count == 1 ? "" : "s") selected"
+    // Singular and plural are separate keys (no .stringsdict), so each language words both.
+    let format = manualUtxos.count == 1
+        ? AppLocalization.string("%d UTXO selected")
+        : AppLocalization.string("%d UTXOs selected")
+    return String(format: format, locale: AppLocalization.locale, manualUtxos.count)
 }
 
 /// A small glass capsule for one line of context (available balance, fee).
@@ -817,7 +848,7 @@ struct KaspaKeypadAmountEntry: View {
     var onKeyTyped: () -> Void = {}
 
     var body: some View {
-        let price = priceStore.currentPriceUsd
+        let price = priceStore.networkPriceUsd
         VStack(spacing: 0) {
             Spacer(minLength: 8)
             amountLine
@@ -884,6 +915,8 @@ struct KaspaKeypadAmountEntry: View {
             }
             .padding(.horizontal, 12)
         }
+        .onAppear { priceStore.refreshIfStale() }
+        .leavesCurrencyModeWhenPriceGoes(fiatAmountState, price: price, onAmountChange: onAmountChange)
     }
 
     private var amountLine: some View {
@@ -1130,7 +1163,8 @@ struct SwipeUpToSendScrollView<Content: View>: View {
     /// The screen's error for a send that failed, shown under "Failed".
     var failureMessage: String?
     var labels: SwipeUpLabels = .send
-    /// What the Face ID prompt says, when this screen does something other than send Kaspa.
+    /// Set only for a .kachat name transaction: the screen then asks Face ID with this reason
+    /// before it sends. Nil (a Kaspa send) sends on the swipe with no prompt.
     var authReason: String? = nil
     /// For an action that ends without a `SentTransaction` (a .kachat claim): true once it
     /// worked, and `outcome` shows under the title in place of the transaction.
@@ -1159,8 +1193,10 @@ struct SwipeUpToSendScrollView<Content: View>: View {
     @State private var confirmed = false
     /// The send ended without a transaction: the sending screen shows "Failed".
     @State private var failed = false
-    /// Face ID is up for a send. Until it answers the screen is still the form, so without this a
-    /// second swipe (or VoiceOver activation) in that moment asked again and could send twice.
+    /// Face ID is up for a .kachat transaction (`authReason` set). Until it answers the screen is
+    /// still the form, so without this a second swipe (or VoiceOver activation) in that moment
+    /// asked again and could send twice. A plain Kaspa send asks nothing: `startSending` switches
+    /// to `.sending` at once, which is its double-send guard.
     @State private var authPending = false
 
     private static var barHeight: CGFloat { 64 }
@@ -1297,13 +1333,18 @@ struct SwipeUpToSendScrollView<Content: View>: View {
         }
     }
 
-    /// Kaspa never leaves on the swipe alone: Face ID first, on every Send Kaspa screen. Declined,
+    /// A Kaspa send goes on the swipe alone, as in KaChat (the owner's call, 2026-11-13). Only a
+    /// .kachat name transaction, which passes `authReason`, still asks Face ID first; declined,
     /// the screen settles back with everything still filled in.
     private func authenticateThenSend() {
         guard !authPending, phase == .form else { return }
+        guard let authReason else {
+            startSending()
+            return
+        }
         authPending = true
         DeviceAuth.authenticate(
-            reason: authReason ?? AppLocalization.string("Confirm sending Kaspa"),
+            reason: authReason,
             onSuccess: {
                 startSending()
                 authPending = false
@@ -1448,7 +1489,8 @@ private struct SendProgressScreen: View {
 
             if let failure {
                 Label {
-                    Text(verbatim: failure)
+                    // A key, or a message already in the in-app language.
+                    Text(verbatim: AppLocalization.string(failure))
                         .fixedSize(horizontal: false, vertical: true)
                 } icon: {
                     Image(systemName: "exclamationmark.triangle.fill")

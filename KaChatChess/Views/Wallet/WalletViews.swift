@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import WebKit
 import CoreImage
 import CoreImage.CIFilterBuiltins
@@ -94,7 +95,7 @@ private struct WalletBalanceCard: View {
     /// What the total is worth in your currency. Testnet coins aren't worth anything.
     private func fiatText(_ sompi: UInt64?) -> String? {
         guard let sompi, AppSettings.load().networkType == .mainnet,
-              let price = priceStore.currentPriceUsd, price > 0 else { return nil }
+              let price = priceStore.networkPriceUsd, price > 0 else { return nil }
         return formatFiatAmount(Double(sompi) / 100_000_000.0 * price, currency: priceStore.currentCurrency)
     }
 }
@@ -131,7 +132,13 @@ struct ChessWalletView: View {
     /// The account's .kachat names for the Your Domains count - the same set its .kachat tab
     /// lists (in grace and lapsed included). 0 where the registry isn't launched.
     @State private var kachatOwnedCount = 0
-    @ObservedObject private var kachatRegistry = KachatNamesRegistry.shared
+    /// Not observed: this screen only needs the registry's `revision`, which it keeps in
+    /// `kachatRevision`. Observing the whole registry redrew the tab on every refresh
+    /// (`isRefreshing`, `refreshedAt`, `source`...).
+    private let kachatRegistry = KachatNamesRegistry.shared
+    /// The registry's `revision`, copied in by `onReceive`; nil until the first value arrives,
+    /// so the reload tasks keyed on it don't run twice on appear.
+    @State private var kachatRevision: Int?
     @State private var spendingAddressBalanceSompi: UInt64?
     @State private var isLoadingSpendingBalance = false
     /// Every spending address together, for the balance card and the top bar.
@@ -195,7 +202,9 @@ struct ChessWalletView: View {
                 }
                 .padding()
             }
-            .task(id: "\(walletManager.currentWallet?.publicAddress ?? "")-\(kachatRegistry.revision)") {
+            .onReceive(KachatNamesRegistry.shared.$revision.removeDuplicates()) { kachatRevision = $0 }
+            .task(id: "\(walletManager.currentWallet?.publicAddress ?? "")-\(kachatRevision ?? -1)") {
+                guard kachatRevision != nil else { return }
                 await expiredKachatNames.load()
             }
             .refreshable {
@@ -292,7 +301,10 @@ struct ChessWalletView: View {
                     HStack(spacing: 10) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundColor(.red)
-                        Text(localizedFormat("%d profile update(s) failed", failedKNSUpdates.count))
+                        // Singular and plural are separate keys (no .stringsdict).
+                        Text(verbatim: localizedFormat(failedKNSUpdates.count == 1
+                                                       ? "%d profile update failed"
+                                                       : "%d profile updates failed", failedKNSUpdates.count))
                             .font(.footnote.weight(.semibold))
                         Button {
                             retryAllFailedKNSUpdates()
@@ -527,7 +539,8 @@ struct ChessWalletView: View {
                 await NameServicesClient.shared.refresh(for: walletAddress)
             }
             // Reloads whenever the registry moves (a registration, sale or transfer lands).
-            .task(id: "\(walletAddress)-\(kachatRegistry.revision)") {
+            .task(id: "\(walletAddress)-\(kachatRevision ?? -1)") {
+                guard kachatRevision != nil else { return }
                 await loadKachatOwnedCount(walletAddress)
             }
         }
@@ -720,7 +733,8 @@ struct ChessWalletView: View {
                         .font(.subheadline)
                         .padding()
                 } else {
-                    Text("Spending address is unlocking — go back and try again.")
+                    // Shown in the Receive sheet, whose only way out is Done.
+                    Text("Spending address is unlocking. Close this and try again.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .padding()
@@ -961,7 +975,8 @@ struct ChessWalletView: View {
     }
 
     private func compactErrorText(_ error: Error, maxLength: Int = 160) -> String {
-        let text = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Looked up: errors thrown here carry English keys ("Invalid email address format").
+        let text = AppLocalization.string(error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines))
         guard text.count > maxLength else { return text }
         return String(text.prefix(maxLength - 3)) + "..."
     }
@@ -1080,7 +1095,7 @@ struct ChessWalletView: View {
                 await MainActor.run {
                     knsSaveProgressText = localizedFormat(
                         "Updating %@ (%d/%d)...",
-                        change.key.displayName,
+                        localized(change.key.displayName),
                         index + 1,
                         changes.count
                     )
@@ -1096,7 +1111,7 @@ struct ChessWalletView: View {
                     successCount += 1
                     logKNSWrite("FIELD_OK key=\(change.key.rawValue)")
                 } catch {
-                    failedFields.append(change.key.displayName)
+                    failedFields.append(localized(change.key.displayName))
                     failedChanges[change.key] = change.value
                     let message = compactErrorText(error)
                     failedMessages[change.key] = message
@@ -1371,7 +1386,7 @@ struct ChessWalletView: View {
             try validateKNSFieldValue(value, key: key, assetId: assetId)
             await MainActor.run {
                 isSavingKNSProfile = true
-                knsSaveProgressText = localizedFormat("Retrying %@...", key.displayName)
+                knsSaveProgressText = localizedFormat("Retrying %@...", localized(key.displayName))
             }
 
             _ = try await KNSProfileWriteService.shared.submitAddProfile(
@@ -1393,7 +1408,7 @@ struct ChessWalletView: View {
                 knsSaveProgressText = nil
                 failedKNSUpdates.removeValue(forKey: key)
                 Haptics.success()
-                showToast(localizedFormat("%@ updated.", key.displayName))
+                showToast(localizedFormat("%@ updated.", localized(key.displayName)))
             }
             logKNSWrite("RETRY_OK key=\(key.rawValue)")
         } catch {
@@ -1430,17 +1445,17 @@ struct ChessWalletView: View {
         }
 
         if trimmed.count > maxLength {
-            throw KasiaError.apiError("\(key.displayName) is too long (\(trimmed.count)/\(maxLength))")
+            throw KasiaError.apiError(localizedFormat("%@ is too long (%d/%d)", localized(key.displayName), trimmed.count, maxLength))
         }
 
         switch key {
         case .contactEmail:
             if !trimmed.isEmpty && !isLikelyValidEmail(trimmed) {
-                throw KasiaError.apiError("Invalid email address format")
+                throw KasiaError.apiError(localized("Invalid email address format"))
             }
         case .discord:
             if !trimmed.isEmpty && KNSProfileLinkBuilder.discordURL(from: trimmed) == nil {
-                throw KasiaError.apiError("Discord must be a numeric user id or a valid /users/<id> URL")
+                throw KasiaError.apiError(localized("Discord must be a numeric user id or a valid /users/<id> URL"))
             }
         default:
             break
@@ -1453,7 +1468,7 @@ struct ChessWalletView: View {
         )
         let payloadJSON = try JSONEncoder().encode(payload)
         if payloadJSON.count > 520 {
-            throw KasiaError.apiError("\(key.displayName) is too long for KNS inscription payload")
+            throw KasiaError.apiError(localizedFormat("%@ is too long for KNS inscription payload", localized(key.displayName)))
         }
     }
 
@@ -1693,9 +1708,9 @@ private struct KNSProfileEditorSheet: View {
     }
 
     private var displayName: String {
-        guard let raw = liveProfileInfo.domainName else { return "KNS Profile" }
+        guard let raw = liveProfileInfo.domainName else { return AppLocalization.string("KNS Profile") }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? "KNS Profile" : trimmed
+        return trimmed.isEmpty ? AppLocalization.string("KNS Profile") : trimmed
     }
 
     var body: some View {
@@ -1878,11 +1893,16 @@ private struct KNSProfileEditorSheet: View {
                             Text("Confirm Changes")
                                 .font(.headline)
                                 .fontWeight(.bold)
-                            Text("\(pendingChanges.count) change\(pendingChanges.count == 1 ? "" : "s"). Each is submitted as its own on-chain transaction from your chatting address:")
+                            // Singular and plural are separate keys (no .stringsdict).
+                            Text(verbatim: String(format: AppLocalization.string(pendingChanges.count == 1
+                                    ? "%d change. Each is submitted as its own on-chain transaction from your chatting address:"
+                                    : "%d changes. Each is submitted as its own on-chain transaction from your chatting address:"),
+                                                  locale: AppLocalization.locale, pendingChanges.count))
                                 .font(.subheadline)
                             VStack(alignment: .leading, spacing: 4) {
                                 ForEach(pendingChanges, id: \.self) { change in
-                                    Text("• \(change)")
+                                    // `change` is a key ("Avatar", "Bio").
+                                    Text(verbatim: "• " + AppLocalization.string(change))
                                         .font(.subheadline)
                                         .foregroundColor(.secondary)
                                 }
@@ -1985,12 +2005,12 @@ private struct KNSProfileEditorSheet: View {
 
         do {
             guard let rawData = try await item.loadTransferable(type: Data.self) else {
-                throw KasiaError.apiError(String(localized: "Could not load selected image"))
+                throw KasiaError.apiError(AppLocalization.string("Could not load selected image"))
             }
 
             let prepared = try prepareImageForUpload(rawData)
             guard !prepared.data.isEmpty else {
-                throw KasiaError.apiError(String(localized: "Could not encode selected image"))
+                throw KasiaError.apiError(AppLocalization.string("Could not encode selected image"))
             }
             await MainActor.run {
                 switch kind {
@@ -2006,7 +2026,7 @@ private struct KNSProfileEditorSheet: View {
             }
         } catch {
             await MainActor.run {
-                imageLoadError = UserFacingError.message(for: error)
+                imageLoadError = AppLocalization.string(UserFacingError.message(for: error))
                 Haptics.impact(.medium)
             }
         }
@@ -2024,7 +2044,7 @@ private struct KNSProfileEditorSheet: View {
     private func prepareImageForUpload(_ rawData: Data) throws -> (image: UIImage, data: Data, mimeType: String) {
         let maxDimension: CGFloat = 1400
         guard let source = CGImageSourceCreateWithData(rawData as CFData, nil) else {
-            throw KasiaError.apiError(String(localized: "Selected data is not a valid image"))
+            throw KasiaError.apiError(AppLocalization.string("Selected data is not a valid image"))
         }
 
         let thumbnailOptions: [CFString: Any] = [
@@ -2038,7 +2058,7 @@ private struct KNSProfileEditorSheet: View {
             0,
             thumbnailOptions as CFDictionary
         ) else {
-            throw KasiaError.apiError(String(localized: "Could not process selected image"))
+            throw KasiaError.apiError(AppLocalization.string("Could not process selected image"))
         }
 
         let previewImage = UIImage(cgImage: cgImage)
@@ -2049,12 +2069,12 @@ private struct KNSProfileEditorSheet: View {
             1,
             nil
         ) else {
-            throw KasiaError.apiError(String(localized: "Could not initialize image encoder"))
+            throw KasiaError.apiError(AppLocalization.string("Could not initialize image encoder"))
         }
 
         CGImageDestinationAddImage(destination, cgImage, nil)
         guard CGImageDestinationFinalize(destination) else {
-            throw KasiaError.apiError(String(localized: "Could not encode selected image"))
+            throw KasiaError.apiError(AppLocalization.string("Could not encode selected image"))
         }
 
         return (previewImage, outputData as Data, "image/png")
@@ -2296,7 +2316,7 @@ private struct KNSDomainsListView: View {
                     ForEach(names) { owned in
                         DomainNameCardView(
                             title: owned.display,
-                            badge: owned.isProvisional ? String(localized: "Settling") : nil
+                            badge: owned.isProvisional ? AppLocalization.string("Settling") : nil
                         )
                     }
                 }
@@ -2672,7 +2692,7 @@ struct KNSDomainSendView: View {
                 Section {
                     Picker("Fee", selection: $feeTier) {
                         ForEach(WithdrawFeeTier.allCases) { tier in
-                            Text(tier.rawValue).tag(tier)
+                            Text(LocalizedStringKey(tier.rawValue)).tag(tier)
                         }
                     }
                     .pickerStyle(.segmented)
@@ -2778,6 +2798,13 @@ struct KNSDomainSendView: View {
 
     private func handleInputChange(_ input: String) {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        // An upper-case address (a compact QR code's "KASPA:QR...") goes into the field in lower
+        // case; that change comes back here through the field's onChange. As in KaPay.
+        let lowered = lowercasedKaspaAddress(trimmed)
+        if lowered != trimmed {
+            addressInput = lowered
+            return
+        }
 
         resolvedAddress = nil
         resolvedDomain = nil
@@ -2791,7 +2818,7 @@ struct KNSDomainSendView: View {
             return
         }
 
-        if trimmed.hasPrefix("kaspa:") || trimmed.hasPrefix("kaspatest:") {
+        if trimmed.lowercased().hasPrefix("kaspa:") || trimmed.lowercased().hasPrefix("kaspatest:") {
             isValidAddress = KaspaAddress.isValidOnActiveNetwork(trimmed)
             return
         }
@@ -2853,6 +2880,7 @@ struct KNSDomainSendView: View {
             if let queryIndex = address.firstIndex(of: "?") {
                 address = String(address[..<queryIndex])
             }
+            address = lowercasedKaspaAddress(address)
         }
         addressInput = address
         handleInputChange(address)
@@ -2895,7 +2923,7 @@ struct KNSDomainSendView: View {
                 await MainActor.run {
                     isSubmitting = false
                     transferStage = nil
-                    errorMessage = UserFacingError.message(for: error)
+                    errorMessage = AppLocalization.string(UserFacingError.message(for: error))
                     Haptics.impact(.medium)
                 }
             }
@@ -3155,7 +3183,7 @@ struct ChattingAddressManageView: View {
             // Settings' "Biometrics for Address Private Keys", which this key is one of (KaPlay's
             // choice; KaPay asks with the seed phrase's switch)
             if settingsViewModel.settings.biometricSpendingKeyEnabled {
-                DeviceAuth.authenticate(reason: "Unlock to view this address's private key") {
+                DeviceAuth.authenticate(reason: AppLocalization.string("Unlock to view this address's private key")) {
                     showPrivateKeySheet = true
                 }
             } else {
@@ -3312,7 +3340,7 @@ struct ChattingAddressManageView: View {
             utxoLoadError = nil
         } catch {
             // The list keeps what it had; an outage is not an empty address.
-            utxoLoadError = UserFacingError.message(for: error)
+            utxoLoadError = AppLocalization.string(UserFacingError.message(for: error))
         }
         isLoadingUtxos = false
     }
@@ -3402,7 +3430,7 @@ private struct ChattingAddressPrivateKeyView: View {
     @State private var toastToken = UUID()
 
     private var privateKeyHex: String {
-        WalletManager.shared.getPrivateKey()?.hexString ?? "Unavailable"
+        WalletManager.shared.getPrivateKey()?.hexString ?? AppLocalization.string("Unavailable")
     }
 
     var body: some View {
@@ -3674,7 +3702,7 @@ struct ChattingAddressQRView: View {
                     VStack(spacing: 0) {
                         Text("Receive")
                             .font(.headline)
-                        Text(balanceSompi.map { "\(formatKaspaExact($0)) \(KaspaUnit.symbol)" } ?? "—")
+                        Text(verbatim: balanceSompi.map { "\(formatKaspaExact($0)) \(KaspaUnit.symbol)" } ?? "—")
                             .font(.caption)
                             .fontWeight(.bold)
                             .monospacedDigit()
@@ -3683,6 +3711,11 @@ struct ChattingAddressQRView: View {
                 }
             }
             .navigationBarTitleDisplayMode(.inline)
+            // The page is always white, so everything on it reads as light mode: the toast's
+            // material and text, the bar's buttons and the status bar, which in dark mode were
+            // white on white.
+            .environment(\.colorScheme, .light)
+            .preferredColorScheme(.light)
             .onAppear {
                 qrImage = ProfileQRCodeCache.cachedImage(for: address)
                 ProfileQRCodeCache.preload(address: address) { image in
@@ -4037,7 +4070,7 @@ struct WithdrawKaspaView: View {
                     guard !Task.isCancelled else { return }
                     // no fee shown (so no swipe), but the last base stays for the next estimate
                     builtFeeSompi = nil
-                    feeError = UserFacingError.message(for: error)
+                    feeError = AppLocalization.string(UserFacingError.message(for: error))
                 }
                 isEstimatingFee = false
             }
@@ -4383,7 +4416,7 @@ struct WithdrawKaspaView: View {
                     .monospacedDigit()
                     .lineLimit(1)
                     .minimumScaleFactor(0.5)
-                if let price = priceStore.currentPriceUsd, price > 0 {
+                if let price = priceStore.networkPriceUsd, price > 0 {
                     Text(verbatim: formatFiatAmount(Double(amountSompi) / 100_000_000.0 * price,
                                                     currency: priceStore.currentCurrency))
                         .font(.subheadline)
@@ -4417,6 +4450,13 @@ struct WithdrawKaspaView: View {
 
     private func handleInputChange(_ input: String) {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        // An upper-case address (a compact QR code's "KASPA:QR...") goes into the field in lower
+        // case; that change comes back here through the field's onChange. As in KaPay.
+        let lowered = lowercasedKaspaAddress(trimmed)
+        if lowered != trimmed {
+            addressInput = lowered
+            return
+        }
 
         resolvedAddress = nil
         resolvedDomain = nil
@@ -4440,7 +4480,7 @@ struct WithdrawKaspaView: View {
             return
         }
 
-        if trimmed.hasPrefix("kaspa:") || trimmed.hasPrefix("kaspatest:") {
+        if trimmed.lowercased().hasPrefix("kaspa:") || trimmed.lowercased().hasPrefix("kaspatest:") {
             // the other network's address is the same key on another chain: refused
             isValidAddress = KaspaAddress.isValidOnActiveNetwork(trimmed)
             return
@@ -4464,7 +4504,7 @@ struct WithdrawKaspaView: View {
         isValidAddress = KaspaAddress.isValidOnActiveNetwork(request.address)
         // the exact amount is what's sent; the field shows it in whichever unit it is in
         amountInput = request.amountText
-        _ = fiatAmountState.setMaxKas(Double(request.amountSompi) / 100_000_000.0, priceInCurrency: priceStore.currentPriceUsd)
+        _ = fiatAmountState.setMaxKas(Double(request.amountSompi) / 100_000_000.0, priceInCurrency: priceStore.networkPriceUsd)
     }
 
     /// Use one service's answer (the priority one, or a pick from "Other domains").
@@ -4516,6 +4556,7 @@ struct WithdrawKaspaView: View {
             if let queryIndex = address.firstIndex(of: "?") {
                 address = String(address[..<queryIndex])
             }
+            address = lowercasedKaspaAddress(address)
         }
         addressInput = address
         handleInputChange(address)
@@ -4545,14 +4586,14 @@ struct WithdrawKaspaView: View {
                 await MainActor.run {
                     // a newer Max (another speed tapped meanwhile) decides the amount
                     guard maxRequest == request else { return }
-                    amountInput = fiatAmountState.setMaxKas(Double(result.amountSompi) / 100_000_000.0, priceInCurrency: priceStore.currentPriceUsd)
+                    amountInput = fiatAmountState.setMaxKas(Double(result.amountSompi) / 100_000_000.0, priceInCurrency: priceStore.networkPriceUsd)
                     maxCapped = result.cappedAtInputLimit
                     isEstimatingMax = false
                 }
             } catch {
                 await MainActor.run {
                     guard maxRequest == request else { return }
-                    errorMessage = UserFacingError.message(for: error)
+                    errorMessage = AppLocalization.string(UserFacingError.message(for: error))
                     maxCapped = false
                     isEstimatingMax = false
                 }
@@ -4607,7 +4648,7 @@ struct WithdrawKaspaView: View {
             } catch {
                 await MainActor.run {
                     isSending = false
-                    errorMessage = UserFacingError.message(for: error)
+                    errorMessage = AppLocalization.string(UserFacingError.message(for: error))
                     // nothing went out; Try Again goes back to a Review with the fee of today's coins
                     if error is SendFeeChangedError { feeRefresh += 1 }
                 }
@@ -4693,6 +4734,8 @@ struct CoinControlView: View {
     /// mature).
     static func hotWalletReason(chatting: Bool) -> (UTXO, UInt64?) -> LocalizedStringKey? {
         { utxo, virtualDaaScore in
+            // Plain sends never spend a coin bound to a covenant (`unreservedUtxos`).
+            if utxo.covenantId != nil { return "Carries a covenant, not spendable here" }
             if chatting, utxo.isCoinbase { return "Mining reward, not spendable here" }
             if chatting, utxo.blockDaaScore == 0 { return "Not confirmed yet" }
             if !chatting, ChatService.spendableUtxos([utxo], virtualDaaScore: virtualDaaScore).isEmpty {
@@ -4724,7 +4767,7 @@ struct CoinControlView: View {
             utxos = fetched
             loadError = nil
         } catch {
-            loadError = UserFacingError.message(for: error)
+            loadError = AppLocalization.string(UserFacingError.message(for: error))
         }
         isLoading = false
     }

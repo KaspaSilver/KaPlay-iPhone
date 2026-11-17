@@ -41,6 +41,10 @@ struct Bech32 {
 
     /// Decode Kaspa bech32 address
     static func decode(_ address: String) -> (hrp: String, version: UInt8, data: Data)? {
+        // bech32 is read in one case only: "KASPA:QR..." (a compact QR code) is the same address
+        // as "kaspa:qr...", but a mix of both is not an address (BIP-173). Callers that take
+        // typed or scanned text lower-case a single-case address first (`lowercasedKaspaAddress`).
+        guard address == address.lowercased() || address == address.uppercased() else { return nil }
         // Split by ":"
         let parts = address.lowercased().split(separator: ":")
         guard parts.count == 2 else { return nil }
@@ -178,6 +182,20 @@ enum KaspaAddressType: UInt8 {
     }
 }
 
+// MARK: - Typed and scanned addresses
+
+/// A bare `kaspa:` / `kaspatest:` address in upper case ("KASPA:QR…", what a compact QR code
+/// carries) in lower case: bech32 is case-insensitive, but only in one case, so a mixed-case
+/// payload stays as typed and fails the check. Anything else (a name, a link with a query) is
+/// returned as is. As in KaPay.
+func lowercasedKaspaAddress(_ text: String) -> String {
+    let lower = text.lowercased()
+    guard lower.hasPrefix("kaspa:") || lower.hasPrefix("kaspatest:"), !text.contains("?"),
+          let colon = text.firstIndex(of: ":") else { return text }
+    let payload = text[text.index(after: colon)...]
+    return payload == payload.uppercased() || payload == payload.lowercased() ? lower : text
+}
+
 // MARK: - Kaspa Address
 
 struct KaspaAddress {
@@ -194,8 +212,12 @@ struct KaspaAddress {
         return encoded
     }
 
+    /// Known prefixes only, and each type's own payload length (32-byte Schnorr key, 33-byte
+    /// ECDSA key, 32-byte script hash): anything else would build a script no key can spend.
+    /// As in KaPay.
     init?(address: String) {
-        guard let decoded = Bech32.decode(address) else {
+        guard let decoded = Bech32.decode(address),
+              ["kaspa", "kaspatest", "kaspasim", "kaspadev"].contains(decoded.hrp) else {
             return nil
         }
 
@@ -204,9 +226,11 @@ struct KaspaAddress {
 
         // Determine type from version
         switch decoded.version {
-        case 0, 1:
-            self.type = decoded.version == 0 ? .pubKey : .pubKeyECDSA
-        case 8:
+        case 0 where decoded.data.count == 32:
+            self.type = .pubKey
+        case 1 where decoded.data.count == 33:
+            self.type = .pubKeyECDSA
+        case 8 where decoded.data.count == 32:
             self.type = .scriptHash
         default:
             return nil
@@ -287,11 +311,17 @@ struct KaspaAddress {
     }
 
     /// Generate the script public key for an address
-    /// This creates the locking script that funds are sent to
+    /// This creates the locking script that funds are sent to. nil unless the address parses
+    /// with a known prefix and its type's payload length (`init?(address:)`); never traps.
     static func scriptPublicKey(from address: String) -> Data? {
         guard let kaspaAddr = KaspaAddress(address: address) else {
             return nil
         }
+        // `init?(address:)` already holds the payload to 32 or 33 bytes; a single-byte push is
+        // what every script below starts with, so anything that couldn't be one is refused here
+        // rather than trapping in `UInt8(_:)`.
+        let expected = kaspaAddr.type == .pubKeyECDSA ? 33 : 32
+        guard kaspaAddr.payload.count == expected else { return nil }
 
         var script = Data()
 

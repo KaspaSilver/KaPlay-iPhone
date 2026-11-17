@@ -33,6 +33,9 @@ struct ToastBanner: View {
                 .foregroundColor(style.iconColor)
             // Looked up by hand: `Text` shows a String variable as it is. Verbatim after that, so
             // text that isn't a key (an address, a node's error) can't be read as Markdown.
+            // `message` is either a plain key ("Copied") or text already filled in from a
+            // looked-up format (`addressCopiedToastText`): a toast with a value in it must be
+            // built that way, since a finished "Address kaspa:qz… copied" is never a key.
             Text(verbatim: AppLocalization.string(message))
                 .font(.subheadline)
                 .foregroundColor(.primary)
@@ -74,8 +77,10 @@ extension String {
     /// App-standard toast text for copying an address: "Address kaspa:qz3x...m2aj...8f2k copied".
     /// Every address-copy confirmation across the app must use this so the wording and the
     /// shortened form cannot drift between screens.
+    /// Already in the in-app language: the format is looked up, then the address filled in
+    /// (`ToastBanner` looks up the finished text, which can't match a key once it holds an address).
     var addressCopiedToastText: String {
-        "Address \(addressToastShortened) copied"
+        String(format: AppLocalization.string("Address %@ copied"), locale: AppLocalization.locale, addressToastShortened)
     }
 
     /// Standard shortened form used inside the copy toast: the "kaspa:"/"kaspatest:" prefix,

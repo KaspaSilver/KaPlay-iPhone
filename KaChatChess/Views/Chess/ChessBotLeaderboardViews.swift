@@ -2,7 +2,7 @@ import SwiftUI
 
 /// A square on the Leaderboard tab, in place of tabs: it opens that board's own page.
 struct ChessLeaderboardSquare: View {
-    let title: String
+    let title: LocalizedStringKey
     let icon: String
     let action: () -> Void
 
@@ -90,7 +90,7 @@ struct ChessBotLeaderboardsView: View {
                 Text(bot.name)
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
-                Text(best.map { "Best: \($0.moves) moves" } ?? "Not beaten yet")
+                Text(verbatim: best.map { ChessText.format("Best: %lld moves", $0.moves) } ?? ChessText.string("Not beaten yet"))
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -107,8 +107,9 @@ struct ChessBotLeaderboardView: View {
     @ObservedObject private var knsService = KNSService.shared
     @EnvironmentObject private var walletManager: WalletManager
     @State private var period: ChessLeaderboardPeriod = .month
-    /// The player whose row was tapped, for their card (`ChessPlayerView`).
-    @State private var profileContact: Contact?
+    /// The address whose row was tapped, for their card (`ChessPlayerView`). KaPlay has no
+    /// contacts: nothing is saved for it.
+    @State private var profileAddress: String?
 
     private var rows: [ChessBotBoardRow] { service.rows(for: bot, period: period) }
 
@@ -139,8 +140,7 @@ struct ChessBotLeaderboardView: View {
                 }
                 ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
                     Button {
-                        let contacts = ContactsManager.shared
-                        profileContact = contacts.getContact(byAddress: row.address) ?? contacts.getOrCreateContact(address: row.address)
+                        profileAddress = row.address
                     } label: {
                         rowLabel(row, rank: index + 1)
                     }
@@ -162,12 +162,12 @@ struct ChessBotLeaderboardView: View {
             ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
         }
         .sheet(isPresented: Binding(
-            get: { profileContact != nil },
-            set: { if !$0 { profileContact = nil } }
+            get: { profileAddress != nil },
+            set: { if !$0 { profileAddress = nil } }
         )) {
-            if let contact = profileContact {
+            if let address = profileAddress {
                 NavigationStack {
-                    ChessPlayerView(address: contact.address)
+                    ChessPlayerView(address: address)
                 }
             }
         }
@@ -176,7 +176,7 @@ struct ChessBotLeaderboardView: View {
     private func rowLabel(_ row: ChessBotBoardRow, rank: Int) -> some View {
         let isMe = row.address == walletManager.currentWallet?.publicAddress
         return HStack(spacing: 12) {
-            Text("\(rank)")
+            Text(verbatim: "\(rank)")
                 .font(.subheadline.monospacedDigit().weight(.semibold))
                 .foregroundColor(.secondary)
                 .frame(width: 28, alignment: .trailing)

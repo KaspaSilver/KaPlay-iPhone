@@ -199,7 +199,7 @@ struct NFCCardBackupView: View {
         busy = true
         defer { busy = false }
         do {
-            let status = try await NFCCard.run(success: "Card found.") { connection in
+            let status = try await NFCCard.run(success: AppLocalization.string("Card found.")) { connection in
                 try await connection.select()
             }
             guard !status.pinBlocked else { throw NFCCardError.pinBlocked }
@@ -247,8 +247,8 @@ struct NFCCardBackupView: View {
             }.value
             guard backup.count <= card.maxBackup else { throw NFCCardError.backupTooLarge }
 
-            try await NFCCard.run(success: "Backup saved.") { connection in
-                connection.setMessage("Saving. Keep the card still.")
+            try await NFCCard.run(success: AppLocalization.string("Backup saved.")) { connection in
+                connection.setMessage(AppLocalization.string("Saving. Keep the card still."))
                 let current = try await connection.select()
                 if current.pinBlocked { throw NFCCardError.pinBlocked }
                 // The confirmations were for the card scanned first. An interrupted save can
@@ -317,7 +317,7 @@ struct NFCCardBackupView: View {
         defer { busy = false }
         let enteredPIN = pin
         do {
-            pinCleared = try await NFCCard.run(success: "Backup erased.") { connection in
+            pinCleared = try await NFCCard.run(success: AppLocalization.string("Backup erased.")) { connection in
                 let current = try await connection.select()
                 if current.pinBlocked { throw NFCCardError.pinBlocked }
                 if !current.pinSet { throw NFCCardError.noPIN }
@@ -345,19 +345,22 @@ struct NFCCardSecretField: View {
     let isNumeric: Bool
 
     var body: some View {
-        TextField(title, text: $text)
-            .keyboardType(isNumeric ? .numberPad : .default)
-            .textContentType(nil)
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled()
-            .onChange(of: text) { value in
-                guard isNumeric else { return }
-                let digits = String(value.filter { $0.isASCII && $0.isNumber }.prefix(NFCCard.pinLength))
-                if digits != value { text = digits }
-            }
-            .padding()
-            .background(Color(.systemGray6))
-            .clipShape(RoundedRectangle(cornerRadius: 12))
+        // blurred while the screen is recorded or mirrored, like the words themselves (as in KaPay)
+        SecureView {
+            TextField(title, text: $text)
+                .keyboardType(isNumeric ? .numberPad : .default)
+                .textContentType(nil)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .onChange(of: text) { value in
+                    guard isNumeric else { return }
+                    let digits = String(value.filter { $0.isASCII && $0.isNumber }.prefix(NFCCard.pinLength))
+                    if digits != value { text = digits }
+                }
+                .padding()
+                .background(Color(.systemGray6))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+        }
     }
 }
 

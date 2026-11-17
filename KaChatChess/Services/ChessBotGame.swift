@@ -28,6 +28,9 @@ final class ChessBotGame: ObservableObject {
     let bot: ChessBot
     let playerColor: ChessColor
     let id = UUID().uuidString.lowercased()
+    /// The account playing, from the moment the game was set up: the result is filed under it
+    /// and the stamp signed by it, never by an account signed in later.
+    let playerAddress: String?
 
     @Published private(set) var board = ChessEngine.initialBoard()
     @Published private(set) var moves: [PlayedMove] = []
@@ -42,6 +45,13 @@ final class ChessBotGame: ObservableObject {
     init(bot: ChessBot, playerColor: ChessColor) {
         self.bot = bot
         self.playerColor = playerColor
+        self.playerAddress = WalletManager.shared.currentWallet?.publicAddress
+    }
+
+    /// The account that played is still the one signed in.
+    private var isPlayerSignedIn: Bool {
+        guard let playerAddress else { return false }
+        return WalletManager.shared.currentWallet?.publicAddress == playerAddress
     }
 
     var botColor: ChessColor { playerColor.opposite }
@@ -111,7 +121,7 @@ final class ChessBotGame: ObservableObject {
     private func finish(_ result: ChessBotProgress.Result) {
         guard self.result == nil else { return }
         self.result = result
-        ChessBotProgress.shared.add(result, against: bot)
+        if let playerAddress { ChessBotProgress.shared.add(result, against: bot, address: playerAddress) }
         sendStamp()
     }
 
@@ -156,13 +166,17 @@ final class ChessBotGame: ObservableObject {
         case .none, .failed: break
         case .sending, .stamped, .unconfirmed: return
         }
+        guard let playerAddress, isPlayerSignedIn else {
+            stamp = .failed(AppLocalization.string(Self.accountChangedMessage))
+            return
+        }
         stamp = .sending
         let message = ChessBotCodec.result(
             id: id, bot: bot, playerColor: playerColor, result: result, moves: moves.map(\.move)
         )
         Task {
             let txId: String
-            switch await send(message) {
+            switch await send(message, from: playerAddress) {
             case .sent(let id):
                 txId = id
             case .failed(let error):
@@ -179,8 +193,10 @@ final class ChessBotGame: ObservableObject {
                 return
             }
             stamp = .stamped
+            // Filed under the account that played, whoever is signed in by now (the check above
+            // can take over a minute).
             if case .won = result {
-                ChessBotProgress.shared.addStampedWin(moves: playerMoveCount, against: bot)
+                ChessBotProgress.shared.addStampedWin(moves: playerMoveCount, against: bot, address: playerAddress)
             }
         }
     }
@@ -209,22 +225,31 @@ final class ChessBotGame: ObservableObject {
         case unknown
     }
 
-    private func send(_ message: ChessBotMessage) async -> SendResult {
+    /// Signed by `sender` only: checked before every attempt, after every wait, and by
+    /// `sendPublicChat` itself (`expectedSender`) when the send's turn comes.
+    private func send(_ message: ChessBotMessage, from sender: String) async -> SendResult {
         let content = ChessBotCodec.encode(message)
         var attempt = 0
         while true {
+            guard WalletManager.shared.currentWallet?.publicAddress == sender else {
+                return .failed(AppLocalization.string(Self.accountChangedMessage))
+            }
             do {
                 let txId = try await PublicChatService.shared.sendPublicChat(
-                    channel: ChessBotCodec.channel, content: content, deferNoInputRetry: false
+                    channel: ChessBotCodec.channel, content: content, deferNoInputRetry: false,
+                    expectedSender: sender
                 )
                 if let txId { return .sent(txId) }
-                return .failed("The result was not sent.")
+                return .failed(AppLocalization.string("The result was not sent."))
             } catch {
                 if error is SendOutcomeUnknownError {
                     AppLog.log("[Chess] Bot game stamp outcome unknown")
                     return .unknown
                 }
                 attempt += 1
+                guard WalletManager.shared.currentWallet?.publicAddress == sender else {
+                    return .failed(AppLocalization.string(Self.accountChangedMessage))
+                }
                 if attempt > 5 || !PublicChatService.isRetryableSendError(error) {
                     AppLog.log("[Chess] Bot game stamp failed: %@", error.localizedDescription)
                     return .failed(PublicChatService.friendlySendErrorMessage(for: error))
@@ -233,4 +258,6 @@ final class ChessBotGame: ObservableObject {
             }
         }
     }
+
+    private static let accountChangedMessage = "This game was played on another account. Sign in to it to stamp the result."
 }

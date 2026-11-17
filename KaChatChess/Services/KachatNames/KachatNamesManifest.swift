@@ -82,15 +82,17 @@ extension KachatNames {
         /// The most periods `extend` can add now: a name (from `periodStart`) holds at most
         /// `maxYears` periods (ops.rs `extendable_years`).
         func extendableYears(periodStart: Int64, expiresAt: Int64) -> Int64 {
-            let room = periodStart + maxYears * periodMs - expiresAt
-            return room < 0 ? 0 : min(room / periodMs, maxYears)
+            // overflow-safe: the times can come from a server
+            let (end, o1) = periodStart.addingReportingOverflow(maxYears * periodMs)
+            let (room, o2) = end.subtractingReportingOverflow(expiresAt)
+            return o1 || o2 || room < 0 ? 0 : min(room / periodMs, maxYears)
         }
 
         func extendableYears(_ f: NameFields) -> Int64 { extendableYears(periodStart: f.periodStart, expiresAt: f.expiresAt) }
 
         /// When `renew` becomes valid: `expiresAt - renewWindowMs` (unix ms). The transaction is
         /// final once the network's past median time passes its lock time, which is at least this.
-        func renewOpens(expiresAt: Int64) -> Int64 { expiresAt - renewWindowMs }
+        func renewOpens(expiresAt: Int64) -> Int64 { KachatNames.clampedSum(expiresAt, -renewWindowMs) }
 
         /// How close to expiry a name counts as "expires soon" (a buyer would have to renew it):
         /// 30 days on a yearly clock, the renewal window on a short one (testnet's 2 hours),
@@ -241,6 +243,12 @@ extension KachatNames {
             return n.uint64Value
         }
 
+        /// `u64` that fits an Int64 (times and counts): a served manifest's number never traps.
+        private static func i64(_ v: Any?, _ what: String) throws -> Int64 {
+            guard let n = Int64(exactly: try u64(v, what)) else { throw Failure("manifest: \(what) out of range") }
+            return n
+        }
+
         private static func tiers(_ v: Any?, _ what: String) throws -> [UInt64] {
             guard let o = v as? [String: Any] else { throw Failure("manifest: \(what) missing") }
             return try ["len1", "len2", "len3", "len4", "len5plus"].map { try u64(o[$0], "\(what).\($0)") }
@@ -297,7 +305,7 @@ extension KachatNames {
                 let mig = Migration(
                     predecessorRegistryId: try unhex32(try Self.str(mj["predecessorRegistryId"], "migration.predecessorRegistryId")),
                     root: try unhex32(try Self.str(mj["root"], "migration.root")),
-                    deadlineMs: Int64(try Self.u64(mj["deadlineMs"], "migration.deadlineMs")),
+                    deadlineMs: try Self.i64(mj["deadlineMs"], "migration.deadlineMs"),
                     sponsor: try unhex32(try Self.str(mj["sponsor"], "migration.sponsor"))
                 )
                 // root 0 and deadline 0: a v5 registry with no predecessor (register works as on v4)
@@ -307,10 +315,10 @@ extension KachatNames {
                 bond: try Self.u64(p["bond"], "bond"),
                 gapValue: try Self.u64(p["gapValue"], "gapValue"),
                 tCommit: try Self.u64(p["tCommit"], "tCommit"),
-                maxYears: Int64(try Self.u64(p["maxYears"], "maxYears")),
-                periodMs: Int64(try Self.u64(p["periodMs"], "periodMs")),
-                graceMs: Int64(try Self.u64(p["graceMs"], "graceMs")),
-                renewWindowMs: Int64(try Self.u64(p["renewWindowMs"], "renewWindowMs")),
+                maxYears: try Self.i64(p["maxYears"], "maxYears"),
+                periodMs: try Self.i64(p["periodMs"], "periodMs"),
+                graceMs: try Self.i64(p["graceMs"], "graceMs"),
+                renewWindowMs: try Self.i64(p["renewWindowMs"], "renewWindowMs"),
                 registerPrices: try Self.tiers((p["prices"] as? [String: Any])?["register"], "prices.register"),
                 renewPrices: try Self.tiers((p["prices"] as? [String: Any])?["renew"], "prices.renew"),
                 offerMaxFee: try Self.u64(p["offerMaxFee"], "offerMaxFee"),
@@ -329,9 +337,12 @@ extension KachatNames {
             }
             let o = outs[0]
             guard (o["index"] as? NSNumber)?.intValue == 0 else { throw Failure("manifest: the genesis gap is not output 0") }
+            guard let spkVersion = UInt16(exactly: try Self.u64(o["scriptPublicKeyVersion"], "genesis spk version")) else {
+                throw Failure("manifest: genesis spk version out of range")
+            }
             genesisOutput = TxOutput(
                 value: try Self.u64(o["value"], "genesis value"),
-                scriptVersion: UInt16(try Self.u64(o["scriptPublicKeyVersion"], "genesis spk version")),
+                scriptVersion: spkVersion,
                 script: try unhex(try Self.str(o["scriptPublicKey"], "genesis spk")),
                 covenant: nil
             )
@@ -387,7 +398,9 @@ extension KachatNames {
                   (params.registerPrices + params.renewPrices).allSatisfy({ $0 <= priceCap }),
                   params.maxYears >= 1, params.maxYears <= 31,
                   params.periodMs >= 60_000, params.periodMs <= yearMs, params.maxYears * params.periodMs < 1_000_000_000_000,
-                  params.renewWindowMs > 0, params.renewWindowMs <= params.periodMs else {
+                  params.renewWindowMs > 0, params.renewWindowMs <= params.periodMs,
+                  // the screens add grace to expiry times: a grace past any real one could overflow them
+                  params.graceMs >= 0, params.graceMs <= 1_000_000_000_000 else {
                 throw Failure("manifest: params out of range")
             }
             guard params.registerPrices == Self.pinnedRegisterPrices[network], params.renewPrices == Self.pinnedRenewPrices[network] else {

@@ -96,7 +96,9 @@ struct OnboardingView: View {
             )) {
                 if let account = pendingRemovalAccount {
                     DeleteAccountSheet(
-                        confirmSubtitle: "Deletes \(account.displayAlias) (\(account.shortPublicAddress)) and its local data from this device.",
+                        confirmSubtitle: String(format: AppLocalization.string("Deletes %@ (%@) and its local data from this device."),
+                                                 locale: AppLocalization.locale,
+                                                 account.displayAlias, account.shortPublicAddress),
                         notBackedUp: AccountBackupStatus.shared.isPending(account.publicAddress)
                     ) {
                         DeviceAuth.authenticate(reason: AppLocalization.string("Confirm deleting this account")) {
@@ -153,7 +155,7 @@ struct OnboardingView: View {
             ) {
                 Button("OK", role: .cancel) {}
             } message: {
-                Text(signInErrorMessage ?? walletManager.signInFailureMessage ?? "Unable to sign in to this account.")
+                Text(verbatim: signInErrorMessage ?? walletManager.signInFailureMessage ?? AppLocalization.string("Unable to sign in to this account."))
             }
             .alert(
                 "Couldn't Create Account",
@@ -339,12 +341,11 @@ struct OnboardingView: View {
                 afterAccountActions = { pendingRemovalAccount = account }
                 accountActionsTarget = nil
             }
-
-            Spacer(minLength: 0)
         }
         .padding(.horizontal, 20)
         .padding(.bottom, 20)
-        .presentationDetents([.height(280)])
+        // Measured, not a fixed 280: larger text or a longer language pushed Delete off the bottom.
+        .fittedSheetDetent(estimate: 280)
         .presentationDragIndicator(.visible)
     }
 
@@ -400,10 +401,11 @@ struct OnboardingView: View {
         signInErrorMessage = nil
 
         if settingsViewModel.settings.biometricAccountLoginEnabled {
-            DeviceAuth.authenticate(reason: "Unlock to sign in to \(account.displayAlias)") {
+            DeviceAuth.authenticate(reason: String(format: AppLocalization.string("Unlock to sign in to %@"),
+                                                   locale: AppLocalization.locale, account.displayAlias)) {
                 performSignIn(account)
             } onFailure: {
-                signInErrorMessage = "Authentication failed."
+                signInErrorMessage = AppLocalization.string("Authentication failed.")
             }
         } else {
             performSignIn(account)

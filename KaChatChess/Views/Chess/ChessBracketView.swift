@@ -28,7 +28,7 @@ struct ChessBracketView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 0) {
-                    ForEach(Array(["Quarterfinals", "Semifinals", "Final", "Champion"].enumerated()), id: \.offset) { index, title in
+                    ForEach(Array(([ "Quarterfinals", "Semifinals", "Final", "Champion"] as [LocalizedStringKey]).enumerated()), id: \.offset) { index, title in
                         Text(title)
                             .font(.caption.weight(.bold))
                             .foregroundColor(.secondary)
@@ -41,14 +41,14 @@ struct ChessBracketView: View {
                 ZStack(alignment: .topLeading) {
                     connectors
                     ForEach(0..<4, id: \.self) { index in
-                        matchCard(gameId: "1-\(index)", placeholder: ("Seed \(seedPair(index).0)", "Seed \(seedPair(index).1)"))
+                        matchCard(gameId: "1-\(index)", placeholder: (ChessText.format("Seed %lld", seedPair(index).0), ChessText.format("Seed %lld", seedPair(index).1)))
                             .offset(x: columnX[0], y: round1Y[index])
                     }
                     ForEach(0..<2, id: \.self) { index in
-                        matchCard(gameId: "2-\(index)", placeholder: ("Winner of QF\(index * 2 + 1)", "Winner of QF\(index * 2 + 2)"))
+                        matchCard(gameId: "2-\(index)", placeholder: (ChessText.format("Winner of QF%lld", index * 2 + 1), ChessText.format("Winner of QF%lld", index * 2 + 2)))
                             .offset(x: columnX[1], y: semiY[index])
                     }
-                    matchCard(gameId: "3-0", placeholder: ("Winner of SF1", "Winner of SF2"))
+                    matchCard(gameId: "3-0", placeholder: (ChessText.format("Winner of SF%lld", 1), ChessText.format("Winner of SF%lld", 2)))
                         .offset(x: columnX[2], y: finalY)
                     championCard
                         .offset(x: columnX[3], y: finalY)
@@ -149,7 +149,7 @@ struct ChessBracketView: View {
             Circle()
                 .strokeBorder(Color.secondary.opacity(0.4), style: StrokeStyle(lineWidth: 1, dash: [3]))
                 .frame(width: 20, height: 20)
-            Text(text)
+            Text(verbatim: text)
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .lineLimit(1)
@@ -164,7 +164,7 @@ struct ChessBracketView: View {
         if !game.isOver {
             HStack(spacing: 4) {
                 Circle().fill(Color.red).frame(width: 5, height: 5)
-                Text("LIVE " + clockText(game.remainingMs(game.sideToMove, at: now)))
+                Text(verbatim: ChessText.format("LIVE %@", ChessText.clock(game.remainingMs(game.sideToMove, at: now))))
                     .font(.scaled(size: 9, weight: .bold).monospacedDigit())
             }
             .foregroundColor(.white)
@@ -207,10 +207,5 @@ struct ChessBracketView: View {
         .frame(width: Self.cardWidth, height: Self.cardHeight)
         .background(RoundedRectangle(cornerRadius: 12).fill(Color.yellow.opacity(champion == nil ? 0.06 : 0.14)))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.yellow.opacity(0.5), lineWidth: 1))
-    }
-
-    private func clockText(_ ms: Int64) -> String {
-        let seconds = Int(ms / 1000)
-        return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 }

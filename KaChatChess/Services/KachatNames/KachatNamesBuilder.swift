@@ -514,14 +514,14 @@ extension KachatNames {
 
             let nameLength = name.utf8.count
             let price = params.registerCost(forLength: nameLength, years: years)
-            let expires = now + years * params.periodMs
+            let expires = KachatNames.clampedSum(now, KachatNames.clampedProduct(years, params.periodMs))
             let fields = NameFields(name: name, owner: env.me, price: 0, periodStart: now, expiresAt: expires)
             var notes: [String] = []
-            let matureAt = commitUtxo.entry.blockDaaScore + params.tCommit
+            let matureAt = KachatNames.clampedSum(commitUtxo.entry.blockDaaScore, params.tCommit)
             if env.blockDaa < matureAt {
                 notes.append("commit not mature yet: valid from DAA \(matureAt) (now \(env.blockDaa))")
             }
-            if expires + params.graceMs < env.wallMs {
+            if KachatNames.clampedSum(expires, params.graceMs) < env.wallMs {
                 notes.append("backdated: this name is already past expiresAt + grace (reclaimable at once)")
             } else if expires < env.wallMs {
                 notes.append("backdated: this name is already expired (in grace)")
@@ -698,7 +698,7 @@ extension KachatNames {
                     PlannedOutput(output: TxOutput(value: UInt64(n.fields.price), script: Codec.p2pkScript(n.fields.owner)), label: "payout to the seller")
                 ]
             )
-            if n.fields.expiresAt - params.expiresSoonMs < env.wallMs {
+            if KachatNames.clampedSum(n.fields.expiresAt, -params.expiresSoonMs) < env.wallMs {
                 d.notes.append("expires soon: the buyer will have to renew it")
             }
             d.payload = Codec.namePayload(op: "buy", name: n.name)
@@ -827,7 +827,7 @@ extension KachatNames {
         /// the last owner, the caller's bounty]; lock time = expiresAt + grace (unix ms).
         func reclaim(env: Env, parts x: ExitParts) throws -> Plan {
             try exitChecks(x)
-            let unlock = x.name.fields.expiresAt + params.graceMs
+            let unlock = KachatNames.clampedSum(x.name.fields.expiresAt, params.graceMs)
             guard unlock > 0, UInt64(unlock) >= lockTimeThreshold else { throw Failure("expiresAt + grace is not a timestamp") }
             var d = Draft(
                 op: "reclaim \(x.name.name)",

@@ -19,7 +19,9 @@ enum NFCCard {
     }
 
     static let pinLength = 6
-    static let tapPrompt = "Hold your card flat against the top back of your iPhone."
+    static var tapPrompt: String {
+        AppLocalization.string("Hold your card flat against the top back of your iPhone.")
+    }
 
     static func isValidPIN(_ pin: String) -> Bool {
         pin.count == pinLength && pin.allSatisfy { $0.isASCII && $0.isNumber }
@@ -63,39 +65,39 @@ enum NFCCardError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .cancelled:
-            return "The scan was cancelled."
+            return AppLocalization.string("The scan was cancelled.")
         case .timedOut:
-            return "No card was found in time. Try again, and keep the card flat against the top back of your iPhone."
+            return AppLocalization.string("No card was found in time. Try again, and keep the card flat against the top back of your iPhone.")
         case .cardRemoved:
-            return "The card moved away too soon. Hold it still and try again. If a save was interrupted, your previous backup on the card is still there."
+            return AppLocalization.string("The card moved away too soon. Hold it still and try again. If a save was interrupted, your previous backup on the card is still there.")
         case .notLoaded:
-            return "This card doesn't have the KaChat-NFC software yet. Load it from the NFC Card page in Kaspa Quick Start."
+            return AppLocalization.string("This card doesn't have the KaChat-NFC software yet. Load it from the NFC Card page in Kaspa Quick Start.")
         case .wrongPIN(let triesRemaining):
             return triesRemaining == 1
-                ? "Wrong PIN. 1 try left before this card's PIN is blocked for good."
-                : "Wrong PIN. \(triesRemaining) tries left."
+                ? AppLocalization.string("Wrong PIN. 1 try left before this card's PIN is blocked for good.")
+                : String(format: AppLocalization.string("Wrong PIN. %lld tries left."), triesRemaining)
         case .pinBlocked:
-            return "This card's PIN is blocked after too many wrong tries, so any backup on it can no longer be read. Use your 12 or 24 words instead."
+            return AppLocalization.string("This card's PIN is blocked after too many wrong tries, so any backup on it can no longer be read. Use your 12 or 24 words instead.")
         case .noBackup:
-            return "There's no backup on this card."
+            return AppLocalization.string("There's no backup on this card.")
         case .noPIN:
-            return "This card has no PIN yet, so it has no backup on it."
+            return AppLocalization.string("This card has no PIN yet, so it has no backup on it.")
         case .cardChanged:
-            return "This isn't the card you scanned first. Start again with the card you want to use."
+            return AppLocalization.string("This isn't the card you scanned first. Start again with the card you want to use.")
         case .backupTooLarge:
-            return "This account's backup is too large for the card."
+            return AppLocalization.string("This account's backup is too large for the card.")
         case .wrongPassphrase:
-            return "That passphrase doesn't match this backup. It has to be exact, including capitals and spaces."
+            return AppLocalization.string("That passphrase doesn't match this backup. It has to be exact, including capitals and spaces.")
         case .noPassphrase:
-            return "This account has no passphrase, so it can't be backed up to a card."
+            return AppLocalization.string("This account has no passphrase, so it can't be backed up to a card.")
         case .unreadableBackup:
-            return "This backup can't be read. It may have been made by a newer version of KaPlay."
+            return AppLocalization.string("This backup can't be read. It may have been made by a newer version of KaPlay.")
         case .saveNotConfirmed:
-            return "The save couldn't be confirmed, so don't rely on this card. Try again."
+            return AppLocalization.string("The save couldn't be confirmed, so don't rely on this card. Try again.")
         case .seedUnavailable:
-            return "This account's 12 or 24 words couldn't be read on this device."
+            return AppLocalization.string("This account's 12 or 24 words couldn't be read on this device.")
         case .cardFailed(let detail):
-            return "The card reported a problem (\(detail)). Try again."
+            return String(format: AppLocalization.string("The card reported a problem (%@). Try again."), detail)
         }
     }
 }
@@ -285,7 +287,7 @@ private final class NFCCardSessionHost: NSObject, NFCTagReaderSessionDelegate {
 
     func tagReaderSession(_ session: NFCTagReaderSession, didDetect tags: [NFCTag]) {
         guard tags.count == 1, let tag = tags.first else {
-            session.alertMessage = "More than one card was found. Hold just one."
+            session.alertMessage = AppLocalization.string("More than one card was found. Hold just one.")
             session.restartPolling()
             return
         }

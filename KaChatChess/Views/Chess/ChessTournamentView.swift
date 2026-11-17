@@ -30,9 +30,9 @@ struct ChessTournamentView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .fixedScreenTitle(Text(tournament?.name ?? "Tournament"))
+        .fixedScreenTitle(titleText)
         .background(Color(.systemGroupedBackground))
-        .navigationTitle(tournament?.name ?? "Tournament")
+        .navigationTitle(titleText)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) { BalanceToolbarLabel() }
@@ -68,6 +68,10 @@ struct ChessTournamentView: View {
         autoOpenedGameId = game.id
         Haptics.success()
         openGameId = game.id
+    }
+
+    private var titleText: Text {
+        tournament.map { Text(verbatim: $0.displayName) } ?? Text("Tournament")
     }
 
     /// Contact name, then KNS domain, then the shortened address - for the player too.
@@ -128,9 +132,11 @@ struct ChessTournamentView: View {
         switch tournament.status {
         case .open:
             VStack(alignment: .leading, spacing: 8) {
-                Text(tournament.isDuel
-                     ? "Waiting for your opponent. The game starts by itself when they join."
-                     : "Waiting for \(tournament.seatsLeft) more player\(tournament.seatsLeft == 1 ? "" : "s"). It starts by itself when the eighth joins.")
+                Text(verbatim: tournament.isDuel
+                     ? ChessText.string("Waiting for your opponent. The game starts by itself when they join.")
+                     : (tournament.seatsLeft == 1
+                        ? ChessText.string("Waiting for 1 more player. It starts by itself when the eighth joins.")
+                        : ChessText.format("Waiting for %lld more players. It starts by itself when the eighth joins.", tournament.seatsLeft)))
                     .font(.subheadline)
                 if let me, !tournament.isSeated(me, at: service.now) {
                     Button {
@@ -138,7 +144,7 @@ struct ChessTournamentView: View {
                         isJoining = true
                         Task { await service.join(tournament); isJoining = false }
                     } label: {
-                        Text(isJoining ? "Joining…" : service.joinLabel(roomId: tournament.id))
+                        Text(verbatim: isJoining ? ChessText.string("Joining…") : service.joinLabel(roomId: tournament.id))
                             .font(.subheadline.weight(.semibold))
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 10)
@@ -163,7 +169,7 @@ struct ChessTournamentView: View {
                         } label: {
                             Label("Copy", systemImage: "doc.on.doc").font(.caption.weight(.semibold))
                         }
-                        ShareLink(item: "Join my chess tournament in KaPlay: open Play > \(tournament.isDuel ? "1v1" : "Tournaments") > Join with a code, and enter \(tournament.id)") {
+                        ShareLink(item: ChessText.invite(for: tournament)) {
                             Image(systemName: "square.and.arrow.up")
                         }
                     }
@@ -174,7 +180,7 @@ struct ChessTournamentView: View {
             if let me, let game = tournament.currentGame(for: me) {
                 if game.isOver {
                     if game.winner == me {
-                        Text("You won \(roundName(game.round)). Waiting for your next opponent - watch the other game meanwhile.")
+                        Text(verbatim: wonText(round: game.round))
                             .font(.subheadline)
                     } else {
                         Text("You are out of this tournament. Watch the rest of the bracket.")
@@ -184,14 +190,14 @@ struct ChessTournamentView: View {
                     // Cool-down on the bracket before the next round: who it is, and when.
                     HStack(spacing: 12) {
                         VStack(alignment: .leading, spacing: 3) {
-                            Text("Next: \(roundName(game.round)) vs \(name(for: game.address(of: game.color(of: me) == .white ? .black : .white)))")
+                            Text(verbatim: nextText(round: game.round, opponent: name(for: game.address(of: game.color(of: me) == .white ? .black : .white))))
                                 .font(.subheadline.weight(.semibold))
                             Text("Your game starts in")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
                         Spacer()
-                        Text("\(Int((left + 999) / 1000))")
+                        Text(verbatim: "\(Int((left + 999) / 1000))")
                             .font(.scaled(size: 34, weight: .bold, design: .rounded).monospacedDigit())
                             .foregroundColor(.accentColor)
                             .contentTransition(.numericText())
@@ -211,7 +217,7 @@ struct ChessTournamentView: View {
             }
         case .finished:
             if let champion = tournament.champion {
-                Label(tournament.isDuel ? "\(name(for: champion)) won" : "\(name(for: champion)) won the tournament", systemImage: "trophy.fill")
+                Label(tournament.isDuel ? ChessText.format("%@ won", name(for: champion)) : ChessText.format("%@ won the tournament", name(for: champion)), systemImage: "trophy.fill")
                     .font(.subheadline.weight(.semibold))
                     .foregroundColor(.yellow)
             }
@@ -220,9 +226,25 @@ struct ChessTournamentView: View {
         }
     }
 
-    private func roundName(_ round: Int) -> String {
-        guard let tournament, !tournament.isDuel else { return "the game" }
-        return round == 3 ? "the final" : (round == 2 ? "the semifinal" : "round 1")
+    /// A whole sentence per round, so a translation never has to fit "the final" into a gap.
+    private func wonText(round: Int) -> String {
+        guard let tournament, !tournament.isDuel else {
+            return ChessText.string("You won the game. Waiting for your next opponent - watch the other game meanwhile.")
+        }
+        switch round {
+        case 3: return ChessText.string("You won the final. Waiting for your next opponent - watch the other game meanwhile.")
+        case 2: return ChessText.string("You won the semifinal. Waiting for your next opponent - watch the other game meanwhile.")
+        default: return ChessText.string("You won round 1. Waiting for your next opponent - watch the other game meanwhile.")
+        }
+    }
+
+    private func nextText(round: Int, opponent: String) -> String {
+        guard let tournament, !tournament.isDuel else { return ChessText.format("Next: the game vs %@", opponent) }
+        switch round {
+        case 3: return ChessText.format("Next: the final vs %@", opponent)
+        case 2: return ChessText.format("Next: the semifinal vs %@", opponent)
+        default: return ChessText.format("Next: round 1 vs %@", opponent)
+        }
     }
 
     private func playerRow(seed: Int, address: String) -> some View {
@@ -252,11 +274,12 @@ struct ChessTournamentView: View {
                     }
                     .font(.subheadline)
                     .lineLimit(1)
-                    Text(gameStatus(game)).font(.caption).foregroundColor(.secondary)
+                    Text(verbatim: game.isOver ? ChessText.resultSummary(game, now: service.now, name: name(for:)) : ChessText.moveLine(game))
+                        .font(.caption).foregroundColor(.secondary)
                 }
                 Spacer()
                 if !game.isOver {
-                    Text(clockText(game.remainingMs(game.sideToMove, at: service.now)))
+                    Text(verbatim: ChessText.clock(game.remainingMs(game.sideToMove, at: service.now)))
                         .font(.caption.monospacedDigit())
                         .foregroundColor(.secondary)
                 }
@@ -267,21 +290,4 @@ struct ChessTournamentView: View {
         .buttonStyle(.plain)
     }
 
-    private func gameStatus(_ game: ChessTournamentGame) -> String {
-        guard let winner = game.winner, let outcome = game.outcome else {
-            return "Move \(game.moves.count / 2 + 1) · \(game.sideToMove == .white ? "white" : "black") to move"
-        }
-        let who = name(for: winner)
-        switch outcome {
-        case .checkmate: return "\(who) won by checkmate"
-        case .resignation: return "\(who) won by resignation"
-        case .timeout: return "\(who) won on time"
-        case .drawTiebreak(let reason): return "\(who) won on clock after a draw (\(reason))"
-        }
-    }
-
-    private func clockText(_ ms: Int64) -> String {
-        let seconds = Int(ms / 1000)
-        return String(format: "%d:%02d", seconds / 60, seconds % 60)
-    }
 }

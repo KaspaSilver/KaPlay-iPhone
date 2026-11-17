@@ -28,9 +28,11 @@ struct ChessTournamentGameView: View {
     private var game: ChessTournamentGame? { tournament?.games[gameId] }
     private var me: String? { walletManager.currentWallet?.publicAddress }
     private var myColor: ChessColor? { me.flatMap { game?.color(of: $0) } }
-    /// Not once the clock has decided the game: a move after the flag is void on chain.
+    /// Not once the clock has decided the game: a move after the flag is void on chain. The
+    /// player's own clock at zero is enough - `isDecided`'s margin is for the opponent's flag.
     private var isMyTurn: Bool {
-        guard let game, let myColor, !game.isDecided(at: service.now) else { return false }
+        guard let game, let myColor, !game.isDecided(at: service.now),
+              game.remainingMs(myColor, at: service.now) > 0 else { return false }
         return game.sideToMove == myColor && !service.pendingMoveGames.contains("\(tournamentId)|\(gameId)")
     }
     /// The board is drawn from the viewer's side: black players see black at the bottom.
@@ -63,10 +65,10 @@ struct ChessTournamentGameView: View {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .navigationTitle(game.map { roundLabel($0) } ?? "Game")
+        .navigationTitle(titleText)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .principal) { ScreenTitleToolbarLabel(title: Text(game.map { roundLabel($0) } ?? "Game")) }
+            ToolbarItem(placement: .principal) { ScreenTitleToolbarLabel(title: titleText) }
             if isLockedIn {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button {
@@ -104,7 +106,7 @@ struct ChessTournamentGameView: View {
         .sheet(isPresented: $showLeaveWarning) {
             if let tournament, let game {
                 resignSheet(tournament, game, leaving: true)
-                    .presentationDetents([.height(300)])
+                    .fittedSheetDetent(estimate: 300)
                     .presentationDragIndicator(.visible)
             }
         }
@@ -170,9 +172,10 @@ struct ChessTournamentGameView: View {
         service.requestOpenBracket(tournament.id)
     }
 
-    private func roundLabel(_ game: ChessTournamentGame) -> String {
-        if tournament?.isDuel == true { return "1v1" }
-        return game.round == 3 ? "Final" : (game.round == 2 ? "Semifinal" : "Round 1")
+    /// "1v1", "Round 1", "Semifinal" or "Final", in the app's language.
+    private var titleText: Text {
+        guard let game else { return Text("Game") }
+        return Text(verbatim: ChessText.roundTitle(game.round, isDuel: tournament?.isDuel == true))
     }
 
     /// Contact name, then KNS domain, then the shortened address - the app's rule, and the
@@ -203,7 +206,7 @@ struct ChessTournamentGameView: View {
         .padding(.top, 8)
         .sheet(isPresented: $showResignConfirm) {
             resignSheet(tournament, game, leaving: false)
-                .presentationDetents([.height(300)])
+                .fittedSheetDetent(estimate: 300)
                 .presentationDragIndicator(.visible)
         }
         .sheet(item: $pendingPromotion) { move in
@@ -218,9 +221,19 @@ struct ChessTournamentGameView: View {
     /// leaving means resigning: what it means, then Resign (and leave) or stay.
     private func resignSheet(_ tournament: ChessTournament, _ game: ChessTournamentGame, leaving: Bool) -> some View {
         let opponent = name(for: game.address(of: myColor == .white ? .black : .white))
-        let consequence = tournament.isDuel
-            ? "\(opponent) wins, and it counts as a loss on the leaderboard. Resigning is one transaction."
-            : "\(opponent) goes through and you are out of the tournament. It counts as a loss on the leaderboard. Resigning is one transaction."
+        // One whole text per case, so a translation can order it as its language needs.
+        let consequence: String = {
+            switch (tournament.isDuel, leaving) {
+            case (true, false):
+                return ChessText.format("%@ wins, and it counts as a loss on the leaderboard. Resigning is one transaction.", opponent)
+            case (true, true):
+                return ChessText.format("If you leave, you resign the game. %@ wins, and it counts as a loss on the leaderboard. Resigning is one transaction.", opponent)
+            case (false, false):
+                return ChessText.format("%@ goes through and you are out of the tournament. It counts as a loss on the leaderboard. Resigning is one transaction.", opponent)
+            case (false, true):
+                return ChessText.format("If you leave, you resign the game. %@ goes through and you are out of the tournament. It counts as a loss on the leaderboard. Resigning is one transaction.", opponent)
+            }
+        }()
         return VStack(spacing: 16) {
             Image(systemName: leaving ? "rectangle.portrait.and.arrow.right" : "flag.fill")
                 .font(.scaled(size: 34))
@@ -228,7 +241,7 @@ struct ChessTournamentGameView: View {
                 .padding(.top, 28)
             Text(leaving ? "Leave the game?" : "Resign this game?")
                 .font(.title3.weight(.bold))
-            Text(leaving ? "If you leave, you resign the game. \(consequence)" : consequence)
+            Text(verbatim: consequence)
                 .font(.subheadline)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
@@ -299,7 +312,7 @@ struct ChessTournamentGameView: View {
         let remaining = game.remainingMs(color, at: service.now)
         let isActive = !game.isOver && game.sideToMove == color
         let isLow = remaining < 20_000
-        let label: String = myColor == nil ? (color == .white ? "White" : "Black") : (color == myColor ? "You" : "Them")
+        let label: LocalizedStringKey = myColor == nil ? (color == .white ? "White" : "Black") : (color == myColor ? "You" : "Them")
         let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
         let tint: Color = isLow ? Color.red.opacity(0.14) : (isActive ? Color.accentColor.opacity(0.12) : Color.clear)
         let stroke: Color = isLow ? Color.red.opacity(0.55) : (isActive ? Color.accentColor.opacity(0.6) : Color.white.opacity(0.18))
@@ -363,37 +376,33 @@ struct ChessTournamentGameView: View {
     private func statusLine(_ game: ChessTournamentGame) -> some View {
         let text: String = {
             if let winner = game.winner, let outcome = game.outcome {
-                let who = name(for: winner)
-                switch outcome {
-                case .checkmate: return "Checkmate. \(who) won."
-                case .resignation: return "\(who) won by resignation."
-                case .timeout: return "\(who) won on time."
-                case .drawTiebreak(let reason): return "Draw by \(reason). \(who) won on clock."
-                }
+                return ChessText.resultSentence(winner: name(for: winner), outcome: outcome)
             }
             if let winner = game.decidedWinner(at: service.now) {
                 // Out of clock, claim not posted yet: the result is already fixed.
-                return "Time ran out. \(name(for: winner)) won on time."
+                return ChessText.format("Time ran out. %@ won on time.", name(for: winner))
             }
-            if service.pendingMoveGames.contains("\(tournamentId)|\(gameId)") { return "Sending your move…" }
+            if service.pendingMoveGames.contains("\(tournamentId)|\(gameId)") { return ChessText.string("Sending your move…") }
             // The clock runs from the moment the board opens (the match-found countdown covers
             // the start - see ChessTournamentCodec.matchFoundDelayMs); nothing to count down here.
             if let myColor {
-                if ChessEngine.isKingInCheck(color: game.sideToMove, board: game.board), game.sideToMove == myColor { return "Check. Your move." }
-                return game.sideToMove == myColor ? "Your move" : "Their move"
+                if ChessEngine.isKingInCheck(color: game.sideToMove, board: game.board), game.sideToMove == myColor { return ChessText.string("Check. Your move.") }
+                return ChessText.string(game.sideToMove == myColor ? "Your move" : "Their move")
             }
-            return game.sideToMove == .white ? "White to move" : "Black to move"
+            return ChessText.string(game.sideToMove == .white ? "White to move" : "Black to move")
         }()
-        Text(text)
+        Text(verbatim: text)
             .font(.subheadline.weight(.semibold))
             .foregroundColor(game.isDecided(at: service.now) ? .secondary : .primary)
     }
 
     // MARK: - Board
 
-    private var legalDestinations: [ChessSquare] {
+    /// Worked out once per render (the board's), never per square: the clock re-renders the
+    /// screen every second.
+    private var legalDestinations: Set<ChessSquare> {
         guard let game, let selectedSquare, isMyTurn else { return [] }
-        return ChessEngine.legalMoves(from: selectedSquare, board: game.board).map { $0.to }
+        return Set(ChessEngine.legalMoves(from: selectedSquare, board: game.board).map { $0.to })
     }
 
     private func board(_ game: ChessTournamentGame) -> some View {
@@ -401,12 +410,13 @@ struct ChessTournamentGameView: View {
             let size = proxy.size.width / 8
             let ranks = flipped ? Array(0..<8) : Array((0..<8).reversed())
             let files = flipped ? Array((0..<8).reversed()) : Array(0..<8)
+            let destinations = legalDestinations
             ZStack {
                 VStack(spacing: 0) {
                     ForEach(ranks, id: \.self) { rank in
                         HStack(spacing: 0) {
                             ForEach(files, id: \.self) { file in
-                                square(file: file, rank: rank, game: game, size: size)
+                                square(file: file, rank: rank, game: game, size: size, destinations: destinations)
                             }
                         }
                     }
@@ -425,13 +435,13 @@ struct ChessTournamentGameView: View {
         .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
-    private func square(file: Int, rank: Int, game: ChessTournamentGame, size: CGFloat) -> some View {
+    private func square(file: Int, rank: Int, game: ChessTournamentGame, size: CGFloat, destinations: Set<ChessSquare>) -> some View {
         let sq = ChessSquare(file: file, rank: rank)
         let isLight = !(file + rank).isMultiple(of: 2)
         let last = game.moves.last
         let isLast = last.map { $0.from == sq || $0.to == sq } ?? false
         let isSelected = selectedSquare == sq
-        let isTarget = legalDestinations.contains(sq)
+        let isTarget = destinations.contains(sq)
         return ZStack {
             Rectangle().fill(isLight ? ChessBoardThumbnail.lightSquareColor : ChessBoardThumbnail.darkSquareColor)
             if isLast { Rectangle().fill(Color.yellow.opacity(0.35)) }
@@ -487,7 +497,8 @@ struct ChessTournamentGameView: View {
             }
             Spacer(minLength: 0)
         }
-        .presentationDetents([.height(180)])
+        .padding(.bottom, 16)
+        .fittedSheetDetent(estimate: 180)
     }
 }
 

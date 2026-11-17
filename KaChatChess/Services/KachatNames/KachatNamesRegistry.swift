@@ -444,8 +444,9 @@ final class KachatNamesRegistry: ObservableObject {
     /// Accepted transactions touching `address`, newest first (kaspa-rest-server), paged until
     /// every outpoint in `spending` has its spender, the history ends, or `restMaxPages` pages.
     /// One page is not enough: 50 dust payments to a registry address would hide the spend that
-    /// moved it on, and the names behind it would never resolve (IOS-065).
-    static func restTransactions(address: String, spending wanted: Set<String>) async throws -> [KachatNames.TxView] {
+    /// moved it on, and the names behind it would never resolve (IOS-065). Nonisolated: the pages
+    /// are fetched and parsed off the main thread (it touches no registry state).
+    nonisolated static func restTransactions(address: String, spending wanted: Set<String>) async throws -> [KachatNames.TxView] {
         let base = AppSettings.load().kaspaRestAPIURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let root = base.hasSuffix("/") ? String(base.dropLast()) : base
         var out: [KachatNames.TxView] = []
@@ -471,15 +472,16 @@ final class KachatNamesRegistry: ObservableObject {
         return out
     }
 
-    static let restPageSize = 50
+    nonisolated static let restPageSize = 50
     /// 1,000 transactions per address: past the newest dust anyone would pay to send
-    static let restMaxPages = 20
+    nonisolated static let restMaxPages = 20
 
-    /// Whether the REST API has seen `txId` accepted.
-    static func isAccepted(txId: String) async -> Bool {
+    /// Whether the REST API has seen `txId` accepted. Off the main thread, and on `session`
+    /// (15 s a request), not the shared session's 60 s: callers poll it in a loop.
+    nonisolated static func isAccepted(txId: String) async -> Bool {
         let base = AppSettings.load().kaspaRestAPIURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: "\(base.hasSuffix("/") ? String(base.dropLast()) : base)/transactions/\(txId)?inputs=false&outputs=false&resolve_previous_outpoints=no"),
-              let (data, response) = try? await URLSession.shared.data(from: url),
+              let (data, response) = try? await session.data(from: url),
               (response as? HTTPURLResponse)?.statusCode == 200,
               let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
         return (j["is_accepted"] as? Bool) == true
@@ -516,6 +518,10 @@ final class KachatNamesRegistry: ObservableObject {
         if case .indexer(let base) = source,
            let j = try await fromIndexer(KachatNames.IndexerAPI.NameJSON.self, base, "/names/\(name)") {
             if let info = j.info(keyOf: Self.keyOf) { return .registered(info) }
+            // Only an explicit `registered: false` is free (the indexer always says so for a free
+            // name). A record it calls registered, or doesn't say, that can't be read is no
+            // answer: never "free", which would offer to claim a name someone holds.
+            guard j.saysFree else { throw KachatNames.Failure("the indexer's record of \(name) can't be checked") }
             return .free(name: name, gap: j.gap?.info)
         }
         let st = try readChainState()
@@ -649,8 +655,9 @@ final class KachatNamesRegistry: ObservableObject {
     /// cancelled). A lapse is just the clock running out, so no registry change announces it.
     func dropLapsed(from names: [KachatNames.NameInfo], update: ([KachatNames.NameInfo]) -> Void) async {
         var held = names
-        while let next = held.map({ $0.expiresAt + graceMs }).filter({ $0 > KachatNames.nowMs() }).min() {
-            let wait = UInt64(max(0, next - KachatNames.nowMs()) + 500) * 1_000_000
+        while let next = held.map({ KachatNames.clampedSum($0.expiresAt, graceMs) }).filter({ $0 > KachatNames.nowMs() }).min() {
+            // at most a day at a time, so a far-off (or junk) time can't overflow the wait
+            let wait = UInt64(min(max(0, next - KachatNames.nowMs()), 86_400_000) + 500) * 1_000_000
             try? await Task.sleep(nanoseconds: wait)
             if Task.isCancelled { return }
             let grace = graceMs
@@ -850,15 +857,18 @@ final class KachatNamesRegistry: ObservableObject {
         let d7 = nowMs - 7 * 86_400_000
         var at: [String: Int64] = [:]
         var paid: [String: UInt64] = [:]
+        // an indexer's figures can be anything: sums stop at UInt64.max instead of trapping
+        func add(_ total: inout UInt64, _ v: UInt64) { total = KachatNames.clampedSum(total, v) }
         for e in events {
             at[e.txId] = max(at[e.txId] ?? 0, e.at ?? 0)
-            guard let name = e.name, let years = e.years, years > 0 else { continue }
+            // no transaction pays for more than `maxYears` periods
+            guard let name = e.name, let years = e.years, years > 0, years <= params.maxYears else { continue }
             let length = name.utf8.count
             switch e.op {
             case "register":
-                paid[e.txId, default: 0] += params.registerCost(forLength: length, years: years)
+                add(&paid[e.txId, default: 0], params.registerCost(forLength: length, years: years))
             case "extend", "renew":
-                paid[e.txId, default: 0] += params.renewPrice(forLength: length) * UInt64(years)
+                add(&paid[e.txId, default: 0], params.renewPrice(forLength: length) * UInt64(years))
             default:
                 break
             }
@@ -868,9 +878,9 @@ final class KachatNamesRegistry: ObservableObject {
         for (tx, time) in at {
             let fee = paid[tx] ?? 0
             transactions.total += 1
-            fees.total += fee
-            if time > d7 { transactions.last7d += 1; fees.last7d += fee }
-            if time > d1 { transactions.last24h += 1; fees.last24h += fee }
+            add(&fees.total, fee)
+            if time > d7 { transactions.last7d += 1; add(&fees.last7d, fee) }
+            if time > d1 { transactions.last24h += 1; add(&fees.last24h, fee) }
         }
         return (transactions, fees)
     }
@@ -1172,6 +1182,36 @@ final class KachatNamesRegistry: ObservableObject {
             }
         }
         return out
+    }
+
+    /// The address's .kachat label for a screen that moves money (`AddressResolutionCard`), never
+    /// from the cache: the address's identity asked now, the name it gives looked up, its owner
+    /// compared with the address and its record checked on chain (`confirmOnChain`). nil when the
+    /// address has no name, or any of that fails or can't be checked: a wrong name next to an
+    /// address you pay is worse than none. `cachedIdentity` stays for showing people elsewhere.
+    func verifiedLabel(for address: String) async -> String? {
+        guard KachatNamesService.isLaunched else { return nil }
+        let key = address.lowercased()
+        guard NetworkType(address: key) != nil, NetworkType.isOnActiveNetwork(key) else { return nil }
+        await refreshIfStale()
+        do {
+            let found = try await identity(address: key)
+            if storeFetchedIdentity(found, for: key) {
+                ContactsManager.shared.objectWillChange.send()
+                ContactsManager.shared.scheduleSharedNameSync()
+            }
+            guard let label = found.label else { return nil }
+            let canonical = KachatNames.Codec.normalize(label)
+            guard case .registered(let n) = try await lookup(canonical),
+                  n.name == canonical,
+                  n.status(graceMs: graceMs) != .lapsed,
+                  Self.address(of: n.owner)?.lowercased() == key else { return nil }
+            try await confirmOnChain(n)
+            return canonical
+        } catch {
+            AppLog.log("[KachatNames] name check for %@ failed: %@", Self.shortAddress(key), error.localizedDescription)
+            return nil
+        }
     }
 
     func cachedIdentity(for address: String) -> KachatNames.Identity? {
@@ -1870,7 +1910,7 @@ final class KachatNamesNotifier {
                 s.renewNoted = true
                 if !s.graceNoted {
                     post("grace-\(n.name)-\(n.expiresAt)", n.name, S("%@ has expired", display),
-                         S("Renew it before %@ or anyone can claim it.", KachatNamesActions.dayString(n.expiresAt + p.graceMs)))
+                         S("Renew it before %@ or anyone can claim it.", KachatNamesActions.dayString(KachatNames.clampedSum(n.expiresAt, p.graceMs))))
                     s.graceNoted = true
                 }
             case .lapsed:
@@ -1985,7 +2025,7 @@ enum KachatNameReminders {
         // Asked the first time there is a reminder to set, with the app on screen. Denied, the
         // reminders are dropped below and Your Domains says they're off (`KachatLiveDomainsTab`).
         if settings.authorizationStatus == .notDetermined, UIApplication.shared.applicationState == .active,
-           names.contains(where: { $0.expiresAt + p.graceMs > KachatNames.nowMs() }) {
+           names.contains(where: { KachatNames.clampedSum($0.expiresAt, p.graceMs) > KachatNames.nowMs() }) {
             _ = try? await center.requestAuthorization(options: [.alert, .sound])
             settings = await center.notificationSettings()
         }
@@ -2007,19 +2047,19 @@ enum KachatNameReminders {
         for n in names {
             let display = KachatNameLabel.display(n.name)
             let base = "\(prefix)\(n.name)-\(n.expiresAt)-"
-            let renewAt = n.expiresAt - p.renewWindowMs
+            let renewAt = p.renewOpens(expiresAt: n.expiresAt)
             if renewAt > now {
                 wanted[base + "renew"] = (renewAt, S("Renew %@", display),
                                           S("Renewal is open: renew it before %@ to keep it.", KachatNamesActions.dayString(n.expiresAt)), n.name)
             }
             if n.expiresAt > now {
                 wanted[base + "grace"] = (n.expiresAt, S("%@ has expired", display),
-                                          S("Renew it before %@ or anyone can claim it.", KachatNamesActions.dayString(n.expiresAt + p.graceMs)), n.name)
+                                          S("Renew it before %@ or anyone can claim it.", KachatNamesActions.dayString(KachatNames.clampedSum(n.expiresAt, p.graceMs))), n.name)
             }
-            let lastCall = n.expiresAt + p.graceMs - min(p.graceMs / 2, 86_400_000)
+            let lastCall = KachatNames.clampedSum(KachatNames.clampedSum(n.expiresAt, p.graceMs), -min(p.graceMs / 2, 86_400_000))
             if lastCall > now {
                 wanted[base + "lastcall"] = (lastCall, S("%@ has expired", display),
-                                             S("Renew it before %@ or anyone can claim it.", KachatNamesActions.dayString(n.expiresAt + p.graceMs)), n.name)
+                                             S("Renew it before %@ or anyone can claim it.", KachatNamesActions.dayString(KachatNames.clampedSum(n.expiresAt, p.graceMs))), n.name)
             }
         }
         let stale = pending.filter { wanted[$0] == nil }
