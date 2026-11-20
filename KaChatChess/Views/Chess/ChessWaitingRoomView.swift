@@ -25,7 +25,13 @@ struct ChessWaitingRoomView: View {
     let onFinished: (Exit) -> Void
 
     @ObservedObject private var service = ChessTournamentService.shared
+    /// This screen is a countdown (the seat's time, the match found): it redraws every second.
+    @ObservedObject private var clock = ChessClock.shared
     @EnvironmentObject private var walletManager: WalletManager
+    /// The code was copied: "Copied" shows for a moment (`copiedToken` keeps an older clear
+    /// from wiping a newer copy's toast).
+    @State private var showCopied = false
+    @State private var copiedToken = 0
     @State private var showLeaveWarning = false
     @State private var isLeaving = false
     @State private var handedOff = false
@@ -48,26 +54,56 @@ struct ChessWaitingRoomView: View {
     var body: some View {
         ZStack {
             Color(.systemBackground).ignoresSafeArea()
-            VStack(spacing: 28) {
-                Spacer()
-                if matchFound, let tournament {
-                    // The room filled. Everyone sees this for the same ten seconds of chain
-                    // time, then every phone opens the board together.
-                    Text(tournament.isDuel ? "Match found!" : "Tournament full!")
-                        .font(.title.weight(.heavy))
-                    seats
-                    VStack(spacing: 6) {
-                        Text(verbatim: "\(matchFoundSecondsLeft)")
-                            .font(.scaled(size: 56, weight: .bold, design: .rounded).monospacedDigit())
-                            .contentTransition(.numericText())
-                            .animation(.easeInOut(duration: 0.2), value: matchFoundSecondsLeft)
-                        Text(tournament.isDuel ? "Taking both of you to the board" : "Taking everyone to their boards")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                    }
-                } else {
+            // Scrolls when it doesn't fit (an iPhone SE, large text); centred when it does.
+            GeometryReader { proxy in
+                ScrollView {
+                    roomContent
+                        .padding(.vertical, 24)
+                        .frame(maxWidth: .infinity, minHeight: proxy.size.height)
+                }
+            }
+            // One toast at a time: the copy's confirmation first, then the service's error.
+            .toast(message: showCopied ? "Copied" : service.lastError, style: showCopied ? .success : .error)
+            .safeAreaInset(edge: .bottom) { leaveButton }
+        }
+        .interactiveDismissDisabled()
+        .sheet(isPresented: $showLeaveWarning) {
+            leaveSheet
+                .fittedSheetDetent(estimate: 300)
+                .presentationDragIndicator(.visible)
+        }
+        .onAppear { service.acquire(); appearedAt = clock.now; check() }
+        .onDisappear { service.release() }
+        .onChange(of: tournament?.status) { _ in check() }
+        .onChange(of: clock.now) { _ in check() }
+    }
+
+    @ViewBuilder
+    private var roomContent: some View {
+        VStack(spacing: 28) {
+            if matchFound, let tournament {
+                // The room filled. Everyone sees this for the same ten seconds of chain
+                // time, then every phone opens the board together.
+                Text(tournament.isDuel ? "Match found!" : "Tournament full!")
+                    .font(.title.weight(.heavy))
+                    .multilineTextAlignment(.center)
+                seats
+                VStack(spacing: 6) {
+                    Text(verbatim: "\(matchFoundSecondsLeft)")
+                        .font(.scaled(size: 56, weight: .bold, design: .rounded).monospacedDigit())
+                        .contentTransition(.numericText())
+                        .animation(.easeInOut(duration: 0.2), value: matchFoundSecondsLeft)
+                    Text(tournament.isDuel ? "Taking both of you to the board" : "Taking everyone to their boards")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.horizontal, 32)
+            } else {
                 Text(tournament?.isDuel == true ? "Looking for an opponent" : "Waiting for players")
                     .font(.title2.weight(.bold))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 32)
                 seats
                 countdown
                 if service.arenaServerDown {
@@ -84,38 +120,31 @@ struct ChessWaitingRoomView: View {
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 32)
-                }
-                Spacer()
-                Button(role: .destructive) {
-                    showLeaveWarning = true
-                } label: {
-                    Text(isLeaving || leftByChoice ? "Leaving…" : "Leave")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
-                        .background(Color.red.opacity(0.12))
-                        .foregroundColor(.red)
-                        .clipShape(RoundedRectangle(cornerRadius: 14))
-                }
-                .buttonStyle(.plain)
-                .padding(.horizontal, 24)
-                .padding(.bottom, 24)
-                // No leaving once the room has filled - the game exists on chain.
-                .opacity(matchFound ? 0 : 1)
-                .disabled(matchFound || isLeaving || leftByChoice)
             }
         }
-        .interactiveDismissDisabled()
-        .sheet(isPresented: $showLeaveWarning) {
-            leaveSheet
-                .fittedSheetDetent(estimate: 300)
-                .presentationDragIndicator(.visible)
+    }
+
+    /// Pinned under the content, which scrolls above it.
+    private var leaveButton: some View {
+        Button(role: .destructive) {
+            showLeaveWarning = true
+        } label: {
+            Text(isLeaving || leftByChoice ? "Leaving…" : "Leave")
+                .font(.subheadline.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(Color.red.opacity(0.12))
+                .foregroundColor(.red)
+                .clipShape(RoundedRectangle(cornerRadius: 14))
         }
-        .onAppear { service.acquire(); appearedAt = service.now; check() }
-        .onDisappear { service.release() }
-        .onChange(of: tournament?.status) { _ in check() }
-        .onChange(of: service.now) { _ in check() }
-        .toast(message: service.lastError, style: .error)
+        .buttonStyle(.plain)
+        .padding(.horizontal, 24)
+        .padding(.top, 8)
+        .padding(.bottom, 16)
+        .background(Color(.systemBackground))
+        // No leaving once the room has filled - the game exists on chain.
+        .opacity(matchFound ? 0 : 1)
+        .disabled(matchFound || isLeaving || leftByChoice)
     }
 
     /// The half sheet behind Leave: what leaving means, then Leave or Keep waiting - the same
@@ -186,18 +215,18 @@ struct ChessWaitingRoomView: View {
     /// The room has filled and the match-found countdown is still running.
     private var matchFound: Bool {
         guard let tournament, let me, tournament.status == .live, tournament.players.contains(me) else { return false }
-        return service.now < (tournament.startedAt ?? 0) + ChessTournamentCodec.matchFoundDelayMs
+        return clock.now < (tournament.startedAt ?? 0) + ChessTournamentCodec.matchFoundDelayMs
     }
 
     private var matchFoundSecondsLeft: Int {
         guard let tournament else { return 0 }
-        let left = (tournament.startedAt ?? 0) + ChessTournamentCodec.matchFoundDelayMs - service.now
+        let left = (tournament.startedAt ?? 0) + ChessTournamentCodec.matchFoundDelayMs - clock.now
         return max(0, Int((left + 999) / 1000))
     }
 
     private func check() {
         guard !handedOff, let me else { return }
-        let waited = service.now - (appearedAt ?? service.now) > Self.seatWaitMs
+        let waited = clock.now - (appearedAt ?? clock.now) > Self.seatWaitMs
         guard let tournament else {
             // The room is on this phone only through this player's own create or first join,
             // and that row was dropped (it never reached the network): it is gone, and so is
@@ -225,14 +254,14 @@ struct ChessWaitingRoomView: View {
         } else if tournament.status == .cancelled {
             handedOff = true
             onFinished(.quiet)
-        } else if tournament.isSeated(me, at: service.now) {
+        } else if tournament.isSeated(me, at: clock.now) {
             wasSeated = true
             seenSeatExpiry = tournament.seatExpiry(of: me)
         } else if wasSeated || waited {
             handedOff = true
             if leftByChoice || !wasSeated {
                 onFinished(.quiet)
-            } else if let expiry = seenSeatExpiry, service.now < expiry {
+            } else if let expiry = seenSeatExpiry, clock.now < expiry {
                 // Out of the room while the seat still had time: the seat rested on a join the
                 // network never took, and it was dropped.
                 onFinished(.joinNotLanded)
@@ -245,7 +274,7 @@ struct ChessWaitingRoomView: View {
     private var seats: some View {
         let capacity = tournament?.capacity ?? 2
         // You first, then the others who are here, then a question mark for each empty seat.
-        var shown = tournament?.seatedPlayers(at: service.now) ?? []
+        var shown = tournament?.seatedPlayers(at: clock.now) ?? []
         if let me { shown = [me] + shown.filter { $0 != me } }
         let columns = Array(repeating: GridItem(.flexible(), spacing: 18), count: capacity == 2 ? 2 : 4)
         return LazyVGrid(columns: columns, spacing: 18) {
@@ -300,9 +329,16 @@ struct ChessWaitingRoomView: View {
                 Button {
                     UIPasteboard.general.string = tournament.id
                     Haptics.success()
+                    copiedToken += 1
+                    let token = copiedToken
+                    withAnimation { showCopied = true }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        if copiedToken == token { withAnimation { showCopied = false } }
+                    }
                 } label: {
                     Image(systemName: "doc.on.doc")
                 }
+                .accessibilityLabel(Text("Copy"))
                 ShareLink(item: ChessText.invite(for: tournament)) {
                     Image(systemName: "square.and.arrow.up")
                 }
@@ -311,8 +347,8 @@ struct ChessWaitingRoomView: View {
     }
 
     private var countdown: some View {
-        let expiry = me.flatMap { tournament?.seatExpiry(of: $0) } ?? service.now
-        let left = max(0, Int((expiry - service.now) / 1000))
+        let expiry = me.flatMap { tournament?.seatExpiry(of: $0) } ?? clock.now
+        let left = max(0, Int((expiry - clock.now) / 1000))
         return VStack(spacing: 4) {
             Text(verbatim: String(format: "%d:%02d", left / 60, left % 60))
                 .font(.scaled(size: 44, weight: .semibold, design: .rounded).monospacedDigit())

@@ -3,6 +3,8 @@ import Foundation
 /// What the whole hot wallet holds: the chatting address plus every spending address, hidden ones
 /// included. KaPay's: the Wallet tab's balance card and Manage Addresses read it. (KaPlay's top bar,
 /// `BalanceToolbarLabel`, stays the chatting address: the one every move is paid from.)
+/// Read on demand only (`refresh`, `refreshUntilKnown`), never on UTXO activity: every chess move
+/// is UTXO activity on the chatting address, and KaPlay's Wallet tab is that address alone.
 @MainActor
 final class HotWalletBalance: ObservableObject {
     static let shared = HotWalletBalance()
@@ -15,22 +17,12 @@ final class HotWalletBalance: ObservableObject {
     private var lastReadAt: Date?
     /// Only the newest read counts: an older one finishing late can't put an old figure back.
     private var readGeneration = 0
-    private var activityTask: Task<Void, Never>?
 
-    /// Each tab's top bar asks when it appears; this keeps tab switches from reading each time.
-    /// Arriving funds refresh at once.
+    /// A screen asks when it appears; this keeps tab switches from reading each time.
     private static let minReadInterval: TimeInterval = 30
     private static let unknownRetryNanoseconds: UInt64 = 5_000_000_000
 
-    private init() {
-        NotificationCenter.default.addObserver(
-            forName: .ownAddressUtxoActivity,
-            object: nil,
-            queue: .main
-        ) { _ in
-            Task { @MainActor in HotWalletBalance.shared.noteActivity() }
-        }
-    }
+    private init() {}
 
     /// `wallet`'s spending addresses together, or nil until they're known.
     func spendingSompi(for wallet: Wallet?) -> UInt64? {
@@ -78,16 +70,6 @@ final class HotWalletBalance: ObservableObject {
         while !Task.isCancelled, spendingSompi(for: walletManager.currentWallet) == nil,
               !walletManager.allSpendingAddresses().isEmpty {
             try? await Task.sleep(nanoseconds: Self.unknownRetryNanoseconds)
-            guard !Task.isCancelled else { return }
-            await refresh(force: true)
-        }
-    }
-
-    /// One transaction can bring several UTXO changes: they make one read.
-    private func noteActivity() {
-        activityTask?.cancel()
-        activityTask = Task {
-            try? await Task.sleep(nanoseconds: 500_000_000)
             guard !Task.isCancelled else { return }
             await refresh(force: true)
         }

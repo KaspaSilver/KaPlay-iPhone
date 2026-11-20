@@ -3059,7 +3059,8 @@ extension ChatService {
         }
 
         // Trigger full sync if we have unresolved senders
-        if needsFullSync {
+        // KaPlay has no chats (`syncsChats`): no full KaChat message sync for unresolved senders.
+        if needsFullSync, Self.syncsChats {
             AppLog.log("[ChatService] Triggering full sync to resolve pending senders...")
             requestPaymentCatchUp(lookBackMs: 10 * 60 * 1000)
             Task { @MainActor in

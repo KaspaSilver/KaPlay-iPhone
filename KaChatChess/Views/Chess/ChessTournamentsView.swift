@@ -440,7 +440,7 @@ struct ChessTournamentsView: View {
                         .foregroundColor(.secondary)
                 }
                 Spacer()
-                Text(verbatim: ChessText.clock(game.remainingMs(game.sideToMove, at: service.now)))
+                ChessLiveClockText(game: game)
                     .font(.caption.monospacedDigit().weight(.semibold))
                     .foregroundColor(.secondary)
                 Text("Watch")
@@ -619,8 +619,7 @@ struct ChessLeaderboardRows: View {
     @State private var profileAddress: String?
     @State private var period: ChessLeaderboardPeriod = .month
     /// The board sorted for this kind, worked out when the board or the period changes - not on
-    /// every tick of the service's clock, which re-renders this view once a second. nil until
-    /// the first sort.
+    /// every re-render of the service. nil until the first sort.
     @State private var sortedRows: [ChessLeaderboardRow]?
 
     private var rows: [ChessLeaderboardRow] { sortedRows ?? [] }
@@ -708,8 +707,9 @@ struct ChessLeaderboardRows: View {
                     } else {
                         HStack(spacing: 10) {
                             HStack(spacing: 4) {
-                                Image(systemName: "trophy.fill").foregroundColor(.yellow)
-                                Text(verbatim: "\(row.tournamentsWon)").foregroundColor(.yellow)
+                                // Orange, not yellow: yellow can't be read on a light row.
+                                Image(systemName: "trophy.fill").foregroundColor(.orange)
+                                Text(verbatim: "\(row.tournamentsWon)").foregroundColor(.orange)
                             }
                             Text("\(row.tournamentsLost) L").foregroundColor(.red)
                         }

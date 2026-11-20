@@ -49,7 +49,9 @@ struct ChessTournamentView: View {
         .onDisappear { service.release() }
         // The player's game came into being: open it (once per game).
         .onChange(of: tournament?.games.count) { _ in autoOpenMyGameIfNeeded() }
-        .onChange(of: service.now) { _ in autoOpenMyGameIfNeeded() }
+        // The cool-down runs out: the arena's clock, without observing it (a tick must not
+        // redraw this screen).
+        .onReceive(ChessClock.shared.$now) { _ in autoOpenMyGameIfNeeded() }
         .onAppear { autoOpenMyGameIfNeeded() }
     }
 
@@ -88,7 +90,8 @@ struct ChessTournamentView: View {
             if tournament.status == .open {
                 let seated = tournament.seatedPlayers(at: service.now)
                 Section("Players (\(seated.count) of \(tournament.capacity))") {
-                    ForEach(Array(seated.enumerated()), id: \.offset) { index, address in
+                    // By address: a seat that runs out shifts the ones after it.
+                    ForEach(Array(seated.enumerated()), id: \.element) { index, address in
                         playerRow(seed: index + 1, address: address)
                     }
                     ForEach(0..<max(0, tournament.capacity - seated.count), id: \.self) { _ in
@@ -186,29 +189,14 @@ struct ChessTournamentView: View {
                         Text("You are out of this tournament. Watch the rest of the bracket.")
                             .font(.subheadline)
                     }
-                } else if let left = nextGameCountdownMs {
-                    // Cool-down on the bracket before the next round: who it is, and when.
-                    HStack(spacing: 12) {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(verbatim: nextText(round: game.round, opponent: name(for: game.address(of: game.color(of: me) == .white ? .black : .white))))
-                                .font(.subheadline.weight(.semibold))
-                            Text("Your game starts in")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                        Spacer()
-                        Text(verbatim: "\(Int((left + 999) / 1000))")
-                            .font(.scaled(size: 34, weight: .bold, design: .rounded).monospacedDigit())
-                            .foregroundColor(.accentColor)
-                            .contentTransition(.numericText())
-                            .animation(.easeInOut(duration: 0.2), value: Int((left + 999) / 1000))
-                    }
                 } else {
-                    Button {
+                    // Cool-down on the bracket before the next round (who it is, and when), then
+                    // the way to the game. Its own view: the countdown is redrawn every second.
+                    ChessNextGameRow(
+                        opensAt: game.startedAt + ChessTournamentCodec.matchFoundDelayMs,
+                        title: nextText(round: game.round, opponent: name(for: game.address(of: game.color(of: me) == .white ? .black : .white)))
+                    ) {
                         openGameId = game.id
-                    } label: {
-                        Label("Go to your game", systemImage: "play.fill")
-                            .font(.subheadline.weight(.semibold))
                     }
                 }
             } else {
@@ -219,7 +207,7 @@ struct ChessTournamentView: View {
             if let champion = tournament.champion {
                 Label(tournament.isDuel ? ChessText.format("%@ won", name(for: champion)) : ChessText.format("%@ won the tournament", name(for: champion)), systemImage: "trophy.fill")
                     .font(.subheadline.weight(.semibold))
-                    .foregroundColor(.yellow)
+                    .foregroundColor(.orange)
             }
         case .cancelled:
             Text("Cancelled by the creator.").font(.subheadline).foregroundColor(.secondary)
@@ -279,7 +267,7 @@ struct ChessTournamentView: View {
                 }
                 Spacer()
                 if !game.isOver {
-                    Text(verbatim: ChessText.clock(game.remainingMs(game.sideToMove, at: service.now)))
+                    ChessLiveClockText(game: game)
                         .font(.caption.monospacedDigit())
                         .foregroundColor(.secondary)
                 }
@@ -290,4 +278,41 @@ struct ChessTournamentView: View {
         .buttonStyle(.plain)
     }
 
+}
+
+/// The player's next game on the bracket: "Next: the semifinal vs …" with the seconds until it
+/// opens (`matchFoundDelayMs` after its start, the same instant for both players), then "Go to
+/// your game". It alone observes the arena's clock.
+private struct ChessNextGameRow: View {
+    let opensAt: Int64
+    let title: String
+    let onOpen: () -> Void
+    @ObservedObject private var clock = ChessClock.shared
+
+    var body: some View {
+        let left = opensAt - clock.now
+        if left > 0 {
+            let seconds = Int((left + 999) / 1000)
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(verbatim: title)
+                        .font(.subheadline.weight(.semibold))
+                    Text("Your game starts in")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Text(verbatim: "\(seconds)")
+                    .font(.scaled(size: 34, weight: .bold, design: .rounded).monospacedDigit())
+                    .foregroundColor(.accentColor)
+                    .contentTransition(.numericText())
+                    .animation(.easeInOut(duration: 0.2), value: seconds)
+            }
+        } else {
+            Button(action: onOpen) {
+                Label("Go to your game", systemImage: "play.fill")
+                    .font(.subheadline.weight(.semibold))
+            }
+        }
+    }
 }

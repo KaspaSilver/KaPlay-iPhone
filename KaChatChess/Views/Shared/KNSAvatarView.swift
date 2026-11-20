@@ -736,10 +736,10 @@ private actor KNSProfileImageCache {
         }
 
         do {
-            let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else {
+            guard let fetched = try await cappedImageFetch(request) else {
                 return nil
             }
+            let (data, http) = fetched
 
             if http.statusCode == 304,
                let existingEntry,
@@ -913,6 +913,56 @@ private actor KNSProfileImageCache {
         if !fileManager.fileExists(atPath: imageDirectoryURL.path) {
             try fileManager.createDirectory(at: imageDirectoryURL, withIntermediateDirectories: true)
         }
+    }
+
+    /// Avatars and banners come from whatever https host a player's profile names, so the
+    /// download is bounded: at most this many bytes are read, then it's dropped.
+    private static let maxImageBytes = 2 * 1024 * 1024
+
+    /// GET with a size cap and a content check: nil (nothing stored, the failure cooldown
+    /// applies) when the server sends something that isn't an image, says it's over
+    /// `maxImageBytes`, or keeps sending past it. A 304 and other non-2xx statuses come back
+    /// with no body read. `application/octet-stream` and a missing type are let through (some
+    /// storage hosts serve pictures that way) and the decode decides.
+    private func cappedImageFetch(_ request: URLRequest) async throws -> (Data, HTTPURLResponse)? {
+        let (bytes, response) = try await session.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            bytes.task.cancel()
+            return nil
+        }
+        guard (200...299).contains(http.statusCode) else {
+            bytes.task.cancel()
+            return (Data(), http)
+        }
+        let mimeType = (http.mimeType ?? "").lowercased()
+        let isImageType = mimeType.isEmpty
+            || mimeType.hasPrefix("image/")
+            || mimeType == "application/octet-stream"
+            || mimeType == "binary/octet-stream"
+        guard isImageType, http.expectedContentLength <= Int64(Self.maxImageBytes) else {
+            bytes.task.cancel()
+            return nil
+        }
+        var data = Data()
+        if http.expectedContentLength > 0 {
+            data.reserveCapacity(Int(http.expectedContentLength))
+        }
+        var chunk = [UInt8]()
+        chunk.reserveCapacity(64 * 1024)
+        for try await byte in bytes {
+            chunk.append(byte)
+            if chunk.count == 64 * 1024 {
+                data.append(contentsOf: chunk)
+                chunk.removeAll(keepingCapacity: true)
+                if data.count > Self.maxImageBytes {
+                    bytes.task.cancel()
+                    return nil
+                }
+            }
+        }
+        data.append(contentsOf: chunk)
+        guard data.count <= Self.maxImageBytes else { return nil }
+        return (data, http)
     }
 
     private func header(named name: String, in response: HTTPURLResponse) -> String? {

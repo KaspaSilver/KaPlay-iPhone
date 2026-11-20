@@ -197,6 +197,7 @@ struct ChessTournamentGameView: View {
             clockChip(game, color: flipped ? .white : .black)
                 .padding(.horizontal)
             board(game)
+                .equatable()
                 .padding(.horizontal)
                 .layoutPriority(1)
             clockChip(game, color: flipped ? .black : .white)
@@ -305,71 +306,12 @@ struct ChessTournamentGameView: View {
         .padding(.horizontal)
     }
 
-    /// The 1:1 board's clock chip - label, timer, time - lit while that side is to move, red
-    /// under twenty seconds; the side's avatar and name sit at the leading edge.
+    /// The 1:1 board's clock chip (`ChessTournamentClockChip`), the only part of this screen
+    /// redrawn every second.
     private func clockChip(_ game: ChessTournamentGame, color: ChessColor) -> some View {
         let address = game.address(of: color)
-        let remaining = game.remainingMs(color, at: service.now)
-        let isActive = !game.isOver && game.sideToMove == color
-        let isLow = remaining < 20_000
         let label: LocalizedStringKey = myColor == nil ? (color == .white ? "White" : "Black") : (color == myColor ? "You" : "Them")
-        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
-        let tint: Color = isLow ? Color.red.opacity(0.14) : (isActive ? Color.accentColor.opacity(0.12) : Color.clear)
-        let stroke: Color = isLow ? Color.red.opacity(0.55) : (isActive ? Color.accentColor.opacity(0.6) : Color.white.opacity(0.18))
-        return HStack(spacing: 8) {
-            KNSAvatarView(
-                avatarURLString: KNSService.shared.profileCache[address]?.avatarURL,
-                fallbackText: ContactsManager.shared.displayName(for: address),
-                size: 26,
-                contactAddress: address
-            )
-            Text(name(for: address))
-                .font(.caption.weight(.semibold))
-                .foregroundColor(.secondary)
-                .lineLimit(1)
-            Spacer()
-            HStack(spacing: 6) {
-                Text(label)
-                    .font(.caption2.weight(.semibold))
-                    .foregroundColor(.secondary)
-                Image(systemName: "timer")
-                    .font(.caption)
-                if isActive && remaining < 10_000 {
-                    // Tenths in the last ten seconds, drawn by a local timeline: the model
-                    // publishes `now` once a second, and a 5 Hz publish re-rendered the whole
-                    // board for a digit only this chip shows.
-                    let anchor = Date()
-                    TimelineView(.periodic(from: anchor, by: 0.1)) { timeline in
-                        let elapsed = Int64(timeline.date.timeIntervalSince(anchor) * 1000)
-                        clockLabel(max(0, remaining - elapsed), isActive: isActive)
-                    }
-                } else {
-                    clockLabel(remaining, isActive: isActive)
-                }
-            }
-            .foregroundColor(isLow ? .red : (isActive ? .primary : .secondary))
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(
-                shape.fill(.regularMaterial)
-                    .overlay(shape.fill(tint))
-                    .overlay(shape.stroke(stroke, lineWidth: isActive ? 1.2 : 0.8))
-                    .shadow(color: Color.black.opacity(0.12), radius: 10, x: 0, y: 5)
-            )
-        }
-    }
-
-    private func clockLabel(_ ms: Int64, isActive: Bool) -> some View {
-        Text(clockText(ms))
-            .font(.system(.callout, design: .monospaced).weight(isActive ? .bold : .semibold))
-            .monospacedDigit()
-    }
-
-    private func clockText(_ ms: Int64) -> String {
-        let tenths = Int(ms / 100)
-        let seconds = tenths / 10
-        if seconds < 10 { return String(format: "0:%02d.%d", seconds, tenths % 10) }
-        return String(format: "%d:%02d", seconds / 60, seconds % 60)
+        return ChessTournamentClockChip(game: game, color: color, address: address, name: name(for: address), label: label)
     }
 
     @ViewBuilder
@@ -398,68 +340,38 @@ struct ChessTournamentGameView: View {
 
     // MARK: - Board
 
-    /// Worked out once per render (the board's), never per square: the clock re-renders the
-    /// screen every second.
+    /// Worked out once per render (the board's), never per square.
     private var legalDestinations: Set<ChessSquare> {
         guard let game, let selectedSquare, isMyTurn else { return [] }
         return Set(ChessEngine.legalMoves(from: selectedSquare, board: game.board).map { $0.to })
     }
 
-    private func board(_ game: ChessTournamentGame) -> some View {
-        GeometryReader { proxy in
-            let size = proxy.size.width / 8
-            let ranks = flipped ? Array(0..<8) : Array((0..<8).reversed())
-            let files = flipped ? Array((0..<8).reversed()) : Array(0..<8)
-            let destinations = legalDestinations
-            ZStack {
-                VStack(spacing: 0) {
-                    ForEach(ranks, id: \.self) { rank in
-                        HStack(spacing: 0) {
-                            ForEach(files, id: \.self) { file in
-                                square(file: file, rank: rank, game: game, size: size, destinations: destinations)
-                            }
-                        }
-                    }
-                }
-                // Same "Waiting on opponent..." as the 1:1 board, while it is their move.
-                if let myColor, !game.isDecided(at: service.now), game.sideToMove != myColor {
-                    WaitingOnOpponentOverlay()
-                }
-                if showEndOverlay, let winner = game.winner, let outcome = game.outcome {
-                    ChessGameEndOverlay(winnerName: name(for: winner), outcome: outcome, iWon: myColor == nil ? nil : winner == me)
-                        .transition(.opacity)
-                }
-            }
+    /// The board as plain values (`ChessTournamentBoard`, Equatable): redrawn when the
+    /// position, the selection or an overlay changes, never for a clock.
+    private func board(_ game: ChessTournamentGame) -> ChessTournamentBoard {
+        var endOverlay: ChessTournamentBoard.EndOverlay?
+        if showEndOverlay, let winner = game.winner, let outcome = game.outcome {
+            endOverlay = .init(winnerName: name(for: winner), outcome: outcome, iWon: myColor == nil ? nil : winner == me)
         }
-        .aspectRatio(1, contentMode: .fit)
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-    }
-
-    private func square(file: Int, rank: Int, game: ChessTournamentGame, size: CGFloat, destinations: Set<ChessSquare>) -> some View {
-        let sq = ChessSquare(file: file, rank: rank)
-        let isLight = !(file + rank).isMultiple(of: 2)
         let last = game.moves.last
-        let isLast = last.map { $0.from == sq || $0.to == sq } ?? false
-        let isSelected = selectedSquare == sq
-        let isTarget = destinations.contains(sq)
-        return ZStack {
-            Rectangle().fill(isLight ? ChessBoardThumbnail.lightSquareColor : ChessBoardThumbnail.darkSquareColor)
-            if isLast { Rectangle().fill(Color.yellow.opacity(0.35)) }
-            if isSelected { Rectangle().fill(Color.accentColor.opacity(0.35)) }
-            if let piece = game.board.piece(at: sq) {
-                ChessPieceGlyphView(piece: piece, fontSize: size * 0.7)
-            }
-            if isTarget {
-                Circle().fill(Color.accentColor.opacity(0.55)).frame(width: size * 0.3, height: size * 0.3)
-            }
-        }
-        .frame(width: size, height: size)
-        .contentShape(Rectangle())
-        .onTapGesture { tap(sq, game: game) }
+        return ChessTournamentBoard(
+            board: game.board,
+            lastFrom: last?.from,
+            lastTo: last?.to,
+            flipped: flipped,
+            selectedSquare: selectedSquare,
+            destinations: legalDestinations,
+            // Same "Waiting on opponent..." as the 1:1 board, while it is their move.
+            showsWaiting: myColor != nil && !game.isDecided(at: service.now) && game.sideToMove != myColor,
+            endOverlay: endOverlay,
+            // The game is read when the tap comes, never kept from this render: an equal board
+            // can stand for a later ply (a repeated position).
+            onTap: { tap($0) }
+        )
     }
 
-    private func tap(_ sq: ChessSquare, game: ChessTournamentGame) {
-        guard isMyTurn, let tournament, let myColor else { return }
+    private func tap(_ sq: ChessSquare) {
+        guard isMyTurn, let tournament, let game, let myColor else { return }
         if let from = selectedSquare {
             if legalDestinations.contains(sq) {
                 let move = ChessMove(from: from, to: sq, promotion: nil)
@@ -502,6 +414,160 @@ struct ChessTournamentGameView: View {
     }
 }
 
+
+/// A side's clock chip on the tournament board - avatar and name, label, timer, time - lit
+/// while that side is to move, red under twenty seconds. It alone observes the arena's clock,
+/// so a tick redraws the chips and nothing else on the screen.
+private struct ChessTournamentClockChip: View {
+    let game: ChessTournamentGame
+    let color: ChessColor
+    let address: String
+    let name: String
+    let label: LocalizedStringKey
+    @ObservedObject private var clock = ChessClock.shared
+
+    var body: some View {
+        let remaining = game.remainingMs(color, at: clock.now)
+        let isActive = !game.isOver && game.sideToMove == color
+        let isLow = remaining < 20_000
+        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+        let tint: Color = isLow ? Color.red.opacity(0.14) : (isActive ? Color.accentColor.opacity(0.12) : Color.clear)
+        // Adaptive: a white stroke vanished on the light material.
+        let stroke: Color = isLow ? Color.red.opacity(0.55) : (isActive ? Color.accentColor.opacity(0.6) : Color.primary.opacity(0.12))
+        return HStack(spacing: 8) {
+            KNSAvatarView(
+                avatarURLString: KNSService.shared.profileCache[address]?.avatarURL,
+                fallbackText: name,
+                size: 26,
+                contactAddress: address
+            )
+            Text(name)
+                .font(.caption.weight(.semibold))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+            Spacer()
+            HStack(spacing: 6) {
+                Text(label)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundColor(.secondary)
+                Image(systemName: "timer")
+                    .font(.caption)
+                if isActive && remaining < 10_000 {
+                    // Tenths in the last ten seconds, drawn by a local timeline: the clock
+                    // publishes once a second. Each frame reads the clock at the timeline's own
+                    // instant, so it never jumps back when the next second's `now` lands.
+                    let anchor = Date(timeIntervalSince1970: TimeInterval(clock.now) / 1000)
+                    TimelineView(.periodic(from: anchor, by: 0.1)) { timeline in
+                        let at = max(clock.now, Int64(timeline.date.timeIntervalSince1970 * 1000))
+                        clockLabel(game.remainingMs(color, at: at), isActive: isActive)
+                    }
+                } else {
+                    clockLabel(remaining, isActive: isActive)
+                }
+            }
+            .foregroundColor(isLow ? .red : (isActive ? .primary : .secondary))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(
+                shape.fill(.regularMaterial)
+                    .overlay(shape.fill(tint))
+                    .overlay(shape.stroke(stroke, lineWidth: isActive ? 1.2 : 0.8))
+                    .shadow(color: Color.black.opacity(0.12), radius: 10, x: 0, y: 5)
+            )
+        }
+    }
+
+    private func clockLabel(_ ms: Int64, isActive: Bool) -> some View {
+        Text(clockText(ms))
+            .font(.system(.callout, design: .monospaced).weight(isActive ? .bold : .semibold))
+            .monospacedDigit()
+    }
+
+    private func clockText(_ ms: Int64) -> String {
+        let tenths = Int(ms / 100)
+        let seconds = tenths / 10
+        if seconds < 10 { return String(format: "0:%02d.%d", seconds, tenths % 10) }
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
+    }
+}
+
+/// The tournament board: 64 squares from plain values, Equatable so the screen's re-renders
+/// (a toast, a sending move, a clock flipping who may move) skip it unless what it draws has
+/// changed. `onTap` is left out of the comparison.
+struct ChessTournamentBoard: View, Equatable {
+    struct EndOverlay: Equatable {
+        let winnerName: String
+        let outcome: ChessTournamentGame.Outcome
+        let iWon: Bool?
+    }
+
+    let board: ChessBoard
+    let lastFrom: ChessSquare?
+    let lastTo: ChessSquare?
+    let flipped: Bool
+    let selectedSquare: ChessSquare?
+    let destinations: Set<ChessSquare>
+    let showsWaiting: Bool
+    let endOverlay: EndOverlay?
+    let onTap: (ChessSquare) -> Void
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.board == rhs.board && lhs.lastFrom == rhs.lastFrom && lhs.lastTo == rhs.lastTo
+            && lhs.flipped == rhs.flipped && lhs.selectedSquare == rhs.selectedSquare
+            && lhs.destinations == rhs.destinations && lhs.showsWaiting == rhs.showsWaiting
+            && lhs.endOverlay == rhs.endOverlay
+    }
+
+    var body: some View {
+        GeometryReader { proxy in
+            let size = proxy.size.width / 8
+            let ranks = flipped ? Array(0..<8) : Array((0..<8).reversed())
+            let files = flipped ? Array((0..<8).reversed()) : Array(0..<8)
+            ZStack {
+                VStack(spacing: 0) {
+                    ForEach(ranks, id: \.self) { rank in
+                        HStack(spacing: 0) {
+                            ForEach(files, id: \.self) { file in
+                                square(file: file, rank: rank, size: size)
+                            }
+                        }
+                    }
+                }
+                if showsWaiting {
+                    WaitingOnOpponentOverlay()
+                }
+                if let endOverlay {
+                    ChessGameEndOverlay(winnerName: endOverlay.winnerName, outcome: endOverlay.outcome, iWon: endOverlay.iWon)
+                        .transition(.opacity)
+                }
+            }
+        }
+        .aspectRatio(1, contentMode: .fit)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func square(file: Int, rank: Int, size: CGFloat) -> some View {
+        let sq = ChessSquare(file: file, rank: rank)
+        let isLight = !(file + rank).isMultiple(of: 2)
+        let isLast = lastFrom == sq || lastTo == sq
+        let isSelected = selectedSquare == sq
+        let isTarget = destinations.contains(sq)
+        return ZStack {
+            Rectangle().fill(isLight ? ChessBoardThumbnail.lightSquareColor : ChessBoardThumbnail.darkSquareColor)
+            if isLast { Rectangle().fill(Color.yellow.opacity(0.35)) }
+            if isSelected { Rectangle().fill(Color.accentColor.opacity(0.35)) }
+            if let piece = board.piece(at: sq) {
+                ChessPieceGlyphView(piece: piece, fontSize: size * 0.7)
+            }
+            if isTarget {
+                Circle().fill(Color.accentColor.opacity(0.55)).frame(width: size * 0.3, height: size * 0.3)
+            }
+        }
+        .frame(width: size, height: size)
+        .contentShape(Rectangle())
+        .onTapGesture { onTap(sq) }
+    }
+}
 
 /// Pops the navigation stack straight to the 1v1 / Tournaments screen (the third controller
 /// on the stack: Games, Chess, then the kind's screen) when `request` changes. The

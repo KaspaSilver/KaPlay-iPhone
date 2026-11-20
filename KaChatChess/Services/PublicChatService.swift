@@ -428,9 +428,20 @@ final class PublicChatService: ObservableObject {
             var changed = false
             if Self.serviceChannels.contains(channel) {
                 // Our own arena rows take the chain's block time - see processPublicChatHits.
+                // A row whose time was already applied is skipped, as in the room's 8 s poll
+                // (`mergeIndexerRows`): this runs every 2 s during a game, and each update is a
+                // Core Data fetch on the main thread for all 40 rows.
                 for row in rows {
+                    // Our own row can have taken this phone's clock again after the indexer's
+                    // time was applied (the send resolving late): that one is never skipped.
+                    let onOwnClock = localStampSentAt[row.id] != nil || droppedServiceRows.remove(row.id) != nil
                     confirmLocalStamp(row.id)
+                    let key = "\(row.id)@\(row.blockTime)"
+                    guard onOwnClock || !wasApplied(key, channel: channel) else { continue }
                     if store.updateBlockTime(id: row.id, blockTime: row.blockTime) { changed = true }
+                    // Only a row the store already held: a fresh one is inserted below with this
+                    // time, and is marked on the next poll once it is surely there.
+                    if store.isReady, known.contains(row.id) { markApplied(key, channel: channel) }
                 }
             }
             // Awaited, not a deferred reload: the arena picks a room right after this returns
@@ -1152,7 +1163,7 @@ final class PublicChatService: ObservableObject {
         let channel = PublicChatChannelName.normalize(rawChannel)
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            throw KasiaError.networkError("Message is empty")
+            throw KasiaError.networkError(AppLocalization.string("Something went wrong. Please try again."))
         }
         guard let wallet = WalletManager.shared.currentWallet else {
             throw KasiaError.walletNotFound
@@ -1177,7 +1188,7 @@ final class PublicChatService: ObservableObject {
         let payload = KasiaTransactionBuilder.buildPublicChatPayload(channel: channel, content: payloadText)
         let utxos = try await ChatService.shared.fetchUtxosWithFallback(for: wallet.publicAddress)
         guard !utxos.isEmpty else {
-            throw KasiaError.networkError("No spendable UTXOs")
+            throw KasiaError.networkError(Self.notEnoughKasMessage)
         }
         return KasiaTransactionBuilder.estimatePublicChatFee(
             payload: payload,
@@ -1217,7 +1228,7 @@ final class PublicChatService: ObservableObject {
         let channel = PublicChatChannelName.normalize(rawChannel)
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard PublicChatChannelName.isValid(channel) else {
-            throw KasiaError.networkError("Invalid channel name")
+            throw KasiaError.networkError(AppLocalization.string("Something went wrong. Please try again."))
         }
         guard !trimmed.isEmpty else { return nil }
         guard let wallet = WalletManager.shared.currentWallet else {
@@ -1227,7 +1238,9 @@ final class PublicChatService: ObservableObject {
             throw SenderChangedError()
         }
         guard let privateKey = WalletManager.shared.getPrivateKey() else {
-            throw KasiaError.keychainError("Could not get private key")
+            // Said in the app's language: it reaches the chess toasts as it is
+            // (`friendlySendErrorMessage`).
+            throw KasiaError.keychainError(AppLocalization.string("Private key unavailable."))
         }
 
         // If replying, wrap the content in the shared reply envelope (matches Android's
@@ -1659,7 +1672,9 @@ final class PublicChatService: ObservableObject {
     /// Node-level rejection text ("transaction ... is an orphan, where orphan is disallowed",
     /// "already spent", ...) means "the network hasn't caught up with your previous send yet" -
     /// meaningless and alarming to a user mid-typing. Map it (after retries are exhausted) to a
-    /// plain-language message; anything unrecognized passes through unchanged.
+    /// plain-language message. Everything else - a node's or the API's raw text included - goes
+    /// through `UserFacingError.message`, which says it in the app's language; this is what the
+    /// chess toasts show (`ChessTournamentService.send`).
     static func friendlySendErrorMessage(for error: Error) -> String {
         let raw = error.localizedDescription
         let lower = raw.lowercased()
@@ -1667,6 +1682,21 @@ final class PublicChatService: ObservableObject {
             return AppLocalization.string("The network is still confirming your previous send. Please try again in a few seconds.")
         }
         if lower.contains("insufficient funds") { return notEnoughKasMessage }
+        // The app's own errors whose English description `UserFacingError` passes on as it is.
+        if let kasia = error as? KasiaError {
+            switch kasia {
+            case .walletNotFound:
+                return AppLocalization.string("Account not found. Please create or import an account.")
+            case .invalidAddress:
+                return AppLocalization.string("Invalid Kaspa address format.")
+            case .keychainError:
+                return AppLocalization.string("Private key unavailable.")
+            case .unknownError:
+                return AppLocalization.string("Something went wrong. Please try again.")
+            default:
+                break
+            }
+        }
         // The app's own sentence as it was written, without "Network error: " in front - which
         // `handleSendFailure`'s wrapping then doubled. That's how a builder's message (no coins
         // on the chatting address, a balance spread over too many small coins to fit one

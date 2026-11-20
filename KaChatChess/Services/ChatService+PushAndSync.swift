@@ -19,50 +19,14 @@ extension ChatService {
     /// Called at the end of sync to trigger deferred resubscription if needed
     // MARK: - Push Notification Message Handling
 
-    /// Add a message that was decrypted by the notification extension or fetched from push
-    struct ChatHistoryImportSummary {
-        let conversationCount: Int
-        let messageCount: Int
-        let filledSentContentCount: Int
-    }
-
-    /// Stage events emitted by `importChatHistoryArchive` so the restore progress modal can
-    /// show a determinate bar. `.importing` advances per conversation as the Core Data write
-    /// in `MessageStore.syncFromConversations` progresses (real work, not simulated).
-    enum ChatHistoryImportProgress {
-        case validating
-        case preparing
-        case importing(done: Int, total: Int)
-        case finalizing
-    }
-
-    enum ChatHistoryArchiveError: LocalizedError {
-        case encryptionKeyUnavailable
-        case unsupportedVersion(Int)
-        case emptyArchive
-        case remoteBackupUnreadable
-        case remoteBackupIncompatible(Int)
-        case remoteBackupForeignWallet
-
-        var errorDescription: String? {
-            switch self {
-            case .encryptionKeyUnavailable:
-                return "Failed to access wallet encryption key."
-            case .unsupportedVersion(let version):
-                return "Unsupported chat history format (version \(version))."
-            case .emptyArchive:
-                return "No messages found in the selected archive."
-            case .remoteBackupUnreadable:
-                return "The file already on the server isn't a KaChat backup. Nothing was uploaded and it was left untouched. Pick a different backup folder."
-            case .remoteBackupIncompatible(let version):
-                return "The backup already on the server uses schema version \(version), which this version can't merge. Nothing was uploaded and it was left untouched."
-            case .remoteBackupForeignWallet:
-                return "The backup already on the server belongs to a different wallet. Nothing was uploaded. Choose a separate backup folder for this account."
-            }
-        }
-    }
-
     func maybeRunCatchUpSync(trigger: CatchUpSyncTrigger, force: Bool = false) async {
+        // KaPlay has no chats: a catch-up is KaChat's chat sync (handshakes, messages, payments
+        // into chats, which can add contacts that join the UTXO subscription). The balance is
+        // refreshed when the subscription comes back (`scheduleBalanceRefreshAfterSubscriptionEnabled`).
+        guard Self.syncsChats else {
+            AppLog.log("[ChatService] Skipping catch-up sync (%@) - no chats to sync", trigger.rawValue)
+            return
+        }
         refreshPushReliabilityPrerequisites()
 
         let shouldDebounce = !force &&
@@ -258,7 +222,13 @@ extension ChatService {
                 // tick after returning to the foreground syncs promptly; it just does no
                 // network work while the app is not active (same gate as the open-chat poll).
                 guard UIApplication.shared.applicationState == .active else { continue }
-                await self.fetchNewMessages()
+                if Self.syncsChats {
+                    await self.fetchNewMessages()
+                } else {
+                    // KaPlay has no chats to sync: while the subscription is down, the poll keeps
+                    // the chatting address's balance (what moves are paid from) current.
+                    _ = try? await WalletManager.shared.refreshBalance(force: true)
+                }
             }
         }
     }
@@ -650,54 +620,6 @@ extension ChatService {
         try await Task.detached(priority: .userInitiated) {
             try JSONDecoder().decode(T.self, from: data)
         }.value
-    }
-
-}
-
-// MARK: - Shared-file backup merge (upload side)
-//
-// Mirrors Android's `ChatHistoryExportImportService.mergeArchives` and desktop's
-// `mergeChatArchives`, including the abort-rather-than-destroy contract. Everything here is
-// untyped JSON-tree work on purpose: round-tripping through the typed `ChatHistoryArchive`
-// model would silently drop every key this app doesn't model - desktop keeps its whole state
-// in an additive `desktopState` key - and wipe it on the next iOS backup. Unknown keys at the
-// archive, conversation and message level are all carried through verbatim.
-extension ChatService {
-    private nonisolated static let archiveStatusPriority: [String: Int] = [
-        "pending": 0, "warning": 1, "failed": 2, "sent": 3,
-    ]
-    private nonisolated static let archiveValidMessageTypes: Set<String> = [
-        "handshake", "contextual", "payment", "audio",
-    ]
-    private nonisolated static let archiveValidDeliveryStatuses: Set<String> = [
-        "pending", "sent", "failed", "warning",
-    ]
-
-    // MARK: JSON accessors (tolerant of NSNumber/String cross-typing)
-
-    private nonisolated static func jsonString(_ dict: [String: Any], _ key: String) -> String {
-        if let value = dict[key] as? String { return value }
-        return ""
-    }
-
-    // MARK: Deterministic archive UUIDs
-
-    // MARK: Message-level merge helpers
-
-    private final class ArchiveConversationMerge {
-        let contactAddress: String
-        var base: [String: Any]
-        var conversationId = ""
-        var contactAlias = ""
-        var contactPhoto = ""
-        var unreadCount: Int64 = 0
-        var messages: [String: [String: Any]] = [:]
-        var messageOrder: [String] = []
-
-        init(contactAddress: String, base: [String: Any]) {
-            self.contactAddress = contactAddress
-            self.base = base
-        }
     }
 
 }

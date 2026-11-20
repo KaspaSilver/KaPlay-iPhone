@@ -32,6 +32,8 @@ struct CreatePaymentRequestView: View {
     @State private var isWorking = false
     @State private var errorMessage: String?
     @State private var shareItem: ShareURL?
+    /// The request shown as a QR (Show Request As QR).
+    @State private var qrRequest: PaymentRequest?
 
     private struct ShareURL: Identifiable {
         let url: URL
@@ -85,6 +87,9 @@ struct CreatePaymentRequestView: View {
             }
             .sheet(item: $shareItem) { item in
                 PaymentRequestShareSheet(url: item.url)
+            }
+            .sheet(item: $qrRequest) { request in
+                PaymentRequestQRSheet(request: request)
             }
         }
     }
@@ -185,7 +190,10 @@ struct CreatePaymentRequestView: View {
     private var reviewStep: some View {
         SendStepScreen(title: Text("Review"), onBack: { go(to: .amount) }, onCancel: { dismiss() },
                        continueTitle: copied ? "Copied" : "Copy Payment Request",
-                       canContinue: canMake && !isWorking) {
+                       canContinue: canMake && !isWorking,
+                       secondaryTitle: "Show Request As QR",
+                       secondaryIcon: "qrcode",
+                       onSecondary: showQR) {
             copy()
         } content: {
             ScrollView {
@@ -315,6 +323,18 @@ struct CreatePaymentRequestView: View {
         }
     }
 
+    /// Show Request As QR: the same signed request Copy and Share give (and the same reserved
+    /// fresh address), as a code to scan with a phone's camera.
+    private func showQR() {
+        isWorking = true
+        errorMessage = nil
+        Task {
+            defer { isWorking = false }
+            guard let request = await makeRequest() else { return }
+            qrRequest = request
+        }
+    }
+
     private func share() {
         isWorking = true
         errorMessage = nil
@@ -322,6 +342,77 @@ struct CreatePaymentRequestView: View {
             defer { isWorking = false }
             guard let request = await makeRequest(), let url = URL(string: request.shareURLString) else { return }
             shareItem = ShareURL(url: url)
+        }
+    }
+}
+
+/// A payment request as a QR, as in KaChat. Scanned with an iPhone's camera it opens KaPay on
+/// Send, filled in (`kapay://pay/...`, the scheme KaPay takes requests on). A request to your
+/// chatting address is paid as a chat payment, which only KaChat makes, so that one holds the
+/// kachat.app link instead, which opens KaChat.
+private struct PaymentRequestQRSheet: View {
+    let request: PaymentRequest
+    @Environment(\.dismiss) private var dismiss
+    @State private var image: UIImage?
+
+    private var payload: String {
+        request.toChattingAddress ? request.shareURLString : "kapay://pay/\(request.linkTail)"
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 18) {
+                    VStack(spacing: 4) {
+                        Text(verbatim: "\(KaspaUnit.plain(request.amountSompi)) \(KaspaUnit.symbol)")
+                            .font(.system(size: 34, weight: .bold, design: .rounded))
+                            .monospacedDigit()
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.5)
+                        let memo = request.memo.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !memo.isEmpty {
+                            Text(verbatim: memo)
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                                .multilineTextAlignment(.center)
+                        }
+                    }
+                    .padding(.top, 8)
+
+                    Group {
+                        if let image {
+                            Image(uiImage: image)
+                                .interpolation(.none)
+                                .resizable()
+                                .scaledToFit()
+                        } else {
+                            ProgressView()
+                        }
+                    }
+                    .frame(width: 260, height: 260)
+                    .padding(16)
+                    // white, with a quiet zone, so every camera reads it in dark mode too
+                    .background(RoundedRectangle(cornerRadius: 20, style: .continuous).fill(Color.white))
+
+                    Text(request.toChattingAddress
+                         ? "Scan it with an iPhone's camera to pay in KaChat, with everything filled in."
+                         : "Scan it with an iPhone's camera to pay in KaPay, with everything filled in.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 24)
+                .frame(maxWidth: .infinity)
+            }
+            .navigationTitle("Payment Request")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .task { image = ZeroBalanceFundingCardView.makeAddressQRCode(from: payload) }
         }
     }
 }

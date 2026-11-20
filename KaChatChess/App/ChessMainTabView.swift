@@ -6,7 +6,9 @@ import SwiftUI
 struct ChessMainTabView: View {
     enum Tab: Hashable { case play, leaderboard, wallet, settings }
 
-    @EnvironmentObject private var chatService: ChatService
+    /// Not observed: the dock only starts polling with it, and observing it re-rendered the
+    /// whole TabView on every change it publishes.
+    private var chatService: ChatService { ChatService.shared }
     @EnvironmentObject private var walletManager: WalletManager
     @State private var selection: Tab = .play
     @ObservedObject private var links = ChessBotLinkRouter.shared
@@ -49,7 +51,7 @@ struct ChessMainTabView: View {
     }
 }
 
-/// The Leaderboard tab: three squares, each opening its own page. 1v1 and Tournaments are a board
+/// The Leaderboard tab: three rows, each opening its own page. 1v1 and Tournaments are a board
 /// for this month or all time (`ChessLeaderboardPage`); Bots is a board per bot
 /// (`ChessBotLeaderboardsView`).
 struct ChessLeaderboardTabView: View {
@@ -59,10 +61,10 @@ struct ChessLeaderboardTabView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                HStack(spacing: 12) {
-                    ChessLeaderboardSquare(title: "1v1", icon: "person.2.fill") { openMode = .duel }
-                    ChessLeaderboardSquare(title: "Tournaments", icon: "trophy.fill") { openMode = .tournament }
-                    ChessLeaderboardSquare(title: "Bots", icon: "cpu") { openBots = true }
+                VStack(spacing: 12) {
+                    ChessLeaderboardLink(title: "1v1", icon: "person.2.fill") { openMode = .duel }
+                    ChessLeaderboardLink(title: "Tournaments", icon: "trophy.fill") { openMode = .tournament }
+                    ChessLeaderboardLink(title: "Bots", icon: "cpu") { openBots = true }
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
@@ -103,7 +105,8 @@ private struct ChessLeaderboardPage: View {
             ChessLeaderboardRows(mode: mode)
         }
         .listStyle(.insetGrouped)
-        .refreshable { service.refreshIndexerLeaderboards() }
+        // Past the 20 s throttle, and the spinner stays until the boards are in.
+        .refreshable { await service.refreshIndexerLeaderboardsNow() }
         .fixedScreenTitle(title)
         .background(Color(.systemGroupedBackground))
         .navigationTitle(title)

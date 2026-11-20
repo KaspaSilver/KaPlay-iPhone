@@ -249,7 +249,8 @@ struct GlobalNotificationListView: View {
 /// move's change, a send's change, a compound, a .kachat name transaction and anything another app
 /// on the same seed sends stay out. A transaction that can't be read isn't shown: a missed row is
 /// better than a wrong one. One row per transaction, its amount the REST transaction's own outputs
-/// to the chatting address summed, never the node's batch alone (one node's word).
+/// to the chatting address summed, shown only when it equals what the node's batch added there for
+/// that transaction (neither source alone).
 @MainActor
 final class WalletReceiptNotifier {
     static let shared = WalletReceiptNotifier()
@@ -270,17 +271,24 @@ final class WalletReceiptNotifier {
         // No batch-level "we spent a coin, so skip it all": every chess move spends a chatting-address
         // coin, and a payment arriving in the same batch would be lost. Each transaction is judged
         // alone: this app's own sends by txid here, anything else by its inputs (`confirmAndRecord`).
-        // the batch only says which transactions paid the chatting address; what they paid is read
-        // from each transaction itself (`confirmAndRecord`)
+        // The batch says which transactions paid the chatting address and what the node added for
+        // each (its coins to the chatting address, each outpoint counted once); the transaction itself
+        // is read too (`confirmAndRecord`), and a row needs both to agree.
         var txIds: [String] = []
-        for entry in parsed.added where !entry.isCoinbase && entry.address?.lowercased() == wallet.lowercased()
-            && !txIds.contains(entry.transactionId) {
-            txIds.append(entry.transactionId)
+        var nodeAmounts: [String: UInt64] = [:]
+        var seenOutpoints: Set<String> = []
+        var overflowed: Set<String> = []
+        for entry in parsed.added where !entry.isCoinbase && entry.address?.lowercased() == wallet.lowercased() {
+            if !txIds.contains(entry.transactionId) { txIds.append(entry.transactionId) }
+            guard seenOutpoints.insert("\(entry.transactionId):\(entry.outputIndex)").inserted else { continue }
+            let (sum, overflow) = (nodeAmounts[entry.transactionId] ?? 0).addingReportingOverflow(entry.amount)
+            if overflow { overflowed.insert(entry.transactionId) } else { nodeAmounts[entry.transactionId] = sum }
         }
         for txId in txIds where !handled.contains(txId) {
             handled.insert(txId)
-            guard !ChatService.shared.isKnownOutgoingAttemptTxId(txId) else { continue }
-            Task { await self.confirmAndRecord(txId: txId, wallet: wallet) }
+            guard !ChatService.shared.isKnownOutgoingAttemptTxId(txId),
+                  !overflowed.contains(txId), let nodeAmount = nodeAmounts[txId], nodeAmount > 0 else { continue }
+            Task { await self.confirmAndRecord(txId: txId, wallet: wallet, nodeAmount: nodeAmount) }
         }
     }
 
@@ -288,7 +296,8 @@ final class WalletReceiptNotifier {
         WalletManager.shared.currentWallet?.publicAddress == wallet
     }
 
-    private func confirmAndRecord(txId: String, wallet: String) async {
+    /// `nodeAmount`: what the node's batch added to the chatting address for this transaction.
+    private func confirmAndRecord(txId: String, wallet: String, nodeAmount: UInt64) async {
         // The API can be a moment behind the node: asked again a few times.
         var transaction: KaspaFullTransactionResponse?
         for attempt in 0..<4 {
@@ -316,6 +325,13 @@ final class WalletReceiptNotifier {
         }
         guard amount > 0 else {
             AppLog.log("[WalletReceipt] %@ pays nothing to the chatting address by its outputs; not shown", String(txId.prefix(12)))
+            return
+        }
+        // Two sources, one amount: the REST transaction's outputs and the node's own added coins. A
+        // disagreement (a wrong or partial answer from either) shows nothing rather than a wrong sum.
+        guard amount == nodeAmount else {
+            AppLog.log("[WalletReceipt] %@: REST says %@, node says %@; not shown", String(txId.prefix(12)),
+                       Self.formatKas(amount), Self.formatKas(nodeAmount))
             return
         }
         // the words are written when the row is shown (`Entry.displayTitle`); these are the fallback
@@ -381,7 +397,8 @@ struct OwnAddressHistorySheet: View {
                 case nil:
                     ProgressView()
                 case .chatting?:
-                    ChattingAddressManageView(address: address)
+                    // the Wallet tab's view of it: History, Receive and Send; no UTXOs, Domains or keys
+                    ChattingAddressManageView(address: address, chattingOnly: true)
                 case .spending(let entry)?:
                     SpendingAddressTransactionHistoryView(entry: entry)
                 case .unreadable?:

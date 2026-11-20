@@ -40,18 +40,6 @@ final class ReadStatusSyncManager: ObservableObject {
 
     private init() {}
 
-    /// Run one-time migration from CDConversation read status to CDReadMarker.
-    /// Call this after the store is loaded and wallet is set.
-    func runMigrationIfNeeded() {
-        guard let deviceId = KeychainService.shared.currentDeviceId() else { return }
-        guard MessageStore.shared.isStoreLoaded else { return }
-        guard MessageStore.shared.currentWalletAddress != nil else { return }
-
-        Task.detached(priority: .background) {
-            MessageStore.shared.migrateToReadMarkersIfNeeded(deviceId: deviceId)
-        }
-    }
-
     // MARK: - Public API
 
     /// Record a read event for a conversation.
@@ -100,39 +88,6 @@ final class ReadStatusSyncManager: ObservableObject {
         return (marker.lastReadTxId, marker.lastReadBlockTime)
     }
 
-    /// Called when user leaves a conversation. Immediately flushes pending read marker.
-    /// - Parameter contactAddress: Contact address of the conversation being exited
-    func userLeftConversation(_ contactAddress: String) {
-        // Cancel idle timer
-        idleTimers[contactAddress]?.invalidate()
-        idleTimers.removeValue(forKey: contactAddress)
-
-        // Flush immediately
-        flushMarker(for: contactAddress)
-    }
-
-    /// Force flush all pending read markers immediately.
-    /// Call this when app is going to background.
-    func flushAllPending() {
-        guard !pendingMarkers.isEmpty else { return }
-
-        AppLog.log("[ReadStatusSync] Flushing all %d pending read markers", pendingMarkers.count)
-
-        // Cancel all idle timers
-        for timer in idleTimers.values {
-            timer.invalidate()
-        }
-        idleTimers.removeAll()
-
-        // Flush all pending markers
-        let markers = pendingMarkers
-        pendingMarkers.removeAll()
-
-        for (_, marker) in markers {
-            persistReadMarker(marker)
-        }
-    }
-
     // MARK: - Legacy API (for backwards compatibility during migration)
 
     /// Legacy method - redirects to new recordRead API.
@@ -149,26 +104,6 @@ final class ReadStatusSyncManager: ObservableObject {
 
         // Also record the per-device marker
         recordRead(contactAddress: contactAddress, lastReadTxId: lastReadTxId, lastReadBlockTime: lastReadBlockTime)
-    }
-
-    /// Awaitable version of `markAsRead` - see `MessageStore.updateReadStatusAndWait`'s doc
-    /// comment. `recordRead`'s own per-device marker write stays fire-and-forget (debounced by
-    /// design; the local read cursor above is this device's single source of truth for its
-    /// badge, and that is the write a force-quit must not lose).
-    func markAsReadAndWait(contactAddress: String, lastReadTxId: String?, lastReadBlockTime: UInt64) async {
-        let blockTime = Int64(lastReadBlockTime)
-        await MessageStore.shared.updateReadStatusAndWait(
-            contactAddress: contactAddress,
-            lastReadTxId: lastReadTxId,
-            lastReadBlockTime: blockTime,
-            lastReadAt: Date()
-        )
-        recordRead(contactAddress: contactAddress, lastReadTxId: lastReadTxId, lastReadBlockTime: lastReadBlockTime)
-    }
-
-    /// Legacy method name - kept for backwards compatibility
-    func flushPendingUpdates() {
-        flushAllPending()
     }
 
     // MARK: - Private Helpers

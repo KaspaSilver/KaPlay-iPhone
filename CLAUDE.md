@@ -9,31 +9,45 @@ what people read says KaPlay) is chess on Kaspa as its own iPhone app: every mov
 transaction. What the app does and where it came from: [README.md](README.md). The protocol:
 [ONLINE_CHESS.md](ONLINE_CHESS.md).
 
-Tabs (`ChessMainTabView.Tab`): Play, Leaderboard, Wallet (`Views/Wallet/WalletViews.swift`),
+Tabs (`ChessMainTabView.Tab`): Play, Leaderboard, Wallet (`Views/Wallet/ChessWalletView.swift`),
 Settings. Play opens on `GamesView`, a card per game; Chess is the only one so far and opens
 `ChessHomeView`. A new game is one more card there.
 
-The Wallet tab (`ChessWalletView`, `Views/Wallet/WalletViews.swift`) is KaPay's Wallet tab
-(`ProfileView` there; every app has KaPay's full wallet, owner's call 2026-11-07), in KaPlay's look:
-the fixed title with the backup banner, `BalanceToolbarLabel` (the chatting address) in the bar,
-`ConnectionStatusIndicator` left and the bell right. The total balance split into Chatting and
-Spending (`WalletBalanceCard`, the spending part from `HotWalletBalance`), Send, Receive (a fresh
-address, `ReceiveKaspaQRView`) and Request (`CreatePaymentRequestView`, `Views/Shared/PaymentRequestViews.swift`:
-Fresh Address or Choose an Address), Backup Hygiene when due, the Manage Addresses square
-(`Views/Wallet/ManageAddressesView.swift`: spending addresses numbered from #1 with
-`WalletManager.addressNumber`, Discover Addresses, Address Visibility, each address's history,
-UTXOs, Domains, Send, compound and private key; its Chatting Address row opens
-`ChattingAddressManageView`, with `AddressOptionsButton` top right opening `AddressActionsSheet` for the keys and explorer, as every single-address page has, and Compound under UTXOs)
-and the Chatting Address square (its QR), then Your Domains (`KNSDomainsListView`: .kachat, .kas,
-.k, .kaspa; a .kas domain's detail has Set as Primary, Customize Profile (`KNSProfileEditorSheet`)
-and Send (`KNSDomainSendView`); .kachat names open `KachatLiveNameDetail`, `Views/Ecosystem/`),
-and Help (`ProfileHelpView`, the .kachat names guide). Left out from KaPay: Portfolio, Cold Storage,
-the .kachat marketplace (so Your Domains > .kachat has no Inscribe, a name's detail has no Buy,
-Offer or List for Sale, and transactions open the explorer with no Add to Portfolio) and Contacts (owner's call, 2026-11-07: someone who wants saved
-contacts uses KaChat or KaPay, so KaPlay has no Address Book, Contacts pill or contact photos).
+The Wallet tab (`ChessWalletView`, `Views/Wallet/ChessWalletView.swift`) is the chatting address
+only (owner's call, 2026-11-19, replacing KaPay's full wallet from 2026-11-07): the fixed title with
+the backup banner, `BalanceToolbarLabel` in the bar, `ConnectionStatusIndicator` left and the bell
+right, then `ChattingAddressManageView` (generic over its header) with `ChessWalletHeader`: the
+chatting address's balance card (tap to copy, fiat on mainnet), a quiet line when spending addresses
+still hold Kaspa ("… on your other addresses. Manage them in KaPay.", `HotWalletBalance` read once on
+appear), Backup Hygiene when due, the testnet faucet, its History (each transaction opens the
+explorer; reloaded 1.5 s after the chatting address's own UTXO activity while on screen, marked dirty
+while hidden, at most every 30 s on appear, an older or cancelled read never replacing rows shown),
+and Receive (`ChattingAddressQRView` on KaPay's
+receive screen, `AddressReceiveView`: the Kaspa logo and "Chatting Address", the balance, the QR on a
+white card, the whole address, the orange note that it shows your .kachat name, tap anywhere to copy,
+then a notes card: Kaspa and kUSDT can be sent here, and what moves cost) and Send
+(`WithdrawKaspaView` with `lockedSource: .chatting`, so no From step) at the bottom
+(`ChattingAddressActionBar`; until the coins load, Send and Receive use the wallet's live balance,
+and a failed coin read shows Try Again). The bell's Received row opens the same chatting-only screen
+(`chattingOnly: true`). No spending
+addresses, Request, Manage Addresses, Your Domains, UTXOs tab or keys there: those are KaPay's. The
+old full wallet is `FullWalletView` in WalletViews.swift, kept but never shown, with the screens
+only it opens (`ManageAddressesView`, `CreatePaymentRequestView` with Show Request As QR,
+`KNSDomainsListView`); bring it back by pointing `ChessMainTabView` at it.
+
+.kachat names are display only, as in KaChat (owner's call, 2026-11-18: claiming, renewing,
+selling, transferring, buying and offers are KaPay's only). A bell row opens `KachatNameRouteView`:
+the name's card and "Renew, sell or transfer it in KaPay.", or for a free name "Get a .kachat domain"
+(`KachatNamesInfo.pageURL`, home.kachat.app/kachat/). In the unshown full wallet, Your Domains >
+.kachat and each address's .kachat tab are plain cards too. The .kachat write screens are deleted
+(2026-11-20); `KachatNamesActions` keeps only the read side and `resume()`, which
+`KaChatChessApp.handleScenePhaseChange` runs on every activation so a claim begun before 2026-11-18
+still finishes. KaPlay schedules no renewal reminders (`KachatNameReminders.removeLegacyOnce()`
+clears old ones) and the bell has no offer rows. KaPlay has no
+Contacts (owner's call, 2026-11-07: someone who wants saved contacts uses KaChat or KaPay).
 
 Account removal clears what the app keeps per account, on both networks' addresses: the bell and
-what it compares against, .kachat reminders and saved names, the balance cache, added date, address
+what it compares against, saved .kachat names, the balance cache, added date, address
 choice, bot games, the arena's pending stamps (`publicChatLocalStampSentAt`), pending .kachat commit
 salts and the passphrase flag (`WalletManager.removeWalletTabData`), and the spending data. The bell (`GlobalNotificationCenter`) lists .kachat news
 (`KachatNamesNotifier`) and Kaspa received on the chatting address from someone else
@@ -55,8 +69,8 @@ the bar.
 ## Bots and the Leaderboard tab
 
 Bot games are free while played and stamped on chain once, when they end (`ChessBotGame`,
-ONLINE_CHESS.md §7); online games stay on chain move by move. The Leaderboard tab has three squares
-(`ChessLeaderboardSquare`), each opening its own page: 1v1 and Tournaments their board
+ONLINE_CHESS.md §7); online games stay on chain move by move. The Leaderboard tab has three rows
+(`ChessLeaderboardLink`: the icon in a circle, the name and a chevron), each opening its own page: 1v1 and Tournaments their board
 (`ChessLeaderboardPage`), Bots `ChessBotLeaderboardsView`, a board per played bot ranked by fewest
 moves to win (`ChessBotLeaderboardService`). A stamped win can be shared to KaPost, and the post's Challenge
 button opens KaPlay (`ChessBotLinks`, ONLINE_CHESS.md §7.2).
@@ -163,6 +177,11 @@ backup strip. The App ID needs Near Field Communication Tag Reading on.
 Settings is KaChat's alphabetical cards: About (created date, version, website, support email, the
 privacy policy at home.kachat.app/privacy/, licenses), Account Name, Back Up Account (Complete Your
 Backup while owed, View 12 or 24 Words, Back Up to NFC Card), Connection, Customization, Security.
+Connection > Connection Settings (`ConnectionSettingsView`) is KaPay's cards, each opening its own
+screen (`page`) with its host or node under the name: Chess (the arena's indexer,
+`publicChatIndexerURL`), Node (saves as you pick, no Save), Domains (the .kachat Indexer URL,
+`indexerURL`, and "Reading names from" the indexer or the chain; then the other name services) and
+Explorer (the REST API). KaPay's Push and Trestly cards are KaPay's only.
 Below them Delete Account (`DeleteAccountSheet`, the warning the sign-in screen's Delete also shows)
 and Log Out, which KaChat keeps on Profile and KaPlay has no Profile for. Every sign-in gets new tabs
 (`ContentView`'s `signInSession`), opening on Play. Biometrics for Account Login is off by default,
@@ -171,11 +190,16 @@ and existing installs were switched off once (`AppSettings.accountLoginBiometric
 Face ID, as in KaChat (the owner's call, 2026-11-13): Kaspa sends never ask; the swipe sends at
 once, and `startSending` switching to `.sending` is the double-send guard. `DeviceAuth` still asks on
 both Delete Account sheets, the keys-missing screen's Remove, Send Domain, the KNS profile and
-primary-domain saves, .kachat name transactions (`KachatTxSheet` passes `authReason`, the only case
-the swipe asks; declined, it settles back filled in), and revealing the seed phrase or private keys.
+primary-domain saves (in the unshown full wallet), and revealing the seed phrase. Settings has no
+"Biometrics for Address Private Keys" switch any more: no private key is shown in KaPlay.
+`SwipeUpToSendScrollView`'s `authReason` has no caller since the .kachat sheets went.
 Chess moves and messages don't ask. A
 send a node may have taken without answering ends on "Not confirmed" with only Done
-(`SendOutcomeUnknownError`), never Try Again, which could pay twice.
+(`SendOutcomeUnknownError`), never Try Again, which could pay twice. The next send to that address
+is refused while it's unresolved (`refuseWhileSendUnresolved`); it says "went through" only when the
+network or the REST API holds that transaction, never because a coin was spent (a later move can
+spend it after the 600 s hold), and the record is dropped once the coins are unspent, REST says it
+doesn't have it, or 30 minutes pass.
 
 ## Send Kaspa
 
@@ -205,12 +229,13 @@ KaPay's.
    typed on the keypad, never under the network's minimum); Confirm goes back to the review.
 
 Where each screen uses them: `WithdrawKaspaView` (`Views/Wallet/WalletViews.swift`) is the Wallet
-tab's Send (To → From → Amount → Review), the chatting address's own Send (From fixed), a pasted payment request (its address and amount fixed) and Compound UTXOs, which opens on the
+tab's Send (the chatting address's own, From fixed: To → Amount → Review; the From step is only
+in the unshown full wallet), a pasted payment request (its address and amount fixed) and Compound UTXOs, which opens on the
 review. A pre-filled recipient opens on From. A spending address's Send and compound are
 `SpendingAddressWithdrawView` (Manage Addresses). Coin Control greys out what a send can't spend
 (`CoinControlView.hotWalletReason`: the chatting address's rule, or a spending address's, which can
-spend a mature mining reward). The .kachat transactions are `KachatTxSheet` (swipe up with its own
-Face ID reason, `authReason`; a Kaspa send has none and asks nothing).
+spend a mature mining reward). Max puts the exact sompi in the field (`KaspaFiatAmountState.setMaxSompi`),
+and typing after Max drops a Max answer still on its way.
 Prices come from `KaspaPriceStore` (KaPay's pieces read `PortfolioViewModel`). A price over 30
 minutes old is never used to turn a currency amount into KAS: the switch hides (on testnet always),
 and send screens call `refreshIfStale()`. Your main address is the "Chatting Address", as in KaPay.
@@ -245,7 +270,25 @@ and be at most 600 DAA behind the median. Keychain saves update in place and add
 so a failed write keeps the old copy. A .kachat claim follows whichever commit send landed, counts a
 late register as registered, and declines open offers only once a transfer or release is in a block;
 server-supplied times and counts are range-checked, never trapping. The bell's Received amount comes
-from the REST transaction's outputs to the chatting address, and nothing is shown when it can't be read.
+from the REST transaction's outputs to the chatting address and must equal the node's own UTXO batch
+for that transaction; nothing is shown when they disagree or it can't be read.
+
+Errors reach people through `UserFacingError.message` (Models.swift): node-pool, connection, API and
+builder failures map to translated sentences by their text, which stays English underneath for the
+code that matches on it (`isNotSentError`, "Not confirmed").
+
+Reinstalling keeps Keychain accounts but not UserDefaults: a launch with no `kaplay_has_launched_v1`
+marker, no earlier app data and a saved wallet opens logged out, and the first saved-account sign-in
+asks `DeviceAuth` even with Biometrics for Account Login off (`requiresDeviceAuthAfterReinstall`).
+Importing doesn't scan spending addresses (`discoverSpendingAddresses` is kept for the full wallet).
+KaChat message sync never runs (`ChatService.syncsChats` gates catch-up, fallback polling and the
+unresolved-sender syncs); the fallback poll refreshes the balance instead.
+
+The arena's 1 Hz clock is `ChessClock.shared.now`, observed only by clocks and countdowns;
+`ChessTournamentService` keeps derived lists (`myActiveTournament`, `liveTournaments`,
+`finishedTournaments`, `isBusyOnline` …) as cached values recomputed when tournaments, the account
+or a time-based state (`timeRevision`) change, and the board is an `Equatable` view. The clock loop
+pauses in the background and the 2 s fast poll runs only while active; both catch up on return.
 
 ## Build
 

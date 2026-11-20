@@ -75,7 +75,7 @@ struct NFCCardRestoreView: View {
 
     private func show(_ error: Error) {
         if case NFCCardError.cancelled = error { return }
-        errorMessage = error.localizedDescription
+        errorMessage = UserFacingError.message(for: error)
     }
 
     @MainActor
@@ -92,7 +92,7 @@ struct NFCCardRestoreView: View {
                 if !current.pinSet { throw NFCCardError.noPIN }
                 if !current.hasBackup { throw NFCCardError.noBackup }
                 try await connection.verifyPIN(enteredPIN)
-                return try await connection.readBackup()
+                return try await connection.readBackup(maxBytes: current.maxBackup)
             }
             payload = try await Task.detached(priority: .userInitiated) {
                 try NFCCardBackupFormat.open(backup, pin: enteredPIN)
@@ -148,10 +148,7 @@ struct NFCCardRestoreView: View {
             )
             // Same as typing the words: whoever restored it has the seed.
             AccountBackupStatus.shared.markConfirmed(wallet.publicAddress)
-            Task {
-                await walletManager.discoverSpendingAddresses()
-                await HotWalletBalance.shared.refresh(force: true)
-            }
+            // no spending-address sweep: see `WalletManager.importWallet(from:alias:...)`
         } catch {
             ChatService.shared.releaseSyncForOnboarding()
             throw error

@@ -2813,37 +2813,80 @@ extension ChatService {
         unresolvedSends = sends
     }
 
+    /// How long an undecided send may keep refusing a repeat when the network can't be asked
+    /// whether it holds it (no answer from the REST API): after this it's dropped silently.
+    static let unresolvedSendAskLimit: TimeInterval = 1800
+
     /// Reserving coins alone can't stop a repeat paying twice: it would pick other coins and both
     /// could land. So before a send to someone a "Not confirmed" send went to, that send is looked
-    /// up. Landed: the person is told once, and sending again after that is what they meant.
-    /// Still undecided: nothing goes out. Never landed (the network doesn't have it and, after the
-    /// hold, every coin is still unspent): its coins are released and the send goes ahead.
+    /// up. Landed (the network has that very transaction: a mempool, or accepted by the REST API):
+    /// the person is told once, and sending again after that is what they meant. Still undecided:
+    /// nothing goes out. Never landed (after the hold, every coin still unspent, or the REST API
+    /// says it doesn't have it): its coins are released and the record dropped without a word.
+    ///
+    /// A coin gone from the list is no proof it landed: once the hold is over the coins are free
+    /// again and later moves spend them. So only the transaction id decides "went through".
     func refuseWhileSendUnresolved(to recipient: String) async throws {
         let lowered = recipient.lowercased()
         for send in unresolvedSends {
-            let landed: Bool
             if await NodePoolService.shared.networkHasTransaction(send.txId) {
-                landed = true
-            } else if let listed = try? await NodePoolService.shared.getUtxosByAddresses([send.source]) {
-                let unspent = Set(listed.map { outpointKey($0.outpoint) })
-                if send.outpointKeys.contains(where: { !unspent.contains($0) }) {
-                    landed = true
-                } else if Date().timeIntervalSince(send.sentAt) >= Self.unresolvedSendHold {
-                    for key in send.outpointKeys { reservedMessageOutpoints[key] = nil }
-                    unresolvedSends.removeAll { $0.txId == send.txId }
-                    continue
-                } else {
-                    landed = false
-                }
-            } else {
-                landed = false
+                unresolvedSends.removeAll { $0.txId == send.txId }
+                guard send.recipient == lowered else { continue }
+                throw KasiaError.networkError(AppLocalization.string(
+                    "Your last send to this address went through. Check your balance, then send again only if you meant to pay twice."))
             }
-            if landed { unresolvedSends.removeAll { $0.txId == send.txId } }
+            let age = Date().timeIntervalSince(send.sentAt)
+            var neverLanded = false
+            if age >= Self.unresolvedSendHold {
+                if let listed = try? await NodePoolService.shared.getUtxosByAddresses([send.source]) {
+                    let unspent = Set(listed.map { outpointKey($0.outpoint) })
+                    // every coin it would have spent is still there: it never went out
+                    neverLanded = send.outpointKeys.allSatisfy { unspent.contains($0) }
+                }
+                if !neverLanded {
+                    switch await restAcceptance(txId: send.txId) {
+                    case false?:
+                        // the network was asked and doesn't have it; its coins may since have paid
+                        // for other moves, which says nothing about this send
+                        neverLanded = true
+                    case true?:
+                        // accepted after all (the check above can miss it): as landed
+                        unresolvedSends.removeAll { $0.txId == send.txId }
+                        guard send.recipient == lowered else { continue }
+                        throw KasiaError.networkError(AppLocalization.string(
+                            "Your last send to this address went through. Check your balance, then send again only if you meant to pay twice."))
+                    case nil:
+                        // nobody answered: undecided, but not forever
+                        neverLanded = age >= Self.unresolvedSendAskLimit
+                    }
+                }
+            }
+            if neverLanded {
+                for key in send.outpointKeys { reservedMessageOutpoints[key] = nil }
+                unresolvedSends.removeAll { $0.txId == send.txId }
+                AppLog.log("[ChatService] Dropped the unconfirmed send %@: the network doesn't have it", String(send.txId.prefix(12)))
+                continue
+            }
             guard send.recipient == lowered else { continue }
-            throw KasiaError.networkError(AppLocalization.string(landed
-                ? "Your last send to this address went through. Check your balance, then send again only if you meant to pay twice."
-                : "Your last send to this address isn't confirmed yet. Wait a few minutes before sending again, so it can't pay twice."))
+            throw KasiaError.networkError(AppLocalization.string(
+                "Your last send to this address isn't confirmed yet. Wait a few minutes before sending again, so it can't pay twice."))
         }
+    }
+
+    /// The REST API's word on `txId`: true accepted, false unknown (404) or not accepted, nil when
+    /// it didn't answer.
+    private func restAcceptance(txId: String) async -> Bool? {
+        guard let url = kaspaRestURL(path: "/transactions/\(txId)", queryItems: [
+            URLQueryItem(name: "inputs", value: "false"),
+            URLQueryItem(name: "outputs", value: "false"),
+            URLQueryItem(name: "resolve_previous_outpoints", value: "no"),
+        ]) else { return nil }
+        guard let (data, response) = try? await URLSession.shared.data(for: Self.timedRequest(url, timeout: 8)),
+              let status = (response as? HTTPURLResponse)?.statusCode else { return nil }
+        if status == 404 { return false }
+        guard status == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return (json["is_accepted"] as? Bool) == true
     }
 
     /// Sends a plain KAS transfer from a specific spending-chain address (Manage Addresses'

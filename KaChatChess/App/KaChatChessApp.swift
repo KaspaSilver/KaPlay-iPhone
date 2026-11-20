@@ -26,6 +26,9 @@ struct KaChatChessApp: App {
         PendingNetworkSwitch.applyAtLaunch()
         // Players shown as their address are asked again for a .kachat name, once a minute.
         KachatNamesRegistry.shared.startUnnamedIdentitySweep()
+        // Renewal reminders are KaPay's (owner's call, 2026-11-20): the ones an older build set
+        // are taken off once, so none fires. Never asks for notification permission.
+        Task { @MainActor in await KachatNameReminders.removeLegacyOnce() }
     }
 
     var body: some Scene {
@@ -76,8 +79,6 @@ struct KaChatChessApp: App {
 
     @MainActor
     private func handleScenePhaseChange(to newPhase: ScenePhase) {
-        // (The privacy cover isn't driven from here: this phase stays active while any window is
-        // active. Each window follows its own scene, `PrivacyCoverWindows`.)
         guard newPhase == .active else { return }
         let shouldResync = lastActiveResyncAt.map { Date().timeIntervalSince($0) > activeResyncDebounce } ?? true
         guard shouldResync else { return }
@@ -85,7 +86,12 @@ struct KaChatChessApp: App {
         // gRPC connections can die silently while the app is suspended: reconnect the dead ones
         // now rather than letting the next move discover it.
         Task { await NodePoolService.shared.reconnectStaleConnections() }
-        Task { @MainActor in await KachatNamesRegistry.shared.refreshIfStale() }
+        Task { @MainActor in
+            await KachatNamesRegistry.shared.refreshIfStale()
+            // A .kachat claim an older build started (commit sent, register pending) finishes
+            // in the background; nothing new is claimed here (that's KaPay's).
+            KachatNamesActions.shared.resume()
+        }
     }
 }
 
@@ -103,79 +109,6 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         Task.detached(priority: .utility) { CacheManager.sweepStaleTempFiles() }
-        PrivacyCoverWindows.shared.start()
         return true
-    }
-}
-
-extension Notification.Name {
-    static let openChat = Notification.Name("openChat")
-    static let openPublicChat = Notification.Name("openBroadcast")
-}
-
-/// Puts `PrivacyCoverView` in a window of its own above each scene, as KaPost does: covered the
-/// moment that scene stops being active, uncovered when it is again. An overlay on the root view
-/// sat underneath presented sheets, which is where the 12 or 24 words, the passphrase and the
-/// private key are shown, and they would otherwise sit in iOS's snapshot in plain view.
-/// One cover per scene, from the scene's own notifications: an iPad can have several windows, each
-/// snapshotted, and SwiftUI's app-level `scenePhase` stays active while any of them is.
-/// Hidden, a cover's window is gone, so it never takes a touch.
-@MainActor
-private final class PrivacyCoverWindows: NSObject {
-    static let shared = PrivacyCoverWindows()
-
-    private var covers: [ObjectIdentifier: UIWindow] = [:]
-
-    func start() {
-        let center = NotificationCenter.default
-        center.addObserver(self, selector: #selector(sceneWillDeactivate(_:)), name: UIScene.willDeactivateNotification, object: nil)
-        center.addObserver(self, selector: #selector(sceneDidActivate(_:)), name: UIScene.didActivateNotification, object: nil)
-        center.addObserver(self, selector: #selector(sceneDidDisconnect(_:)), name: UIScene.didDisconnectNotification, object: nil)
-    }
-
-    @objc private func sceneWillDeactivate(_ notification: Notification) {
-        guard let scene = notification.object as? UIWindowScene else { return }
-        let id = ObjectIdentifier(scene)
-        guard covers[id] == nil else { return }
-        let cover = UIWindow(windowScene: scene)
-        cover.windowLevel = .alert + 1
-        // the app's appearance (Settings' choice), which its own windows carry
-        cover.overrideUserInterfaceStyle = scene.windows.first?.overrideUserInterfaceStyle ?? .unspecified
-        cover.rootViewController = UIHostingController(rootView: PrivacyCoverView())
-        cover.isHidden = false
-        covers[id] = cover
-    }
-
-    @objc private func sceneDidActivate(_ notification: Notification) {
-        removeCover(of: notification)
-    }
-
-    @objc private func sceneDidDisconnect(_ notification: Notification) {
-        removeCover(of: notification)
-    }
-
-    private func removeCover(of notification: Notification) {
-        guard let scene = notification.object as? UIWindowScene,
-              let cover = covers.removeValue(forKey: ObjectIdentifier(scene)) else { return }
-        cover.isHidden = true
-    }
-}
-
-/// What the App Switcher and a system prompt see instead of the app's contents.
-private struct PrivacyCoverView: View {
-    var body: some View {
-        ZStack {
-            // Solid under the blur: in its own window the material would otherwise let large
-            // words on a sheet below be read through it.
-            Color(.systemBackground)
-            Rectangle().fill(.ultraThinMaterial)
-            // The app's own icon, shaped like it is on the Home Screen.
-            Image("KaChatChessLogo")
-                .resizable()
-                .scaledToFit()
-                .frame(width: 72, height: 72)
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        }
-        .ignoresSafeArea()
     }
 }

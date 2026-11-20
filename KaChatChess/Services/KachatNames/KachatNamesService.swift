@@ -286,16 +286,6 @@ final class KachatNamesService: ObservableObject {
 
     // MARK: - Salts
 
-    /// A fresh 32-byte commit salt. Keep it (with the name) until the registration: without it
-    /// the commit cannot be registered.
-    nonisolated static func newSalt() throws -> Data {
-        var bytes = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
-            throw KachatNames.Failure("no randomness for the salt")
-        }
-        return Data(bytes)
-    }
-
     // MARK: - Signing
 
     /// Signs every input that needs it with the wallet key: BIP-340 Schnorr over the version-1
@@ -387,29 +377,4 @@ final class KachatNamesService: ObservableObject {
 
     // MARK: - Profile record
 
-    /// The address profile record (KACHAT_NAMES.md section 7): a self-transfer with payload
-    /// `kchat:1:profile:<json>`, built and signed by the existing version-0 payload builder.
-    /// `json` is the whole profile (records replace, never patch), a JSON object of at most 2 KB.
-    func buildProfileRecord(address: String, privateKey: Data, utxos: [UTXO], json: Data) throws -> KaspaRpcTransaction {
-        guard Self.profilesEnabled else { throw ServiceError.testnetOnly }
-        // The record is written from the wallet's address on the network the app runs on.
-        guard NetworkType(address: address) == AppSettings.load().networkType else { throw ServiceError.wrongAddressNetwork }
-        guard json.count <= KachatNames.Codec.maxProfileJSONBytes else { throw ServiceError.badProfile("over 2 KB") }
-        guard let object = try? JSONSerialization.jsonObject(with: json) as? [String: Any] else {
-            throw ServiceError.badProfile("not a JSON object")
-        }
-        guard (object["v"] as? NSNumber)?.intValue == 1 else { throw ServiceError.badProfile("\"v\" must be 1") }
-        let payload = KachatNames.Codec.profilePayload(json: json)
-        let plain = utxos.filter { $0.covenantId == nil }
-        return try KasiaTransactionBuilder.buildPayloadSelfSendTx(
-            from: address, senderPrivateKey: privateKey, utxos: plain, payload: payload
-        )
-    }
-
-    /// Build, sign and submit the profile record; returns its id.
-    @discardableResult
-    func submitProfileRecord(address: String, privateKey: Data, utxos: [UTXO], json: Data) async throws -> String {
-        let tx = try buildProfileRecord(address: address, privateKey: privateKey, utxos: utxos, json: json)
-        return try await NodePoolService.shared.submitTransaction(tx).txId
-    }
 }

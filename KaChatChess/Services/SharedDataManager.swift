@@ -13,10 +13,6 @@ final class SharedDataManager {
         UserDefaults(suiteName: appGroupIdentifier)
     }
 
-    private static var sharedContainerURL: URL? {
-        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier)
-    }
-
     static func sharedDefaultsValue(forKey key: String) -> Any? {
         sharedDefaults?.object(forKey: key)
     }
@@ -140,17 +136,6 @@ final class SharedDataManager {
         return recents
     }
 
-    static func removeRecentConversation(address: String) {
-        let recents = getRecentConversations()
-        let filtered = recents.filter { $0.address != address }
-        guard filtered.count != recents.count else { return }
-        if filtered.isEmpty {
-            sharedDefaults?.removeObject(forKey: Keys.recentConversations)
-        } else if let data = try? JSONEncoder().encode(filtered) {
-            sharedDefaults?.set(data, forKey: Keys.recentConversations)
-        }
-    }
-
     // MARK: - KNS
 
     /// The wallet's own primary KNS domain (bare, lowercased) for the extension's mentions-only
@@ -208,18 +193,9 @@ final class SharedDataManager {
         sharedDefaults?.set(address, forKey: Keys.walletAddress)
     }
 
-    static func getWalletAddress() -> String? {
-        return sharedDefaults?.string(forKey: Keys.walletAddress)
-    }
-
     /// Get contact by address (called from notification extension)
     static func getContact(address: String) -> SharedContact? {
         return sharedContactsForCurrentWallet().first { $0.address == address }
-    }
-
-    /// Get all contacts from shared container
-    static func getAllContacts() -> [SharedContact] {
-        return sharedContactsForCurrentWallet()
     }
 
     /// The shared contact list, but ONLY when it belongs to the wallet currently signed in.
@@ -245,167 +221,9 @@ final class SharedDataManager {
 
     // MARK: - Shared Secrets
 
-    /// Store a shared secret for a contact address (call when handshake is processed)
-    static func storeSharedSecret(_ secret: Data, for address: String) {
-        var secrets = getSharedSecrets()
-        secrets[address] = secret.base64EncodedString()
-
-        guard let data = try? JSONEncoder().encode(secrets) else {
-            AppLog.log("[SharedData] Failed to encode shared secrets")
-            return
-        }
-
-        sharedDefaults?.set(data, forKey: Keys.sharedSecrets)
-        AppLog.log("[SharedData] Stored shared secret for %@", String(address.suffix(8)))
-    }
-
-    /// Get shared secret for a contact address
-    static func getSharedSecret(for address: String) -> Data? {
-        let secrets = getSharedSecrets()
-        guard let base64 = secrets[address],
-              let data = Data(base64Encoded: base64) else {
-            return nil
-        }
-        return data
-    }
-
-    /// Get all shared secrets
-    private static func getSharedSecrets() -> [String: String] {
-        guard let data = sharedDefaults?.data(forKey: Keys.sharedSecrets),
-              let secrets = try? JSONDecoder().decode([String: String].self, from: data) else {
-            return [:]
-        }
-        return secrets
-    }
-
-    /// Remove shared secret for an address (call when contact is deleted)
-    static func removeSharedSecret(for address: String) {
-        var secrets = getSharedSecrets()
-        secrets.removeValue(forKey: address)
-
-        if let data = try? JSONEncoder().encode(secrets) {
-            sharedDefaults?.set(data, forKey: Keys.sharedSecrets)
-        }
-    }
-
-    /// Clear all shared secrets (call on wallet delete)
-    static func clearSharedSecrets() {
-        sharedDefaults?.removeObject(forKey: Keys.sharedSecrets)
-    }
-
-    /// One-time hygiene at launch: `storeSharedSecret` has no callers anywhere in the app
-    /// anymore (the NSE derives per-message secrets from the Keychain private key instead),
-    /// but earlier releases DID write per-contact ECDH shared secrets into this plain-plist
-    /// App Group key. Those bytes are message-decryption key material and have no business
-    /// sitting in a UserDefaults plist, so wipe any legacy residue unconditionally.
-    static func purgeLegacySharedSecretsIfPresent() {
-        guard let defaults = sharedDefaults,
-              defaults.object(forKey: Keys.sharedSecrets) != nil else { return }
-        defaults.removeObject(forKey: Keys.sharedSecrets)
-        AppLog.log("[SharedData] Purged legacy shared-secret blob from App Group defaults")
-    }
-
     // MARK: - Pending Messages (txId only, need to fetch payload)
 
-    /// Add a pending message that needs to be fetched when app opens
-    static func addPendingMessage(txId: String, sender: String, type: String? = nil) {
-        var pending = getPendingMessages()
-
-        // Avoid duplicates
-        guard !pending.contains(where: { $0.txId == txId }) else { return }
-
-        pending.append(SharedPendingMessage(
-            txId: txId,
-            sender: sender,
-            type: type,
-            timestamp: Int64(Date().timeIntervalSince1970 * 1000)
-        ))
-
-        // Keep only last 100 pending messages
-        if pending.count > 100 {
-            pending = Array(pending.suffix(100))
-        }
-
-        if let data = try? JSONEncoder().encode(pending) {
-            sharedDefaults?.set(data, forKey: Keys.pendingMessages)
-        }
-    }
-
-    /// Get all pending messages
-    static func getPendingMessages() -> [SharedPendingMessage] {
-        guard let data = sharedDefaults?.data(forKey: Keys.pendingMessages) else {
-            return []
-        }
-
-        // Try JSONDecoder first (app format)
-        if let pending = try? JSONDecoder().decode([SharedPendingMessage].self, from: data) {
-            return pending
-        }
-
-        // Fall back to JSONSerialization (extension format)
-        guard let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-            return []
-        }
-
-        return array.compactMap { dict -> SharedPendingMessage? in
-            guard let txId = dict["txId"] as? String,
-                  let sender = dict["sender"] as? String else {
-                return nil
-            }
-            let type = dict["type"] as? String
-            let timestamp = (dict["timestamp"] as? Int64) ?? Int64(Date().timeIntervalSince1970 * 1000)
-            return SharedPendingMessage(txId: txId, sender: sender, type: type, timestamp: timestamp)
-        }
-    }
-
-    /// Clear all pending messages
-    static func clearPendingMessages() {
-        sharedDefaults?.removeObject(forKey: Keys.pendingMessages)
-    }
-
-    /// Replace pending messages list (used for retry persistence)
-    static func setPendingMessages(_ pending: [SharedPendingMessage]) {
-        if pending.isEmpty {
-            clearPendingMessages()
-            return
-        }
-        if let data = try? JSONEncoder().encode(pending) {
-            sharedDefaults?.set(data, forKey: Keys.pendingMessages)
-        }
-    }
-
-    /// Remove a specific pending message by txId
-    static func removePendingMessage(txId: String) {
-        let pending = getPendingMessages()
-        let filtered = pending.filter { $0.txId != txId }
-        setPendingMessages(filtered)
-    }
-
     // MARK: - Stored Messages (legacy: decrypted text an older extension kept; read once, removed)
-
-    /// Get all stored messages
-    static func getStoredMessages() -> [[String: Any]] {
-        return getStoredMessagesRaw()
-    }
-
-    private static func getStoredMessagesRaw() -> [[String: Any]] {
-        guard let data = sharedDefaults?.data(forKey: Keys.storedMessages),
-              let messages = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-            return []
-        }
-        return messages
-    }
-
-    /// Removes only these entries: anything added meanwhile stays (IOS-052).
-    static func removeStoredMessages(txIds: Set<String>) {
-        guard !txIds.isEmpty else { return }
-        let remaining = getStoredMessagesRaw().filter { !txIds.contains(($0["txId"] as? String) ?? "") }
-        if remaining.isEmpty {
-            sharedDefaults?.removeObject(forKey: Keys.storedMessages)
-        } else if let data = try? JSONSerialization.data(withJSONObject: remaining) {
-            sharedDefaults?.set(data, forKey: Keys.storedMessages)
-        }
-    }
 
 
     // MARK: - Outbound Shares (Share Extension -> Main App)
@@ -415,10 +233,6 @@ final class SharedDataManager {
     /// Check if private key is available (set by main app)
     static func setPrivateKeyAvailable(_ available: Bool) {
         sharedDefaults?.set(available, forKey: Keys.privateKeyAvailable)
-    }
-
-    static func isPrivateKeyAvailable() -> Bool {
-        return sharedDefaults?.bool(forKey: Keys.privateKeyAvailable) ?? false
     }
 
     // MARK: - Cleanup
@@ -460,23 +274,10 @@ final class SharedDataManager {
 
     // MARK: - Unread Count (Badge)
 
-    static func getUnreadCount() -> Int {
-        return sharedDefaults?.integer(forKey: Keys.unreadCount) ?? 0
-    }
-
     static func setUnreadCount(_ count: Int) {
         sharedDefaults?.set(max(0, count), forKey: Keys.unreadCount)
     }
 
-    static func incrementUnreadCount() -> Int {
-        let newValue = max(0, getUnreadCount() + 1)
-        setUnreadCount(newValue)
-        return newValue
-    }
-
-    static func resetUnreadCount() {
-        setUnreadCount(0)
-    }
 }
 
 // MARK: - Shared Models
@@ -493,28 +294,4 @@ struct SharedRecentConversation: Codable {
     let address: String
     let alias: String
     let lastUsedMs: Int64
-}
-
-/// Pending message that needs to be fetched
-struct SharedPendingMessage: Codable {
-    let txId: String
-    let sender: String
-    let type: String?
-    let timestamp: Int64
-
-    init(txId: String, sender: String, type: String? = nil, timestamp: Int64) {
-        self.txId = txId
-        self.sender = sender
-        self.type = type
-        self.timestamp = timestamp
-    }
-
-    // Handle both old format (without type) and new format (with type)
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        txId = try container.decode(String.self, forKey: .txId)
-        sender = try container.decode(String.self, forKey: .sender)
-        type = try container.decodeIfPresent(String.self, forKey: .type)
-        timestamp = try container.decode(Int64.self, forKey: .timestamp)
-    }
 }

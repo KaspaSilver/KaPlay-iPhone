@@ -1,7 +1,8 @@
 import SwiftUI
 
-/// A square on the Leaderboard tab, in place of tabs: it opens that board's own page.
-struct ChessLeaderboardSquare: View {
+/// A row on the Leaderboard tab: the board's icon in a circle, its name and a chevron, opening
+/// that board's own page. The same card as Backup Hygiene's and an address's Domains rows.
+struct ChessLeaderboardLink: View {
     let title: LocalizedStringKey
     let icon: String
     let action: () -> Void
@@ -11,29 +12,30 @@ struct ChessLeaderboardSquare: View {
             Haptics.selection()
             action()
         } label: {
-            VStack(spacing: 8) {
+            HStack(spacing: 14) {
                 Image(systemName: icon)
-                    .font(.title2)
+                    .font(.scaled(size: 22, weight: .semibold))
+                    .foregroundColor(.accentColor)
+                    .frame(width: 48, height: 48)
+                    .background(Circle().fill(Color.accentColor.opacity(0.15)))
                 Text(title)
-                    .font(.subheadline.weight(.semibold))
+                    .font(.headline)
+                    .foregroundColor(.primary)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.7)
+                    .minimumScaleFactor(0.8)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundColor(.secondary)
             }
-            .padding(.horizontal, 6)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .aspectRatio(1, contentMode: .fit)
-            .foregroundColor(.primary)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(
-                RoundedRectangle(cornerRadius: 16)
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
                     .fill(Color(.secondarySystemGroupedBackground))
             )
-            .overlay(alignment: .topTrailing) {
-                Image(systemName: "chevron.right")
-                    .font(.caption2.weight(.bold))
-                    .foregroundColor(.secondary)
-                    .padding(10)
-            }
-            .contentShape(RoundedRectangle(cornerRadius: 16))
+            .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         }
         .buttonStyle(.plain)
     }

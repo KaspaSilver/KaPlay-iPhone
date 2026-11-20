@@ -143,6 +143,12 @@ final class WalletManager: ObservableObject {
     func clearSignInFailure() { signInFailureMessage = nil }
     @Published private(set) var isLoggedOut = false
     @Published private(set) var savedAccounts: [SavedAccountSummary] = []
+    /// The app was deleted and installed again while an account was saved: the Keychain kept it,
+    /// UserDefaults (Log Out, settings) did not. Until a saved account is opened once, opening it
+    /// asks for Face ID or the passcode, whatever Biometrics for Account Login says
+    /// (`OnboardingView.signIn`). Owner's call, 2026-11-20.
+    @Published private(set) var requiresDeviceAuthAfterReinstall =
+        UserDefaults.standard.bool(forKey: WalletManager.reinstallAuthPendingKey)
 
     private let keychainService = KeychainService.shared
     private let bip39 = BIP39.shared
@@ -153,6 +159,8 @@ final class WalletManager: ObservableObject {
     private init() {
         LaunchTrace.startWatchdog()
         LaunchTrace.mark("WalletManager.init")
+        // first of all: it tells a reinstall from an update by what this install wrote before
+        markFirstLaunch()
         // first: gets UserDefaults back under iOS's 4 MB limit before anything else writes
         DerivedAddressStore.prepare()
         Self.trimUserDefaults()
@@ -163,6 +171,48 @@ final class WalletManager: ObservableObject {
         Task {
             await loadWallet()
         }
+    }
+
+    /// Set on this install's first launch. The Keychain outlives deleting the app, UserDefaults
+    /// don't: a reinstall found the old account in the Keychain with no Log Out flag and opened
+    /// straight into it. So the first launch with no marker but a stored account opens the
+    /// sign-in screen logged out and asks for the device's Face ID or passcode on the first
+    /// sign-in (`requiresDeviceAuthAfterReinstall`). Nothing is deleted from the Keychain.
+    private static let hasLaunchedKey = "kaplay_has_launched_v1"
+    private static let reinstallAuthPendingKey = "kaplay_reinstall_sign_in_auth_pending"
+
+    private func markFirstLaunch() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: Self.hasLaunchedKey) else { return }
+        // An update from a build without the marker still has this install's data: only
+        // WalletManager writes these, and only after its first launch.
+        let ranBefore = defaults.object(forKey: Self.defaultsTrimmedKey) != nil
+            || defaults.object(forKey: savedAccountsKey) != nil
+            || defaults.object(forKey: logoutFlagKey) != nil
+        if !ranBefore {
+            let stored: Wallet?
+            do {
+                stored = try keychainService.loadWallet()
+            } catch {
+                // Keychain not readable yet (before the first unlock): decide on a later launch
+                AppLog.log("[WalletManager] First launch: Keychain not readable (%@); deciding later", error.localizedDescription)
+                return
+            }
+            if stored != nil {
+                AppLog.log("%@", "[WalletManager] Reinstall with a saved account: opening signed out, device auth on first sign-in")
+                defaults.set(true, forKey: logoutFlagKey)
+                defaults.set(true, forKey: Self.reinstallAuthPendingKey)
+                requiresDeviceAuthAfterReinstall = true
+            }
+        }
+        defaults.set(true, forKey: Self.hasLaunchedKey)
+    }
+
+    /// The first sign-in after a reinstall went through: later ones follow the setting again.
+    private func clearReinstallAuthRequirement() {
+        guard requiresDeviceAuthAfterReinstall else { return }
+        requiresDeviceAuthAfterReinstall = false
+        UserDefaults.standard.removeObject(forKey: Self.reinstallAuthPendingKey)
     }
 
     /// Keeps the app's UserDefaults well under iOS's 4 MB limit - past it iOS refuses EVERY
@@ -496,14 +546,10 @@ final class WalletManager: ObservableObject {
         let wallet = try await importWallet(from: seedPhrase, alias: alias, chattingAddressIndex: chattingAddressIndex, family: family)
         // whoever typed the words has them
         AccountBackupStatus.shared.markConfirmed(wallet.publicAddress)
-        // A restored seed finds its spending addresses by itself - legacy and quantum, the same
-        // sweep as Manage Addresses' Discover Addresses - so balances and change rotation are
-        // right without anyone knowing to tap it (owner's call, 2026-10-21). Only this path: a
-        // typed-in recovery phrase; creating or switching accounts doesn't scan.
-        Task {
-            await self.discoverSpendingAddresses()
-            await HotWalletBalance.shared.refresh(force: true)
-        }
+        // No spending-address sweep here any more (it was 1,000+ addresses and a HotWalletBalance
+        // refresh): KaPlay's wallet is the chatting address only, whose change returns to itself,
+        // so recognising your own sends doesn't need it. `discoverSpendingAddresses()` stays for
+        // the unshown full wallet's Manage Addresses.
         return wallet
     }
 
@@ -798,7 +844,10 @@ final class WalletManager: ObservableObject {
     /// Whether the sign-in landed on `account`; when it didn't, and no recovery screen explains
     /// why, the reason waits in `signInFailureMessage` for the rebuilt accounts screen.
     private func finishSignIn(_ account: SavedAccountSummary) -> Bool {
-        if isCurrentAccount(account) { return true }
+        if isCurrentAccount(account) {
+            clearReinstallAuthRequirement()
+            return true
+        }
         if walletNeedingKeyRecovery == nil {
             signInFailureMessage = error?.localizedDescription
                 ?? AppLocalization.string("Unable to sign in to this account.")

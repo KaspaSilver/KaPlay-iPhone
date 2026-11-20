@@ -43,7 +43,7 @@ struct SecuritySettingsPage: View {
     @ObservedObject private var walletManager = WalletManager.shared
 
     /// A biometric lock that could be switched off without passing the lock is not a lock -
-    /// anyone holding an unlocked phone could have turned all three off and then read the seed
+    /// anyone holding an unlocked phone could have turned them off and then read the seed
     /// phrase. So the switch itself is gated, in BOTH directions: turning one on is a claim
     /// about who is holding the device too.
     ///
@@ -81,11 +81,9 @@ struct SecuritySettingsPage: View {
                     reason: "Unlock to change the account login biometric lock",
                     isOn: $settingsViewModel.settings.biometricAccountLoginEnabled
                 )
-                biometricToggle(
-                    "Biometrics for Address Private Keys",
-                    reason: "Unlock to change the private key biometric lock",
-                    isOn: $settingsViewModel.settings.biometricSpendingKeyEnabled
-                )
+                // No "Biometrics for Address Private Keys": no private key is shown anywhere
+                // reachable since the Wallet tab became the chatting address only. The setting
+                // (`biometricSpendingKeyEnabled`) stays for the unshown full wallet.
             }
         }
         .navigationTitle("Security")
@@ -245,18 +243,6 @@ struct AppSettingsView: View {
     }
 }
 
-
-private extension Data {
-    mutating func appendUInt16(_ value: UInt16) {
-        var little = value.littleEndian
-        append(Data(bytes: &little, count: MemoryLayout<UInt16>.size))
-    }
-
-    mutating func appendUInt32(_ value: UInt32) {
-        var little = value.littleEndian
-        append(Data(bytes: &little, count: MemoryLayout<UInt32>.size))
-    }
-}
 
 struct SeedPhraseView: View {
     @Environment(\.dismiss) private var dismiss
@@ -435,7 +421,7 @@ struct SeedPhraseView: View {
         do {
             seedPhrase = try KeychainService.shared.loadSeedPhrase()
         } catch {
-            self.error = error.localizedDescription
+            self.error = UserFacingError.message(for: error)
         }
     }
 
@@ -506,12 +492,58 @@ struct KaspaExplorerSettingsView: View {
     }
 }
 
+/// Domains screen's "Reading names from" row: the .kachat source `KachatNamesRegistry` last
+/// chose. Its own view so only this row observes the registry, not every Connection screen.
+private struct KachatNamesSourceRow: View {
+    @ObservedObject private var kachatRegistry = KachatNamesRegistry.shared
+
+    var body: some View {
+        HStack {
+            Text("Reading names from")
+            Spacer()
+            sourceLabel
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.trailing)
+        }
+        .task { await kachatRegistry.refreshIfStale() }
+    }
+
+    @ViewBuilder
+    private var sourceLabel: some View {
+        if !KachatNamesService.isLaunched {
+            Text("Not live on this network")
+        } else {
+            switch kachatRegistry.source {
+            case .indexer(let base):
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("Indexer")
+                    Text(verbatim: URLComponents(string: base)?.host ?? base)
+                        .font(.caption)
+                }
+            case .chain:
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("The chain")
+                    Text("Indexer not usable right now")
+                        .font(.caption)
+                }
+            case nil:
+                if kachatRegistry.isRefreshing {
+                    ProgressView()
+                } else {
+                    Text(kachatRegistry.lastError == nil ? "Checking..." : "Couldn't check")
+                }
+            }
+        }
+    }
+}
+
 struct ConnectionSettingsView: View {
+    /// Nil: the cards. Set: that connection's own screen (as in KaPay).
+    var page: Page? = nil
     @EnvironmentObject var settingsViewModel: SettingsViewModel
     @Environment(\.dismiss) private var dismiss
-    /// Where .kachat names are read from right now, for the Domains tab.
-    @ObservedObject private var namesRegistry = KachatNamesRegistry.shared
 
+    /// The .kachat names indexer (Domains screen). Blank = the network's default.
     @State private var indexerURL: String = ""
     @State private var publicChatIndexerURL: String = ""
     @State private var kaspaRestAPIURL: String = ""
@@ -556,26 +588,10 @@ struct ConnectionSettingsView: View {
         return "https://" + trimmed
     }
 
+    /// The Chess screen: the arena's indexer. (.kachat names have their own indexer field, on the
+    /// Domains screen.)
     @ViewBuilder
-    private var indexerSections: some View {
-        Section {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Indexer URL")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                TextField(indexerPlaceholder(AppSettings.defaultIndexerURL), text: $indexerURL)
-                    .font(.system(.body, design: .monospaced))
-                    .autocapitalization(.none)
-                    .autocorrectionDisabled()
-                    .keyboardType(.URL)
-                httpsInlineError(for: indexerURL)
-            }
-        } header: {
-            Text("Message Indexer")
-        } footer: {
-            Text("Serves .kachat names when it has them (see the Domains tab).")
-        }
-
+    private var chessSections: some View {
         Section {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Chess Indexer URL")
@@ -630,8 +646,6 @@ struct ConnectionSettingsView: View {
             }
         } header: {
             Text("Kaspa Node")
-        } footer: {
-            Text("Automatic Scan discovers and connects to the best available nodes. Choosing a specific node connects only to it, without falling back to others. Doesn't affect the indexers, domains or explorer on the other tabs. Add custom addresses to the IP Address Book below to select them here.")
         }
 
         Section {
@@ -654,6 +668,7 @@ struct ConnectionSettingsView: View {
                     Image(systemName: "plus.circle.fill")
                         .foregroundColor(.accentColor)
                 }
+                .accessibilityLabel("Add")
                 .disabled(newSavedNodeAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
 
@@ -706,65 +721,29 @@ struct ConnectionSettingsView: View {
             }
         } header: {
             Text("IP Address Book")
-        } footer: {
-            Text("Save your own node addresses here, then tap one to copy it and paste into the Kaspa Node field above.")
         }
     }
 
     @ViewBuilder
     private var domainsSections: some View {
-        // .kachat first: it is what every address field resolves before anything else.
+        // .kachat first: it is what every address field resolves before anything else. Names are
+        // read through this indexer when it serves this network's registry and keeps up, else
+        // straight from the chain (`KachatNamesRegistry.chooseSource`).
         Section {
             VStack(alignment: .leading, spacing: 4) {
-                Text("KaChat Names (.kachat)")
+                Text(".kachat Indexer URL")
                     .font(.caption)
                     .foregroundColor(.secondary)
-                // Read through the chat indexer above when it serves this network's names, else
-                // straight from the chain (KachatNamesRegistry).
-                if settingsViewModel.settings.networkType == .testnet {
-                    Text("Live on Testnet (testnet-10 registry)")
-                        .foregroundColor(.secondary)
-                } else {
-                    Text("Live on Mainnet")
-                        .foregroundColor(.secondary)
-                }
+                TextField(indexerPlaceholder(AppSettings.defaultIndexerURL), text: $indexerURL)
+                    .font(.system(.body, design: .monospaced))
+                    .autocapitalization(.none)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                httpsInlineError(for: indexerURL)
             }
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Source")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                switch namesRegistry.source {
-                case .indexer(let base):
-                    Text(base)
-                        .font(.system(.body, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .textSelection(.enabled)
-                case .chain:
-                    Text("Read straight from the chain")
-                        .foregroundColor(.secondary)
-                    Text("The Message Indexer doesn't serve .kachat names on this network, or is behind.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                case nil:
-                    Text("Checking...")
-                        .foregroundColor(.secondary)
-                }
-            }
-            Button {
-                selectedTab = .indexer
-            } label: {
-                Label("Change on the Indexer tab", systemImage: "arrow.right.circle")
-            }
+            KachatNamesSourceRow()
         } header: {
             Text(".kachat Names")
-        } footer: {
-            Text("Resolved first, everywhere you can type an address. Names come from the Message Indexer on the Indexer tab when it serves them and is caught up, otherwise straight from the chain. Run your own indexer and put its URL there to use it.")
-        }
-        .task {
-            // The source is picked on first use; pick it now if nothing has asked yet.
-            if KachatNamesService.isLaunched, namesRegistry.source == nil {
-                _ = try? await namesRegistry.prepare()
-            }
         }
         // The other name services this app reads (see `NameServicesClient`). Shown, not
         // editable. The .kas URL had no empty-string fallback, so saving it blank wrote "" and
@@ -793,8 +772,6 @@ struct ConnectionSettingsView: View {
             }
         } header: {
             Text("Other Domains")
-        } footer: {
-            Text("Looked up after .kachat, and listed under Other domains when a typed name also exists there.")
         }
     }
 
@@ -827,54 +804,150 @@ struct ConnectionSettingsView: View {
             : AppLocalization.string("No testnet indexer yet")
     }
 
-    /// One tab per kind of connection, so the page stays short as the app talks to more
-    /// services: indexers, the Kaspa node, translation, name services, the block explorer.
-    private enum ConnectionTab: String, CaseIterable {
-        case indexer, node, domains, explorer
+    /// One card per kind of connection, as in KaPay: the chess indexer, the Kaspa node, name
+    /// services and the block explorer.
+    enum Page: String, CaseIterable, Identifiable {
+        case chess, node, domains, explorer
 
-        var title: String {
+        var id: String { rawValue }
+
+        var title: LocalizedStringKey {
             switch self {
-            case .indexer: return "Indexer"
+            case .chess: return "Chess"
             case .node: return "Node"
             case .domains: return "Domains"
             case .explorer: return "Explorer"
             }
         }
-    }
 
-    @State private var selectedTab: ConnectionTab = .indexer
-
-    var body: some View {
-        VStack(spacing: 0) {
-            UnderlineTabBar(
-                tabs: ConnectionTab.allCases.map { (tab: $0, title: $0.title) },
-                selection: $selectedTab
-            )
-            // Save covers every tab: the fields keep their edits while you switch between them.
-            Form {
-                switch selectedTab {
-                case .indexer: indexerSections
-                case .node: nodeSections
-                case .domains: domainsSections
-                case .explorer: explorerSections
-                }
+        var icon: String {
+            switch self {
+            case .chess: return "checkerboard.rectangle"
+            case .node: return "server.rack"
+            case .domains: return "at"
+            case .explorer: return "safari"
             }
         }
-        .navigationTitle("Connection Settings")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .confirmationAction) {
-                Button("Save") {
-                    if saveSettings() {
-                        dismiss()
-                    }
-                }
+
+        /// Only the node screen saves as you pick (the picker and the address book).
+        var hasSave: Bool { self != .node }
+    }
+
+    var body: some View {
+        Group {
+            if let page {
+                pageScreen(page)
+            } else {
+                cards
             }
         }
         .onAppear {
             loadCurrentSettings()
         }
         .toast(message: toastMessage, style: toastStyle)
+    }
+
+    /// The cards, each opening its connection's screen.
+    private var cards: some View {
+        ScrollView {
+            VStack(spacing: 12) {
+                ForEach(Page.allCases) { page in
+                    NavigationLink {
+                        ConnectionSettingsView(page: page)
+                    } label: {
+                        connectionCard(page)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding()
+        }
+        .navigationTitle("Connection Settings")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func connectionCard(_ page: Page) -> some View {
+        HStack(spacing: 14) {
+            Image(systemName: page.icon)
+                .font(.body.weight(.semibold))
+                .foregroundColor(.accentColor)
+                .frame(width: 40, height: 40)
+                .background(Circle().fill(Color.accentColor.opacity(0.15)))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(page.title)
+                    .font(.headline)
+                    .foregroundColor(.primary)
+                Text(verbatim: cardSummary(page))
+                    .font(.caption.monospaced())
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 8)
+            Image(systemName: "chevron.right")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(.regularMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(Color(uiColor: .separator), lineWidth: 0.8)
+                )
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 18))
+    }
+
+    /// What each card is set to right now: the server's host, or the node in use.
+    private func cardSummary(_ page: Page) -> String {
+        let settings = settingsViewModel.settings
+        func host(_ url: String) -> String {
+            let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return AppLocalization.string("Not set") }
+            return URLComponents(string: trimmed)?.host ?? trimmed
+        }
+        switch page {
+        case .chess: return host(settings.publicChatIndexerURL)
+        case .node:
+            let trusted = settings.trustedNodeAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trusted.isEmpty { return AppLocalization.string("Automatic Scan") }
+            if trusted == normalizedDefaultAddress { return AppLocalization.string("Default (Recommended)") }
+            if let saved = settings.savedNodeAddresses.first(where: { $0.address == trusted }),
+               !saved.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return saved.label
+            }
+            return trusted
+        case .domains: return host(settings.indexerURL)
+        case .explorer: return host(settings.kaspaRestAPIURL)
+        }
+    }
+
+    /// One connection's own screen; Save keeps it and goes back to the cards.
+    private func pageScreen(_ page: Page) -> some View {
+        Form {
+            switch page {
+            case .chess: chessSections
+            case .node: nodeSections
+            case .domains: domainsSections
+            case .explorer: explorerSections
+            }
+        }
+        .navigationTitle(page.title)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if page.hasSave {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        if saveSettings() {
+                            dismiss()
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private func showToast(_ message: String, style: ToastStyle = .success) {

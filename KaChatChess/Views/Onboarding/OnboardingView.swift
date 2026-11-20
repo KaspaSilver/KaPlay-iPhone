@@ -400,7 +400,8 @@ struct OnboardingView: View {
         guard !isAccountActionRunning else { return }
         signInErrorMessage = nil
 
-        if settingsViewModel.settings.biometricAccountLoginEnabled {
+        // after a reinstall the first sign-in always asks (`requiresDeviceAuthAfterReinstall`)
+        if settingsViewModel.settings.biometricAccountLoginEnabled || walletManager.requiresDeviceAuthAfterReinstall {
             DeviceAuth.authenticate(reason: String(format: AppLocalization.string("Unlock to sign in to %@"),
                                                    locale: AppLocalization.locale, account.displayAlias)) {
                 performSignIn(account)
@@ -447,7 +448,7 @@ struct OnboardingView: View {
                     alias: walletManager.nextDefaultAccountName()
                 )
             } catch {
-                createAccountError = error.localizedDescription
+                createAccountError = UserFacingError.message(for: error)
             }
             isCreatingAccount = false
         }

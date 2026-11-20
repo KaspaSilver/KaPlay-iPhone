@@ -24,7 +24,6 @@ extension KachatNames {
             return .lapsed
         }
 
-        var resolves: Bool { self == .active }
     }
 
     static func nowMs() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
@@ -133,10 +132,6 @@ extension KachatNames {
 
         var id: String { "\(hex(outpoint.txid)):\(outpoint.index)" }
         var fields: OfferFields { OfferFields(key: key, buyer: buyer, seller: seller, refundAfter: refundAfter) }
-        func refundable(atDaa daa: UInt64) -> Bool { daa > UInt64(max(refundAfter, 0)) }
-        /// Made to an earlier owner of the name (registry v3): it can never be accepted and goes
-        /// back to the buyer (withdraw, or a refund once it expires).
-        func isDeclined(currentOwner: Data) -> Bool { seller != currentOwner }
     }
 
     /// One registry event (history, activity). Parties are x-only keys or addresses depending on
@@ -198,12 +193,6 @@ extension KachatNames {
             return t
         }
 
-        /// The Linktree username in a stored link (`https://linktr.ee/<name>` → `<name>`).
-        static func linktreeUsername(_ link: String?) -> String {
-            guard let l = linktreeLink(link) else { return "" }
-            return String(l.dropFirst("https://linktr.ee/".count))
-        }
-
         /// What the Linktree field holds - a bare username, or a pasted link - as a stored link.
         static func linktreeLink(username raw: String) -> String? {
             let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -236,15 +225,6 @@ extension KachatNames {
             p.linktree = Profile.linktreeLink(linktree)
             p.primaryName = Profile.clean(primaryName).map(Codec.normalize).flatMap { Codec.isValid($0) ? $0 : nil }
             return p
-        }
-
-        /// The JSON of the record: compact, keys sorted, nil fields left out. Throws past 2 KB.
-        func recordJSON() throws -> Data {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-            let data = try encoder.encode(sanitized())
-            guard data.count <= Codec.maxProfileJSONBytes else { throw Failure("the profile is over 2 KB") }
-            return data
         }
 
         /// A record's JSON as the indexer reads it (unknown fields dropped, then sanitized).
@@ -403,15 +383,6 @@ extension KachatNames {
             default: link = platform.prefix + h
             }
             return SocialSource(link: link, for: kind)
-        }
-
-        /// The handle as the field shows it after `platform.prefix`.
-        var displayHandle: String {
-            switch platform {
-            case .youtube, .tiktok: return handle.hasPrefix("@") ? String(handle.dropFirst()) : handle
-            case .linkedin: return handle.hasPrefix("in/") ? String(handle.dropFirst(3)) : handle
-            default: return handle
-            }
         }
 
         // MARK: Reading the picture out of what the platform serves (pure, testable)
@@ -805,15 +776,6 @@ extension KachatNames {
             return out
         }
 
-        // MARK: Offers this device made
-
-        mutating func trackOffer(_ o: OfferInfo, at: Int64?) {
-            let txid = hex(o.outpoint.txid)
-            offers.removeAll { $0.txid == txid && $0.index == o.outpoint.index }
-            offers.append(Offer(txid: txid, index: o.outpoint.index, key: hex(o.key), buyer: hex(o.buyer), seller: hex(o.seller),
-                                refundAfter: o.refundAfter, value: o.amount, name: o.name, createdAt: at))
-        }
-
         // MARK: Applying a transaction (registry.rs `Registry::apply`)
 
         private enum Predicted {
@@ -1176,40 +1138,6 @@ extension KachatNames {
         }
 
         struct EventsJSON: Decodable { let events: [EventJSON]; let next: String? }
-
-        /// `GET /stats/names`, the parts the app reads: transaction counts and fees (sompi as
-        /// strings), each over 24 hours, 7 days and all time.
-        struct StatsJSON: Decodable {
-            struct Counts: Decodable { let total: UInt64; let last24h: UInt64; let last7d: UInt64 }
-            struct Fees: Decodable { let total: String; let last24h: String; let last7d: String }
-            let transactions: Counts?
-            let activity: [String: Counts]?
-            let fees: Fees?
-        }
-
-        struct OfferJSON: Decodable {
-            let outpoint: OutpointJSON
-            let buyer: String
-            /// registry v3: the owner the offer was made to (an address)
-            let seller: String?
-            let amount: String
-            let refundAfter: Int64
-            let createdAt: Int64?
-            let refundable: Bool?
-            let name: String?
-
-            /// The offer, when complete. An indexer without the seller (registry v2) gives nothing:
-            /// a v3 offer can't be accepted or declined without it.
-            func info(name fallback: String?, keyOf: (String) -> Data?) -> OfferInfo? {
-                guard let op = outpoint.outpoint, let buyerKey = keyOf(buyer), let sellerKey = seller.flatMap(keyOf),
-                      let amount = UInt64(amount) else { return nil }
-                guard let n = (name ?? fallback).map(Codec.normalize), Codec.isValid(n) else { return nil }
-                return OfferInfo(outpoint: op, key: Codec.key(n), name: n, buyer: buyerKey, seller: sellerKey, amount: amount,
-                                 refundAfter: refundAfter, createdAt: createdAt)
-            }
-        }
-
-        struct OffersJSON: Decodable { let offers: [OfferJSON] }
 
         struct ProfileJSON: Decodable {
             let address: String

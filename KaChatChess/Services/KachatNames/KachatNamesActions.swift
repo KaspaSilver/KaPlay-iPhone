@@ -1,6 +1,4 @@
 import Foundation
-import P256K
-import UIKit
 
 extension KachatNames {
     /// A registration in flight: commit -> wait `tCommit` DAA -> register. Kept per wallet in
@@ -70,30 +68,16 @@ extension KachatNames {
     }
 }
 
-/// The `.kachat` actions: every operation the screens offer, built with the pure builders over
-/// UTXOs re-read from a node, signed with the wallet key and submitted (`KachatNamesService`),
-/// plus the registration driver (commit, wait, register - resumable). Testnet-10 only: each entry
-/// goes through `KachatNamesService.requireLaunched()`. Every action returns its txid and refreshes
-/// the registry once the transaction is accepted.
+/// The `.kachat` registration driver, kept so a claim started in an older build (commit sent,
+/// reveal pending, its salt in the Keychain) still finishes or fails on its own: claiming,
+/// renewing, selling, transferring and offers are KaPay's (owner's call, 2026-11-18). Plus the
+/// read side the bell and Your Domains use (this wallet's keys and names). `resume()` runs when
+/// the app becomes active (`KaChatChessApp`).
 @MainActor
-final class KachatNamesActions: ObservableObject {
+final class KachatNamesActions {
     static let shared = KachatNamesActions()
 
-    @Published private(set) var pending: [KachatNames.PendingRegistration] = []
-    /// The registrations still open (in progress, or finished and not yet dismissed): the
-    /// .kachat screen's claims button lists them.
-    var openRegistrations: [KachatNames.PendingRegistration] { pending.filter(\.isOpen) }
-
-    /// The registration whose progress half sheet the app shows by itself
-    /// (`KachatRegistrationPresenter`): set once per launch when a claim is still in progress,
-    /// since it needs the app open to finish. Swiping the sheet away clears it.
-    @Published var autoPresentedRegistration: String?
-    private var autoPresentedThisLaunch = false
-    /// The virtual DAA score the driver last saw (registration progress).
-    @Published private(set) var virtualDaa: UInt64?
-    /// Expired offers this app is sending back to their buyers (see `returnExpiredOffers`).
-    @Published private(set) var returningOffers: Set<String> = []
-
+    private var pending: [KachatNames.PendingRegistration] = []
     private var pendingWallet: String?
     private var driver: Task<Void, Never>?
 
@@ -105,51 +89,25 @@ final class KachatNamesActions: ObservableObject {
     enum ActionError: LocalizedError {
         case noWallet
         case keyMismatch
-        case invalidKey(String)
         case noSalt
-        case notRegisterable(String)
-        /// renew before its window: the network's time has not reached `expiresAt - renewWindowMs`
-        case renewalNotOpen(opensMs: Int64)
-        /// extend past `periodStart + maxYears`
-        case periodFull(renewalOpensMs: Int64)
         /// the record has no periodStart (an indexer without the field), so its state is unknown
         case periodUnknown
         /// the transaction would pay more than the price the person confirmed
         case priceChanged(UInt64)
-        /// the rebuilt transaction's network fee is above the one the person saw
-        case feeChanged(UInt64)
         /// registry v5: registering opens at the migration deadline, once the old registry's names
         /// are imported
         case registrationNotOpen(opensMs: Int64)
-
-        /// Registering can't start yet - shown as a notice, not an error.
-        var isNotOpenYet: Bool {
-            switch self {
-            case .registrationNotOpen: return true
-            default: return false
-            }
-        }
 
         var errorDescription: String? {
             switch self {
             case .noWallet: return AppLocalization.string("No wallet is open.")
             case .keyMismatch: return AppLocalization.string("This wallet's key does not match its address.")
-            case .invalidKey(let what): return String(format: AppLocalization.string("%@ is not a valid key (not on the secp256k1 curve)."), what)
             case .noSalt: return AppLocalization.string("The secret for this registration is missing on this device.")
-            case .notRegisterable(let why): return why
-            case .renewalNotOpen(let opens):
-                return String(format: AppLocalization.string("Renewal opens on %@"), KachatNamesActions.dayString(opens))
-            case .periodFull(let opens):
-                return String(format: AppLocalization.string("This name is already paid up to its longest period. Renewal opens on %@."),
-                              KachatNamesActions.dayString(opens))
             case .periodUnknown:
                 return AppLocalization.string("The names indexer didn't send this name's paid period. Pull to refresh and try again.")
             case .priceChanged(let price):
                 return String(format: AppLocalization.string("The price changed to %@ since you confirmed. Nothing was sent. Check the new price and confirm again."),
                               KaspaUnit.amount(price))
-            case .feeChanged(let fee):
-                return String(format: AppLocalization.string("The network fee went up to %@ since you confirmed. Nothing was sent. Check the new fee and confirm again."),
-                              KaspaUnit.amount(fee))
             case .registrationNotOpen(let opens):
                 return String(format: AppLocalization.string("Names are moving to the new registry. New names can be claimed from %@."),
                               KachatNamesActions.dayString(opens))
@@ -157,8 +115,7 @@ final class KachatNamesActions: ObservableObject {
         }
     }
 
-    /// A unix-ms day ("Oct 12, 2027") in the in-app language, with the time when it is within two
-    /// days (testnet's 24-hour periods, or a renewal that opens tomorrow).
+
     /// Registry v5 refuses `register` until the migration deadline; checked against the wall clock
     /// with the 3-minute margin `registerNow` takes off it.
     static func requireRegistrationOpen(_ m: KachatNames.Manifest) async throws {
@@ -167,6 +124,8 @@ final class KachatNamesActions: ObservableObject {
         throw ActionError.registrationNotOpen(opensMs: deadline + 180_000)
     }
 
+    /// A unix-ms day ("Oct 12, 2027") in the in-app language, with the time when it is within two
+    /// days (testnet's 24-hour periods, or a renewal that opens tomorrow).
     nonisolated static func dayString(_ ms: Int64) -> String {
         let f = DateFormatter()
         f.locale = AppLocalization.locale
@@ -194,30 +153,15 @@ final class KachatNamesActions: ObservableObject {
         return Signer(address: address, privateKey: key, me: me)
     }
 
-    /// The current wallet's chatting address and key on the network the app runs on - the
-    /// profile record's signer. Unlike `signer()` it isn't testnet-only: profiles work on mainnet
-    /// before its registry launches (`KachatNamesService.profilesEnabled`).
-    func profileSigner() throws -> Signer {
-        guard KachatNamesService.profilesEnabled else { throw KachatNamesService.ServiceError.testnetOnly }
-        guard let address = WalletManager.shared.currentWallet?.publicAddress.lowercased(),
-              let key = WalletManager.shared.getPrivateKey() else { throw ActionError.noWallet }
-        guard NetworkType.isOnActiveNetwork(address) else { throw KachatNamesService.ServiceError.wrongAddressNetwork }
-        let me = try KachatNamesService.xonlyKey(privateKey: key)
-        guard let a = KaspaAddress(address: address), a.type == .pubKey, a.payload == me else { throw ActionError.keyMismatch }
-        return Signer(address: address, privateKey: key, me: me)
-    }
-
     /// Which of this wallet's own addresses holds a name.
     enum OwnAddress: Equatable {
         case chatting
         /// A spending address: the app derives its key, so owner actions sign with it.
         case spending(index: Int, address: String)
-        /// A KasSigner (watch-only) address: owner actions need the device to sign.
-        case kasSigner(account: String, index: Int, address: String)
     }
 
     /// Whether `owner` (an x-only key) is one of this wallet's addresses, and which: the chatting
-    /// address, a revealed spending address, or a KasSigner account address. nil = someone else.
+    /// address or a revealed spending address. nil = someone else.
     func ownAddress(of owner: Data) -> OwnAddress? {
         if owner == myKey { return .chatting }
         let wallet = WalletManager.shared
@@ -226,36 +170,6 @@ final class KachatNamesActions: ObservableObject {
             return .spending(index: index, address: address)
         }
         return nil
-    }
-
-    /// The signer for `op`. Owner-only actions (transfer, list/delist, accept, release) on a name
-    /// held by one of this wallet's spending addresses sign - and pay their fee - from that
-    /// address. Everything else, including extend and renew (anyone may pay those), uses the
-    /// chatting address.
-    private func signer(for op: Operation) throws -> Signer {
-        let heldBy: Data?
-        switch op {
-        case .transfer(let n, _), .list(let n, _), .release(let n): heldBy = n.owner
-        case .accept(_, let n): heldBy = n.owner
-        // the seller declines with the key the offer was made to
-        case .decline(let o): heldBy = o.seller
-        default: heldBy = nil
-        }
-        if let owner = heldBy, case .spending(let index, let address)? = ownAddress(of: owner) {
-            return try spendingSigner(index: index, address: address, expected: owner)
-        }
-        switch op {
-        // an offer is withdrawn with the key it was made from (a refund is anyone's, but the
-        // buyer's own address pays its fee the same way)
-        case .withdraw(let o), .refund(let o):
-            if let mine = try? ownerSigner(o.buyer) { return mine }
-            return try signer()
-        // paid by, and (buy, offer) belonging to, the chatting address
-        case .buy, .offer, .extend, .renew:
-            return try buyerSigner()
-        default:
-            return try signer()
-        }
     }
 
     /// A spending address's signer, checked against the key it must have.
@@ -280,32 +194,6 @@ final class KachatNamesActions: ObservableObject {
         }
     }
 
-    /// Who buys: claims, purchases, offers, extend and renew always pay from - and a new name
-    /// always belongs to - the chatting address (owner's call, 2026-10-21: no Buy From picker).
-    /// Names an earlier build bought from a spending address keep that owner, and the owner's
-    /// own key still signs for them (`signer(for:)`, `ownAddress(of:)`).
-    func buyerSigner() throws -> Signer {
-        try signer()
-    }
-
-    /// Who pays `op` (and, for a buy or an offer, who it belongs to), for the confirmation's
-    /// balance line - the same choice `signer(for:)` makes, without touching a private key.
-    func payer(for op: Operation) -> (address: String, key: Data)? {
-        let held: Data?
-        switch op {
-        case .transfer(let n, _), .list(let n, _), .release(let n): held = n.owner
-        case .accept(_, let n): held = n.owner
-        case .decline(let o): held = o.seller
-        case .withdraw(let o), .refund(let o): held = o.buyer
-        default: held = nil
-        }
-        if let held, case .spending(_, let address)? = ownAddress(of: held) {
-            return (address.lowercased(), held)
-        }
-        guard let me = myKey, let address = myAddress else { return nil }
-        return (address, me)
-    }
-
     // MARK: - Addresses the marketplace bought with
 
     private var marketAddressesKey: String? {
@@ -321,30 +209,6 @@ final class KachatNamesActions: ObservableObject {
     }
 
     // MARK: - This wallet's keys (IOS-085 / XP-024)
-
-    private var ownKeyCache: (key: String, keys: Set<Data>)?
-
-    /// The chatting key and every revealed spending address's key: a name or an offer on any of
-    /// them is this wallet's, on every device restored from the seed - not only on the one that
-    /// bought it. Worked out once per account and address count, so a view body may ask.
-    var allOwnKeys: Set<Data> {
-        guard let wallet = myAddress else { return [] }
-        let manager = WalletManager.shared
-        let cacheKey = "\(wallet)|\(manager.maxSpendingAddressIndex)|\(marketAddresses.count)"
-        if let cached = ownKeyCache, cached.key == cacheKey { return cached.keys }
-        var keys: Set<Data> = []
-        if let me = myKey { keys.insert(me) }
-        for (_, address) in manager.spendingAddresses(inRange: 0..<(max(0, manager.maxSpendingAddressIndex) + 1)) {
-            if let key = KachatNamesRegistry.keyOf(address) { keys.insert(key) }
-        }
-        for address in marketAddresses {
-            if let key = KachatNamesRegistry.keyOf(address) { keys.insert(key) }
-        }
-        ownKeyCache = (cacheKey, keys)
-        return keys
-    }
-
-    func isOwnKey(_ key: Data) -> Bool { allOwnKeys.contains(key) }
 
     private var nameKeysCache: (key: String, at: Date, keys: [Data])?
 
@@ -395,31 +259,33 @@ final class KachatNamesActions: ObservableObject {
         return keys
     }
 
-    /// Every name (`includeInactive`) or held name, and every open offer, on this wallet's keys
-    /// (`ownNameKeys`), asked a few at a time.
-    func ownNamesAndOffers(heldOnly: Bool) async throws -> (names: [KachatNames.NameInfo], offers: [KachatNames.OfferInfo]) {
+    /// Every name (`includeInactive`) or held name on this wallet's keys (`ownNameKeys`), asked a
+    /// few at a time. Offers are KaPay's, so none are read.
+    func ownNames(heldOnly: Bool = true) async throws -> [KachatNames.NameInfo] {
         let keys = await ownNameKeys()
         let registry = KachatNamesRegistry.shared
         var names: [KachatNames.NameInfo] = []
-        var offers: [KachatNames.OfferInfo] = []
-        let lookUp: @MainActor (Data) async throws -> ([KachatNames.NameInfo], [KachatNames.OfferInfo]) = { key in
-            let n = heldOnly ? try await registry.heldNames(owner: key) : try await registry.names(owner: key, includeInactive: true)
-            let o = try await registry.myOffers(buyer: key)
-            return (n, o)
+        let lookUp: @MainActor (Data) async throws -> [KachatNames.NameInfo] = { key in
+            heldOnly ? try await registry.heldNames(owner: key) : try await registry.names(owner: key, includeInactive: true)
         }
-        try await withThrowingTaskGroup(of: ([KachatNames.NameInfo], [KachatNames.OfferInfo]).self) { group in
+        try await withThrowingTaskGroup(of: [KachatNames.NameInfo].self) { group in
             var it = keys.makeIterator()
             for _ in 0..<4 {
                 guard let key = it.next() else { break }
                 group.addTask { try await lookUp(key) }
             }
-            while let (n, o) = try await group.next() {
+            while let n = try await group.next() {
                 names += n
-                offers += o
                 if let key = it.next() { group.addTask { try await lookUp(key) } }
             }
         }
-        return (names, offers)
+        return names
+    }
+
+    /// `ownNames` in the shape the unshown full wallet's Your Domains reads (`FullWalletView`):
+    /// the offers are always empty.
+    func ownNamesAndOffers(heldOnly: Bool) async throws -> (names: [KachatNames.NameInfo], offers: [KachatNames.OfferInfo]) {
+        (try await ownNames(heldOnly: heldOnly), [])
     }
 
     /// The current wallet's x-only key, without touching the private key.
@@ -429,17 +295,6 @@ final class KachatNamesActions: ObservableObject {
     }
 
     var myAddress: String? { WalletManager.shared.currentWallet?.publicAddress.lowercased() }
-
-    /// A key a name or an offer will be locked to must be a point on the curve: the contracts
-    /// cannot check it, and an invalid owner locks a name until it lapses.
-    nonisolated static func validateKey(_ xonly: Data, _ what: String) throws {
-        guard xonly.count == 32, xonly != KachatNames.zero32 else { throw ActionError.invalidKey(what) }
-        do {
-            _ = try P256K.KeyAgreement.PublicKey(dataRepresentation: Data([0x02]) + xonly, format: .compressed)
-        } catch {
-            throw ActionError.invalidKey(what)
-        }
-    }
 
     // MARK: - Fees
 
@@ -455,15 +310,7 @@ final class KachatNamesActions: ObservableObject {
         var isBusy: Bool { normal > KachatNames.minFeerate * 1.5 || normalSeconds > 10 }
     }
 
-    /// The fee a name transaction pays: a speed (the Send screens' Normal / Fast / Priority, as
-    /// multiples of the network's Normal rate), or a total the person typed.
-    enum FeeChoice: Equatable {
-        case tier(WithdrawFeeTier)
-        /// the whole network fee, sompi
-        case customTotal(UInt64)
-    }
-
-    @Published private(set) var feeEstimate: FeeEstimate?
+    private var feeEstimate: FeeEstimate?
 
     /// Reads the fee estimate (node first) and publishes it; nil when nothing answers.
     @discardableResult
@@ -513,21 +360,6 @@ final class KachatNamesActions: ObservableObject {
         return KachatNames.safeFeerate(base * Double(tier.multiplier))
     }
 
-    /// The rate for a choice; nil keeps the old default (the priority rate). A typed total is
-    /// turned into a rate by building the transaction once at the floor to learn its mass.
-    private func feerate(for choice: FeeChoice?, op: Operation, s: Signer) async throws -> Double {
-        switch choice {
-        case nil:
-            return await feerate()
-        case .tier(let tier):
-            return await feerate(for: tier)
-        case .customTotal(let total):
-            let probe = try await build(op, s, feerate: KachatNames.minFeerate).plan
-            let mass = max(1, Double(probe.costs.minFee) / KachatNames.minFeerate)
-            return KachatNames.safeFeerate(Double(total) / mass)
-        }
-    }
-
     /// `max(100, the priority fee rate)` in sompi per gram.
     /// The rate for a transaction sent without a sheet (nobody saw its fee): the priority rate,
     /// capped at `backgroundMaxFeerate`.
@@ -548,24 +380,10 @@ final class KachatNamesActions: ObservableObject {
         let chosen: Double
         if let rate { chosen = rate } else { chosen = await feerate() }
         let env = try await service.environment(privateKey: s.privateKey, feerate: chosen)
-        virtualDaa = env.blockDaa
         // not coins a send still in flight spent
         let utxos = ChatService.shared.unreservedUtxos(try await NodePoolService.shared.getUtxosByAddresses([s.address]))
         let funding = KachatNamesService.fundingUtxos(utxos, me: s.me, virtualDaaScore: env.blockDaa)
         return (builder, env, funding)
-    }
-
-    /// Reads the virtual DAA score (for "refundable now" on offers).
-    func refreshVirtualDaa() async {
-        if let daa = await NodePoolService.shared.currentVirtualDaaScore() { virtualDaa = daa }
-    }
-
-    /// What the wallet can spend on names right now (sompi).
-    func spendable() async throws -> UInt64 {
-        let s = try buyerSigner()
-        let utxos = ChatService.shared.unreservedUtxos(try await NodePoolService.shared.getUtxosByAddresses([s.address]))
-        let daa = await NodePoolService.shared.currentVirtualDaaScore() ?? 0
-        return KachatNamesService.fundingUtxos(utxos, me: s.me, virtualDaaScore: daa).reduce(0) { $0 + $1.entry.amount }
     }
 
     // MARK: - Live records
@@ -581,61 +399,6 @@ final class KachatNamesActions: ObservableObject {
         return KachatNames.GapRecord(lo: g.lo, hi: g.hi, value: u.entry.amount, utxo: u)
     }
 
-    private func liveOffer(_ o: KachatNames.OfferInfo, _ m: KachatNames.Manifest) async throws -> KachatNames.OfferRecord {
-        let u = try await service.liveUtxo(script: m.offer.script(o.fields.encoded), outpoint: o.outpoint)
-        return KachatNames.OfferRecord(fields: o.fields, value: u.entry.amount, utxo: u, name: o.name)
-    }
-
-    /// Longest an offer can run before its buyer may take it back (the app's cap, registry v3).
-    nonisolated static let maxOfferDays: UInt64 = 7
-    /// Kaspa's DAA scores per second (offer refund times are DAA scores).
-    nonisolated static let daaPerSecond: UInt64 = 10
-
-    // MARK: - Operations
-
-    enum Operation {
-        /// add years to the current paid period (anyone, any time, up to 2 years past periodStart)
-        case extend(KachatNames.NameInfo, years: Int64)
-        /// start the next period at the current expiry (anyone, once the renewal window opened)
-        case renew(KachatNames.NameInfo, years: Int64)
-        case transfer(KachatNames.NameInfo, to: Data)
-        /// price 0 delists
-        case list(KachatNames.NameInfo, price: UInt64)
-        case buy(KachatNames.NameInfo)
-        /// made to the name's current owner, the only one who can accept or decline it
-        case offer(target: KachatNames.NameInfo, amount: UInt64, refundAfterDaa: UInt64)
-        case withdraw(KachatNames.OfferInfo)
-        case refund(KachatNames.OfferInfo)
-        case accept(KachatNames.OfferInfo, name: KachatNames.NameInfo)
-        /// the seller sends it back to the buyer (registry v3); the network fee comes out of the offer
-        case decline(KachatNames.OfferInfo)
-        case release(KachatNames.NameInfo)
-        case reclaim(KachatNames.NameInfo)
-    }
-
-    /// Builds `op` against live UTXOs without submitting anything: the fee and outputs a sheet
-    /// shows before the person confirms.
-    func plan(_ op: Operation, fee: FeeChoice? = nil) async throws -> KachatNames.Plan {
-        try await planWithRate(op, fee: fee).plan
-    }
-
-    /// The plan and the fee rate it was built at - the rate `perform(exactFeerate:)` then sends at,
-    /// so the fee sent is the fee shown (IOS-061).
-    ///
-    /// A preview never sends anything (IOS-075). When the KAS is there but in more small coins
-    /// than the transaction can take, it is planned as if they were already combined, and
-    /// `combinesCoins` says so: the combine itself is sent by `perform`, after the slide and
-    /// Face ID / passcode.
-    func planWithRate(_ op: Operation, fee: FeeChoice? = nil) async throws -> (plan: KachatNames.Plan, feerate: Double, combinesCoins: Bool) {
-        let s = try signer(for: op)
-        let rate = try await feerate(for: fee, op: op, s: s)
-        do {
-            return (try await build(op, s, feerate: rate).plan, rate, false)
-        } catch let error where Self.isTooManyCoins(error) {
-            return (try await build(op, s, feerate: rate, previewCombined: true).plan, rate, true)
-        }
-    }
-
     // MARK: - Many small coins (mainnet, 2026-10-09)
 
     /// A name transaction takes at most a few funding inputs (`KachatNames.maxInputsFeeEntry`
@@ -644,21 +407,6 @@ final class KachatNamesActions: ObservableObject {
     /// would cover the transaction (IOS-075): a wallet that is simply short never combines.
     nonisolated static func isTooManyCoins(_ error: Error) -> Bool {
         (error as? KachatNames.Failure)?.message.contains("funding inputs fit") == true
-    }
-
-    /// The wallet as it will be once `combineCoins` ran: its largest coins (as many as a send
-    /// takes) as one coin, less room for that send's fee. Only ever planned against, for a
-    /// preview - never signed or sent.
-    static func combinedPreviewWallet(_ wallet: [KachatNames.Utxo]) -> [KachatNames.Utxo] {
-        let sorted = wallet.sorted { $0.entry.amount > $1.entry.amount }
-        let merged = sorted.prefix(KasiaTransactionBuilder.maxInputsPerTransaction)
-        guard merged.count > 1, var entry = merged.first?.entry else { return wallet }
-        let total = merged.reduce(UInt64(0)) { $0 + $1.entry.amount }
-        let feeRoom: UInt64 = 5_000_000
-        guard total > feeRoom else { return wallet }
-        entry.amount = total - feeRoom
-        let standIn = KachatNames.Utxo(outpoint: KachatNames.Outpoint(txid: Data(repeating: 0xcc, count: 32), index: 0), entry: entry)
-        return [standIn] + sorted.dropFirst(merged.count)
     }
 
     /// Combines the wallet's coins into one: a plain send of up to `maxInputsPerTransaction`
@@ -707,346 +455,6 @@ final class KachatNamesActions: ObservableObject {
         return txId
     }
 
-    private func build(_ op: Operation, _ s: Signer, feerate rate: Double? = nil, previewCombined: Bool = false) async throws -> (plan: KachatNames.Plan, env: KachatNames.Env) {
-        let m = try await registry.prepare()
-        let (b, env, live) = try await context(s, feerate: rate)
-        let wallet = previewCombined ? Self.combinedPreviewWallet(live) : live
-        let plan: KachatNames.Plan
-        switch op {
-        case .extend(let n, let years):
-            guard n.periodStart != nil else { throw ActionError.periodUnknown }
-            guard years >= 1, years <= n.extendableYears(m.params) else { throw ActionError.periodFull(renewalOpensMs: n.renewOpens(m.params)) }
-            plan = try b.extend(env: env, wallet: wallet, name: try await liveName(n, m), years: years)
-        case .renew(let n, let years):
-            // Valid only once the network's median time passes the window opening (the mempool
-            // keeps no future-dated transactions): refuse before, and say when it opens.
-            guard KachatNames.Builder.renewWindowOpen(env: env, params: m.params, expiresAt: n.expiresAt) else {
-                throw ActionError.renewalNotOpen(opensMs: n.renewOpens(m.params))
-            }
-            // A renewal counts from the old expiry, not from today: one that would still end in
-            // the past is paid for nothing, and anyone could reclaim the name right after.
-            guard KachatNames.clampedSum(n.expiresAt, KachatNames.clampedProduct(years, m.params.periodMs)) > env.wallMs else {
-                throw KachatNames.Failure(AppLocalization.string("This name has been expired too long to renew. It can only be reclaimed and registered again."))
-            }
-            plan = try b.renew(env: env, wallet: wallet, name: try await liveName(n, m), years: years)
-        case .transfer(let n, let to):
-            try Self.validateKey(to, AppLocalization.string("The new owner"))
-            plan = try b.transfer(env: env, wallet: wallet, name: try await liveName(n, m), newOwner: to)
-        case .list(let n, let price):
-            if price > 0, n.status(graceMs: m.params.graceMs) != .active {
-                throw ActionError.notRegisterable(AppLocalization.string("An expired name can't be listed. Renew it first."))
-            }
-            plan = try b.list(env: env, wallet: wallet, name: try await liveName(n, m), price: price)
-        case .buy(let n):
-            try Self.validateKey(env.me, AppLocalization.string("Your key"))
-            plan = try b.buy(env: env, wallet: wallet, name: try await liveName(n, m))
-        case .offer(let target, let amount, let refundAfter):
-            try Self.validateKey(env.me, AppLocalization.string("Your key"))
-            // an expired name can be reclaimed by anyone soon: the buyer would pay for nothing
-            guard target.status(graceMs: m.params.graceMs) == .active else {
-                throw KachatNames.Failure(AppLocalization.string("Offers can only be made on active names."))
-            }
-            guard target.owner != env.me else {
-                throw KachatNames.Failure(AppLocalization.string("You can't make an offer on your own name."))
-            }
-            // the app's cap: the buyer's funds come back within a week at most
-            let cap = KachatNames.clampedSum(env.blockDaa, Self.maxOfferDays * 86_400 * Self.daaPerSecond)
-            guard refundAfter > env.blockDaa, refundAfter <= cap else {
-                throw KachatNames.Failure(AppLocalization.string("An offer can run for up to 7 days."))
-            }
-            // MAINNET.md C1: refundable before the name expires - past that the seller could
-            // accept it and then reclaim the name, leaving the buyer only the bond
-            let refundAtMs = env.wallMs + Int64(refundAfter - env.blockDaa) * 1000 / Int64(Self.daaPerSecond)
-            guard refundAtMs <= target.expiresAt else {
-                throw KachatNames.Failure(AppLocalization.string("An offer must be refundable before the name expires."))
-            }
-            plan = try b.offer(env: env, wallet: wallet, target: try await liveName(target, m), amount: amount, refundAfter: refundAfter)
-        case .withdraw(let o):
-            plan = try b.withdrawOffer(env: env, offer: try await liveOffer(o, m))
-        case .refund(let o):
-            plan = try b.refundOffer(env: env, offer: try await liveOffer(o, m))
-        case .accept(let o, let n):
-            // The contract would still take an expired offer; the app doesn't - it goes back.
-            if o.refundable(atDaa: env.blockDaa) {
-                throw KachatNames.Failure(AppLocalization.string("This offer has expired. It's going back to the buyer."))
-            }
-            // The contract would hand over an expired name too; the buyer would get a name anyone
-            // can reclaim. Only an active name is accepted.
-            guard n.status(graceMs: m.params.graceMs) == .active else {
-                throw KachatNames.Failure(AppLocalization.string("This name has expired. Offers can only be accepted while the name is active. Renew it first."))
-            }
-            // Made to an earlier owner: the contract refuses it, and it goes back to the buyer.
-            if o.isDeclined(currentOwner: n.owner) {
-                throw KachatNames.Failure(AppLocalization.string("This offer was made before the name changed hands, so it's declined and going back to the buyer."))
-            }
-            try Self.validateKey(o.buyer, AppLocalization.string("The buyer"))
-            // The offer's script doesn't commit to its amount, so the amount the screen showed is only
-            // the indexer's word. The name doesn't go unless the coins really are there.
-            let liveOffered = try await liveOffer(o, m)
-            guard liveOffered.value == o.amount else {
-                throw KachatNames.Failure(AppLocalization.string("This offer holds a different amount than was shown. Nothing was sent."))
-            }
-            plan = try b.acceptOffer(env: env, name: try await liveName(n, m), offer: liveOffered)
-        case .decline(let o):
-            plan = try b.declineOffer(env: env, offer: try await liveOffer(o, m))
-        case .release(let n):
-            let gaps = try await registry.exitGaps(for: n)
-            plan = try b.release(env: env, parts: KachatNames.ExitParts(
-                below: try await liveGap(gaps.below, m), name: try await liveName(n, m), above: try await liveGap(gaps.above, m)))
-        case .reclaim(let n):
-            let gaps = try await registry.exitGaps(for: n)
-            plan = try b.reclaim(env: env, parts: KachatNames.ExitParts(
-                below: try await liveGap(gaps.below, m), name: try await liveName(n, m), above: try await liveGap(gaps.above, m)))
-        }
-        return (plan, env)
-    }
-
-    /// Builds, signs and submits `op`; returns the txid. The registry refreshes once the
-    /// transaction is accepted.
-    /// `maxPrice` is the price the person saw and confirmed (a plan's `priceFee`): a register,
-    /// extend or renew never pays more. Prices can change at any time in the price record.
-    @discardableResult
-    /// `exactFeerate` (from `planWithRate`) sends at the rate the person saw instead of reading it
-    /// again; `maxNetworkFee` refuses a rebuild whose network fee is above the one shown (the
-    /// inputs can change between the two builds), like `maxPrice` does for the price.
-    func perform(_ op: Operation, maxPrice: UInt64? = nil, fee: FeeChoice? = nil,
-                 exactFeerate: Double? = nil, maxNetworkFee: UInt64? = nil) async throws -> String {
-        let s = try signer(for: op)
-        let rate: Double
-        if let exactFeerate { rate = KachatNames.safeFeerate(exactFeerate) } else { rate = try await feerate(for: fee, op: op, s: s) }
-        let (txId, plan) = try await submit(op, s, maxPrice: maxPrice, maxNetworkFee: maxNetworkFee, feerate: rate)
-        // An offer you withdrew or refunded yourself isn't news in the Profile bell; the ones
-        // this app returns on its own (expired, made to an earlier owner) are.
-        switch op {
-        case .withdraw(let o) where !withdrawingOffers.contains(o.id),
-             .refund(let o) where !returningOffers.contains(o.id):
-            KachatNamesNotifier.shared.selfClosedOffers.insert(o.id)
-        default:
-            break
-        }
-        // A name that leaves this owner takes no offers with it: the ones made to this owner
-        // can never be accepted any more, so they go back to their buyers - once the change is
-        // in a block, never while it could still be dropped.
-        var onAccepted: (@MainActor () -> Void)?
-        switch op {
-        case .transfer(let n, _), .release(let n):
-            onAccepted = { [weak self] in self?.declineOpenOffers(on: n, except: nil) }
-        case .accept(let o, let n):
-            onAccepted = { [weak self] in self?.declineOpenOffers(on: n, except: o) }
-        default:
-            break
-        }
-        follow(txId: txId, plan: plan, onAccepted: onAccepted)
-        return txId
-    }
-
-    /// Signs and submits `op`, rebuilt against live UTXOs. It never pays more than `maxPrice`,
-    /// the price the person confirmed.
-    private func submit(_ op: Operation, _ s: Signer, maxPrice: UInt64?, maxNetworkFee: UInt64? = nil,
-                        feerate rate: Double?) async throws -> (String, KachatNames.Plan) {
-        let built: (plan: KachatNames.Plan, env: KachatNames.Env)
-        do {
-            built = try await build(op, s, feerate: rate)
-        } catch let error where Self.isTooManyCoins(error) {
-            try await combineCoins(s)
-            built = try await build(op, s, feerate: rate)
-        }
-        let (plan, env) = built
-        if let maxPrice, plan.priceFee > maxPrice { throw ActionError.priceChanged(plan.priceFee) }
-        // A few percent of slack: the same rate on a rebuild with other inputs can weigh a little more.
-        if let maxNetworkFee, plan.networkFee > maxNetworkFee + maxNetworkFee / 20 + 1_000 {
-            throw ActionError.feeChanged(plan.networkFee)
-        }
-        let txId = try await service.signAndSubmit(plan, privateKey: s.privateKey, env: env)
-        if case .offer = op, let o = plan.newOffer {
-            registry.trackOffer(KachatNames.OfferInfo(
-                outpoint: o.utxo.outpoint, key: o.fields.key, name: o.name, buyer: o.fields.buyer, seller: o.fields.seller,
-                amount: o.value, refundAfter: o.fields.refundAfter, createdAt: KachatNames.nowMs()))
-        }
-        return (txId, plan)
-    }
-
-    // MARK: - Following a sent transaction (node only)
-
-    /// Where a sent name transaction is: sent, waiting in a node's mempool, in a block (its output
-    /// is in the UTXO set), shown (the registry has it), or dropped (no node has it).
-    enum TxStage: Equatable { case sent, inMempool, accepted, shown, dropped }
-
-    /// The stage of every transaction sent from this app this session, by txid.
-    @Published private(set) var txStages: [String: TxStage] = [:]
-
-    /// Follows `txId` on a node until it is in a block, then refreshes the registry so the change
-    /// shows. "In a block" is the node's UTXO set holding the transaction's own output - no
-    /// indexer or explorer involved.
-    /// Without a plan (a transaction built elsewhere, like a profile save) only the mempool, then
-    /// the REST API, can tell.
-    /// `onAccepted` runs once, when it is in a block.
-    func follow(txId: String, plan: KachatNames.Plan?, onAccepted: (@MainActor () -> Void)? = nil) {
-        txStages[txId] = .sent
-        // a registry or offer output (P2SH) if there is one, else the first output
-        let outputs = plan?.unsignedTx.outputs ?? []
-        let index = outputs.firstIndex { KachatNamesService.p2shAddress(script: $0.script) != nil } ?? 0
-        let address: String? = index < outputs.count
-            ? (KachatNamesService.p2shAddress(script: outputs[index].script) ?? Self.p2pkAddress(script: outputs[index].script))
-            : nil
-        Task { @MainActor in
-            var sawMempool = false
-            let started = Date()
-            while Date().timeIntervalSince(started) < 300 {
-                if let address, let utxos = try? await NodePoolService.shared.getUtxosByAddresses([address]),
-                   let landed = utxos.first(where: { $0.outpoint.transactionId.lowercased() == txId.lowercased() && $0.outpoint.index == UInt32(index) }) {
-                    txStages[txId] = .accepted
-                    onAccepted?()
-                    // until the registry (indexer or walk) has caught up with this block
-                    await registry.refreshUntilIncludes(txId: txId, daa: landed.blockDaaScore)
-                    txStages[txId] = .shown
-                    return
-                }
-                if await NodePoolService.shared.getMempoolEntry(txId: txId) != nil {
-                    sawMempool = true
-                    if txStages[txId] == .sent { txStages[txId] = .inMempool }
-                } else if sawMempool || address == nil || Date().timeIntervalSince(started) > 20 {
-                    // Out of the mempool and not found by its output: in a block whose output was
-                    // spent right away, or dropped. A node-held answer is preferred; the REST API
-                    // settles the rare case.
-                    if await KachatNamesRegistry.isAccepted(txId: txId) {
-                        txStages[txId] = .accepted
-                        onAccepted?()
-                        await registry.refreshUntilIncludes(txId: txId, daa: await NodePoolService.shared.currentVirtualDaaScore())
-                        txStages[txId] = .shown
-                        return
-                    }
-                    if Date().timeIntervalSince(started) > 60 {
-                        txStages[txId] = .dropped
-                        return
-                    }
-                }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-            }
-            txStages[txId] = .dropped
-        }
-    }
-
-    /// The address (this network's prefix) of a P2PK output script (`<32-byte key> OP_CHECKSIG`).
-    private static func p2pkAddress(script: Data) -> String? {
-        let b = [UInt8](script)
-        guard b.count == 34, b[0] == 0x20, b[33] == 0xac else { return nil }
-        return KachatNamesRegistry.address(of: Data(b[1..<33]))
-    }
-
-    // MARK: - Expired offers
-
-    /// Sends expired offers back to their buyers. Past its refund time an offer can still be
-    /// accepted on chain until someone refunds it, so it would otherwise hang on the name. The
-    /// refund needs nobody's key and its network fee comes out of the offer itself, so whichever
-    /// app sees one first - its buyer's, or the owner's of the name it's on - returns it, at no
-    /// cost to either. Each offer is tried once per session; a refund someone else got in first
-    /// just fails quietly.
-    func returnExpiredOffers(_ offers: [KachatNames.OfferInfo]) async {
-        guard KachatNamesService.isLaunched, !offers.isEmpty else { return }
-        await refreshVirtualDaa()
-        guard let daa = virtualDaa else { return }
-        for o in offers where o.refundable(atDaa: daa) && !returningOffers.contains(o.id) {
-            returningOffers.insert(o.id)
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                do {
-                    let txId = try await self.perform(.refund(o))
-                    AppLog.log("[KachatNames] returned expired offer %@ to its buyer: %@", o.id, txId)
-                } catch {
-                    AppLog.log("[KachatNames] expired offer %@ not returned: %@", o.id, error.localizedDescription)
-                }
-            }
-        }
-    }
-
-    /// Offers this app is withdrawing because the name changed hands (see `withdrawDeclinedOffers`).
-    @Published private(set) var withdrawingOffers: Set<String> = []
-    /// Offers this app is declining for their seller (see `declineOpenOffers`).
-    @Published private(set) var decliningOffers: Set<String> = []
-
-    /// Sends back every open offer on `n` made to its owner, once the name leaves them (transfer,
-    /// release, or an accepted offer - `except` is that one). Each is the seller's `decline`, so
-    /// it costs the seller nothing: the network fee comes out of the offer.
-    func declineOpenOffers(on n: KachatNames.NameInfo, except accepted: KachatNames.OfferInfo?) {
-        guard KachatNamesService.isLaunched else { return }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            let open = ((try? await self.registry.offers(for: n.name)) ?? [])
-                .filter { $0.seller == n.owner && $0.id != accepted?.id && !self.decliningOffers.contains($0.id) }
-            for o in open {
-                self.decliningOffers.insert(o.id)
-                do {
-                    let txId = try await self.perform(.decline(o))
-                    AppLog.log("[KachatNames] declined offer %@ on %@ (the name left this owner): %@", o.id, n.name, txId)
-                } catch {
-                    AppLog.log("[KachatNames] offer %@ not declined: %@", o.id, error.localizedDescription)
-                }
-            }
-        }
-    }
-
-    /// Pulls this wallet's declined offers back: those made to an earlier owner of the name (the
-    /// contract refuses them now) or on a name since released. A withdraw, signed by the buyer -
-    /// you - and paid back to you. Before its refund time only the buyer or the seller can return
-    /// an offer, so the buyer's app does it as soon as it sees the name changed hands; after that,
-    /// `returnExpiredOffers` covers it from any app. Each offer is asked about once per session,
-    /// only once a node has the record that says so, and goes back only with the owner's Face ID.
-    func withdrawDeclinedOffers(_ offers: [KachatNames.OfferInfo]) async {
-        let keys = allOwnKeys
-        guard KachatNamesService.isLaunched, !keys.isEmpty else { return }
-        let mine = offers.filter {
-            keys.contains($0.buyer) && !withdrawingOffers.contains($0.id) && !returningOffers.contains($0.id)
-                && !askedToWithdrawOffers.contains($0.id)
-        }
-        guard !mine.isEmpty else { return }
-        var ownerByName: [String: Data?] = [:]
-        var due: [KachatNames.OfferInfo] = []
-        for o in mine {
-            guard let name = o.name else { continue }
-            if ownerByName[name] == nil {
-                // never on a behind chain copy's or an indexer's word alone
-                guard let found = try? await registry.lookup(name), await isLiveOnChain(found) else { continue }
-                switch found {
-                // MAINNET.md C1: once the name has expired the seller could accept the offer
-                // and then reclaim the name, so it counts as declined - it comes back
-                case .registered(let n) where n.status(graceMs: registry.graceMs) != .active: ownerByName[name] = .some(Data?.none)
-                case .registered(let n): ownerByName[name] = .some(n.owner)
-                case .free: ownerByName[name] = .some(Data?.none)
-                }
-            }
-            // still made to the name's current owner, who still holds it: it stands
-            if case .some(.some(let current)) = ownerByName[name], !o.isDeclined(currentOwner: current) { continue }
-            due.append(o)
-        }
-        guard !due.isEmpty, UIApplication.shared.applicationState == .active else { return }
-        askedToWithdrawOffers.formUnion(due.map(\.id))
-        let reason = AppLocalization.string("Take back your .kachat offers on names that changed hands")
-        guard await deviceOwnerConfirms(reason: reason) else { return }
-        // signed out or switched while the prompt was up
-        for o in due where allOwnKeys.contains(o.buyer) {
-            withdrawingOffers.insert(o.id)
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                do {
-                    let txId = try await self.perform(.withdraw(o))
-                    AppLog.log("[KachatNames] withdrew declined offer %@ (the name changed hands): %@", o.id, txId)
-                } catch {
-                    AppLog.log("[KachatNames] declined offer %@ not withdrawn: %@", o.id, error.localizedDescription)
-                }
-            }
-        }
-    }
-
-    /// Offers `withdrawDeclinedOffers` has asked the person about this session.
-    private var askedToWithdrawOffers: Set<String> = []
-
-    private func deviceOwnerConfirms(reason: String) async -> Bool {
-        await withCheckedContinuation { (done: CheckedContinuation<Bool, Never>) in
-            DeviceAuth.authenticate(reason: reason, onSuccess: { done.resume(returning: true) }, onFailure: { done.resume(returning: false) })
-        }
-    }
-
     /// Whether a node still holds what `found` rests on: the name's record, or the gap a free
     /// name falls in. The registry's answer can be behind the chain, or an indexer's word only.
     private func isLiveOnChain(_ found: KachatNames.Lookup) async -> Bool {
@@ -1059,233 +467,28 @@ final class KachatNamesActions: ObservableObject {
         }
     }
 
-    // MARK: - Profile record
-
-    /// Writes the address profile (`kchat:1:profile:`): a self-transfer, network fee only.
-    @discardableResult
-    /// What saving `profile` will cost: the profile record is a self-transfer from the chatting
-    /// address, so the network fee is all it spends. Built (and signed) the same way the save
-    /// builds it, never sent.
-    func profileFee(_ profile: KachatNames.Profile) async throws -> UInt64 {
-        let s = try profileSigner()
-        let json = try profile.sanitized().recordJSON()
-        let utxos = ChatService.shared.unreservedUtxos(try await NodePoolService.shared.getUtxosByAddresses([s.address]))
-        let tx = try service.buildProfileRecord(address: s.address, privateKey: s.privateKey, utxos: utxos, json: json)
-        let spent = tx.inputs.reduce(UInt64(0)) { total, input in
-            total + (utxos.first {
-                $0.outpoint.transactionId == input.previousOutpoint.transactionId && $0.outpoint.index == input.previousOutpoint.index
-            }?.amount ?? 0)
-        }
-        let back = tx.outputs.reduce(UInt64(0)) { $0 + $1.value }
-        return spent > back ? spent - back : 0
-    }
-
-    func saveProfile(_ profile: KachatNames.Profile) async throws -> String {
-        let s = try profileSigner()
-        let clean = profile.sanitized()
-        let json = try clean.recordJSON()
-        let utxos = ChatService.shared.unreservedUtxos(try await NodePoolService.shared.getUtxosByAddresses([s.address]))
-        let txId = try await service.submitProfileRecord(address: s.address, privateKey: s.privateKey, utxos: utxos, json: json)
-        registry.noteOwnProfile(clean, address: s.address, txId: txId)
+    /// Frees a lapsed record (a reclaim): anyone may send it, its bond goes back to the old owner
+    /// and its fee comes out of the freed deposit. Signed by the chatting address; the registry
+    /// refreshes once it is accepted.
+    private func reclaim(_ n: KachatNames.NameInfo, feerate rate: Double) async throws -> String {
+        let s = try signer()
+        let m = try await registry.prepare()
+        let (b, env, _) = try await context(s, feerate: KachatNames.safeFeerate(rate))
+        let gaps = try await registry.exitGaps(for: n)
+        let plan = try b.reclaim(env: env, parts: KachatNames.ExitParts(
+            below: try await liveGap(gaps.below, m), name: try await liveName(n, m), above: try await liveGap(gaps.above, m)))
+        let txId = try await service.signAndSubmit(plan, privateKey: s.privateKey, env: env)
         registry.refreshAfter(txId: txId)
         return txId
     }
 
-    // MARK: - Registration
+    // MARK: - Registrations started in an older build
 
-    struct Quote: Equatable {
-        var name: String
-        var years: Int64
-        /// price per year x years, left to miners
-        var price: UInt64
-        /// the name's bond, returned on release
-        var bond: UInt64
-        /// the extra registry gap the registration creates, returned on release
-        var gapDeposit: UInt64
-        /// the commit's value, returned into the registration
-        var commit: UInt64
-        var networkFee: UInt64
-        /// The fee rate `networkFee` was worked out at (sompi per gram): a fee typed on the review
-        /// becomes a rate in proportion to it.
-        var feerate: Double = 0
-        /// what leaves the wallet in the end: price + bond + gap deposit + network fees
-        var total: UInt64
-        var spendable: UInt64
-        /// The KAS is there but in too many small coins for one transaction: KaChat combines them
-        /// into one before registering (`combineCoins`).
-        var combinesCoins = false
-
-        var affordable: Bool { spendable >= total + KachatNames.minChange }
-    }
-
-    /// The cost of registering `name` for `years`, estimated by building both transactions
-    /// (nothing is signed or sent).
-    func quote(name: String, years: Int64, gap: KachatNames.GapInfo, feeTier: WithdrawFeeTier = .normal,
-               customFeerate: Double? = nil) async throws -> Quote {
-        let s = try buyerSigner()
-        let m = try await registry.prepare()
-        try await Self.requireRegistrationOpen(m)
-        let rate = await claimFeerate(feeTier, customFeerate)
-        let (b, env, wallet) = try await context(s, feerate: rate)
-        let salt = try KachatNamesService.newSalt()
-        let spendable = wallet.reduce(UInt64(0)) { $0 + $1.entry.amount }
-        let price = m.params.registerCost(forLength: name.utf8.count, years: years)
-        var commitFee: UInt64 = 0
-        var registerFee: UInt64 = 0
-        var combinesCoins = false
-        if let commitPlan = try? b.commit(env: env, wallet: wallet, name: name, salt: salt) {
-            commitFee = commitPlan.networkFee
-            // the registration, with the commit as if it were already mature and the gap as known
-            if var commit = commitPlan.newCommit {
-                commit.utxo?.entry.blockDaaScore = env.blockDaa > m.params.tCommit ? env.blockDaa - m.params.tCommit : 0
-                let gapUtxo = KachatNames.Utxo(outpoint: gap.outpoint, entry: KachatNames.UtxoEntry(
-                    amount: m.params.gapValue, script: m.gap.script(KachatNames.Codec.gapState(lo: gap.lo, hi: gap.hi)),
-                    blockDaaScore: env.blockDaa, covenantId: m.registryCovenantId))
-                let rest = wallet.filter { u in !commitPlan.inputs.contains { $0.utxo.outpoint == u.outpoint } }
-                do {
-                    let reg = try b.register(env: env, wallet: rest, gap: KachatNames.GapRecord(lo: gap.lo, hi: gap.hi, value: m.params.gapValue, utxo: gapUtxo),
-                                             commit: commit, years: years, now: KachatNames.Builder.registerNow(env: env))
-                    registerFee = reg.networkFee
-                } catch {
-                    combinesCoins = Self.isTooManyCoins(error)
-                }
-            }
-        }
-        if registerFee == 0 { registerFee = 400_000 }
-        if commitFee == 0 { commitFee = 250_000 }
-        let fee = commitFee + registerFee
-        return Quote(name: name, years: years, price: price, bond: m.params.bond, gapDeposit: m.params.gapValue,
-                     commit: KachatNames.commitValue, networkFee: fee, feerate: rate,
-                     total: price + m.params.bond + m.params.gapValue + fee,
-                     spendable: spendable, combinesCoins: combinesCoins)
-    }
-
-    /// Starts registering `name`: a fresh salt (Keychain), the salted commit (submitted), then the
-    /// driver registers once the commit is `tCommit` deep. Returns the commit txid.
-    @discardableResult
-    func startRegistration(name raw: String, years: Int64, maxPrice: UInt64, feeTier: WithdrawFeeTier = .normal,
-                           customFeerate: Double? = nil) async throws -> String {
-        let s = try buyerSigner()
-        // kept with the wallet's claims (and its salt under the wallet), whichever address pays
-        guard let walletAddress = myAddress else { throw ActionError.noWallet }
-        let name = KachatNames.Codec.normalize(raw)
-        try KachatNames.Codec.validate(name)
-        // never a commit that couldn't be registered: v5 opens register at its migration deadline
-        let manifest = try await registry.prepare()
-        try await Self.requireRegistrationOpen(manifest)
-        loadPending(for: walletAddress)
-        await registry.refresh()
-        // Expired past grace: free to claim. The commit and the reclaim that frees the old
-        // record both go out now; the driver registers once the commit has aged.
-        let lapsed = try await claimable(name, manifest)
-        let (b, env, wallet) = try await context(s, feerate: await claimFeerate(feeTier, customFeerate))
-        let salt = try KachatNamesService.newSalt()
-        let plan = try b.commit(env: env, wallet: wallet, name: name, salt: salt)
-        guard let commit = plan.newCommit, let script = commit.utxo?.entry.script else { throw KachatNames.Failure("commit: no record") }
-        let id = UUID().uuidString
-        try KeychainService.shared.saveKachatCommitSalt(salt, id: id, walletAddress: walletAddress)
-        let now = KachatNames.nowMs()
-        var record = KachatNames.PendingRegistration(
-            id: id, name: name, years: years, owner: KachatNames.hex(s.me), commitTxId: plan.unsignedTx.idHex,
-            commitScript: KachatNames.hex(script), commitDaa: nil, registerTxId: nil, cancelTxId: nil,
-            stage: .committing, createdAt: now, updatedAt: now, lastError: nil, maxPrice: maxPrice,
-            feeTier: feeTier.rawValue, customFeerate: customFeerate
-        )
-        loadPending(for: walletAddress)
-        upsert(record)
-        do {
-            let txId = try await service.signAndSubmit(plan, privateKey: s.privateKey, env: env)
-            record.commitTxId = txId
-            record.commitTxIds = [txId]
-            record.commitSentAt = KachatNames.nowMs()
-            record.stage = .waiting
-            record.updatedAt = KachatNames.nowMs()
-            upsert(record)
-            // The reclaim needs nothing from the wallet (its fee comes out of the freed deposit),
-            // so it runs while the commit ages instead of after. If it fails, the driver sends it.
-            if let lapsed { try? await sendReclaim(of: lapsed, for: record) }
-        } catch {
-            // The node may still have taken it: keep the record (and the salt) until the driver
-            // sees the commit on chain or gives up on it.
-            record.lastError = error.localizedDescription
-            record.updatedAt = KachatNames.nowMs()
-            upsert(record)
-            startDriver()
-            throw error
-        }
-        startDriver()
-        return record.commitTxId
-    }
-
-    /// What claiming `name` starts from: nil when it is free in a gap a node holds right now, the
-    /// old record when it has lapsed and a node still holds it. Throws when it is taken, or when
-    /// that can't be confirmed: no commit on an answer that can be behind the chain.
-    private func claimable(_ name: String, _ m: KachatNames.Manifest) async throws -> KachatNames.NameInfo? {
-        for attempt in 0..<2 {
-            switch try await registry.lookup(name) {
-            case .registered(let n) where n.status(graceMs: registry.graceMs) == .lapsed:
-                if await isLiveOnChain(.registered(n)) { return n }
-            case .registered:
-                throw ActionError.notRegisterable(String(format: AppLocalization.string("%@ is already registered."), KachatNameLabel.display(name)))
-            case .free(_, let g):
-                // the gap must still be live: spent means someone registered into it since
-                if let g, (try? await liveGap(g, m)) != nil { return nil }
-                AppLog.log("[KachatNames] no live gap for %@ (try %d)", name, attempt + 1)
-            }
-            // the answer is already out of date: read it again once
-            if attempt == 0 { await registry.refresh() }
-        }
-        throw ActionError.notRegisterable(AppLocalization.string("Couldn't confirm this name is free. Try again in a moment."))
-    }
-
-    /// Spends the commit back (the name was taken, or the person changed their mind).
-    @discardableResult
-    func cancel(_ p: KachatNames.PendingRegistration) async throws -> String {
-        let s = try ownerSigner(try KachatNames.unhex32(p.owner))
-        guard let salt = try KeychainService.shared.loadKachatCommitSalt(id: p.id, walletAddress: pendingWallet ?? s.address) else { throw ActionError.noSalt }
-        let b = try await service.builder()
-        let env = try await service.environment(privateKey: s.privateKey, feerate: await feerate())
-        // whichever send of the commit landed; with none found, the node's own answer
-        let commitUtxo: KachatNames.Utxo
-        if case .live(let u) = await findCommit(p) {
-            commitUtxo = u
-        } else {
-            commitUtxo = try await service.liveUtxo(script: try KachatNames.unhex(p.commitScript), outpoint: try commitOutpoint(p))
-        }
-        let plan = try b.cancelCommit(env: env, commit: KachatNames.CommitRecord(name: p.name, owner: s.me, salt: salt, value: commitUtxo.entry.amount, utxo: commitUtxo))
-        let txId = try await service.signAndSubmit(plan, privateKey: s.privateKey, env: env)
-        var q = pending.first { $0.id == p.id } ?? p
-        q.commitTxId = KachatNames.hex(commitUtxo.outpoint.txid)
-        q.cancelTxId = txId
-        q.stage = .cancelling
-        q.updatedAt = KachatNames.nowMs()
-        upsert(q)
-        startDriver()
-        return txId
-    }
-
-    /// Try a failed registration again.
-    func retry(_ p: KachatNames.PendingRegistration) {
-        combinedFor.remove(p.id) // Try Again may combine coins again
-        var q = p
-        q.stage = .waiting
-        q.lastError = nil
-        q.updatedAt = KachatNames.nowMs()
-        upsert(q)
-        startDriver()
-    }
-
-
-    /// Drop a finished (registered or cancelled) registration from the list.
-    func dismiss(_ p: KachatNames.PendingRegistration) {
-        guard let address = pendingWallet else { return }
-        remove(p.id, address: address)
-    }
-
-    /// Loads the current wallet's registrations and drives the open ones. Call on appear and
-    /// when the app becomes active.
+    /// Loads the current wallet's registrations and drives the open ones to registered (or
+    /// failed). Called when the app becomes active; nothing new is ever started here.
     func resume() {
-        // Every network: a profile saved on another device (Android, Desktop) shows here too.
+        // Every network: a profile saved on another device (Android, Desktop, KaPay) shows here
+        // too, instead of an older copy this device saved.
         if let address = myAddress {
             Task { await registry.syncOwnProfile(address: address) }
         }
@@ -1298,11 +501,6 @@ final class KachatNamesActions: ObservableObject {
         }
         loadPending(for: address)
         startDriver()
-        // A claim still in progress when the app starts: its half sheet comes back up once.
-        if !autoPresentedThisLaunch, let open = pending.first(where: { $0.needsDriving }) {
-            autoPresentedThisLaunch = true
-            autoPresentedRegistration = open.id
-        }
     }
 
     private func startDriver() {
@@ -1324,9 +522,6 @@ final class KachatNamesActions: ObservableObject {
         }
     }
 
-    private func commitOutpoint(_ p: KachatNames.PendingRegistration) throws -> KachatNames.Outpoint {
-        KachatNames.Outpoint(txid: try KachatNames.unhex32(p.commitTxId), index: 0)
-    }
 
     private enum CommitLookup {
         case live(KachatNames.Utxo)
@@ -1368,12 +563,6 @@ final class KachatNamesActions: ObservableObject {
         case .gone: return true
         case .unknown: return nil
         }
-    }
-
-    /// A claim's rate: a typed one (never under the relay floor), else the speed's.
-    private func claimFeerate(_ tier: WithdrawFeeTier, _ custom: Double?) async -> Double {
-        if let custom { return KachatNames.safeFeerate(max(KachatNames.minFeerate, custom)) }
-        return await feerate(for: tier)
     }
 
     /// The rate the registration's chosen speed pays now (its claim-time choice), else Priority.
@@ -1438,7 +627,6 @@ final class KachatNamesActions: ObservableObject {
             }
             guard let m = service.manifest,
                   let dag = try? await NodePoolService.shared.currentDagPoint() else { return }
-            virtualDaa = dag.virtualDaaScore
             // a little past maturity, so the block that takes it is surely deep enough
             guard dag.virtualDaaScore >= KachatNames.clampedSum(commit.entry.blockDaaScore, KachatNames.clampedSum(m.params.tCommit, 20)) else { return }
             await register(p, commit: commit)
@@ -1535,7 +723,7 @@ final class KachatNamesActions: ObservableObject {
     private func sendReclaim(of n: KachatNames.NameInfo, for p: KachatNames.PendingRegistration) async throws {
         let gaps = try await registry.exitGaps(for: n)
         // sent with no fee shown, like the register: the chosen speed under the background cap (IOS-061)
-        let txId = try await perform(.reclaim(n), exactFeerate: await registrationFeerate(p))
+        let txId = try await reclaim(n, feerate: await registrationFeerate(p))
         set(p) {
             $0.reclaimTxId = txId
             $0.reclaimLo = KachatNames.hex(gaps.below.lo)

@@ -34,7 +34,7 @@ struct CreateWalletView: View {
             do {
                 seedPhrase = try await walletManager.generateNewWalletSeedPhrase(wordCount: 24)
             } catch {
-                self.error = error.localizedDescription
+                self.error = UserFacingError.message(for: error)
             }
         }
     }

@@ -306,10 +306,6 @@ extension WalletManager {
         spendingAddress(at: currentSpendingAddressIndex)
     }
 
-    func currentSpendingPrivateKey() -> Data? {
-        spendingPrivateKey(at: currentSpendingAddressIndex)
-    }
-
     /// Derives the shared "change" node (m/44'/111111'/1'/0) once, for reuse across every index
     /// in a range - `spendingAddress(at:)`/`spendingPrivateKey(at:)` above each redo the expensive
     /// parts (Secure Enclave seed-phrase decrypt, PBKDF2-2048 mnemonic-to-seed, 4 HMAC-SHA512
@@ -427,12 +423,6 @@ extension WalletManager {
         }
     }
 
-    /// Reveals a new, never-used spending address slot (extends `maxSpendingAddressIndex` by
-    /// one) without changing which address is currently primary.
-    func generateNextSpendingAddress() async {
-        await updateSpendingBounds(maxIndex: maxSpendingAddressIndex + 1)
-    }
-
     /// Reveals a brand-new quantum-safe slot (KIP-22) and returns its public index - what
     /// "Generate New Address" makes from now on. Always extends the chain: a never-spent-from
     /// address is the whole point, so nothing is ever recycled here.
@@ -502,36 +492,6 @@ extension WalletManager {
     /// False once `owner` is neither the active account nor a saved one (it was removed).
     private func accountStillSaved(_ owner: String) -> Bool {
         currentWallet?.publicAddress == owner || savedAccounts.contains { $0.publicAddress == owner }
-    }
-
-    /// "Generate New Spending Address" - a SEQUENCE, not a single answer: every press yields
-    /// the NEXT fresh address, forever. The chosen index is the lowest one that is truly
-    /// unused (zero balance, no on-chain history, not the primary, never offered to a contact
-    /// as a payment-pool reservation) AND currently hidden - i.e. not already sitting in the
-    /// Manage Addresses list. Recycling un-hides it. An index that is already visible is never
-    /// picked (that was the old stall: the lowest unused index, once revealed, satisfied every
-    /// check again on the next press, so Generate kept returning the same row and appeared to
-    /// stop working). When no hidden unused index remains, the chain extends by one past the
-    /// all-time max, which is always safe. A probe failure (used-ness unknown) skips that
-    /// index rather than recycling it. Returns the chosen index.
-    ///
-    /// Side-effect free: nothing is un-hidden or revealed here - the caller reveals the index
-    /// (`revealSpendingAddress(at:)`) only when the address is really handed out. Past the
-    /// revealed range it answers the next index without extending the chain.
-    func lowestUnusedSpendingAddress() async -> Int {
-        let entries = await getSpendingAddressList().sorted { $0.index < $1.index }
-        for entry in entries {
-            guard entry.hidden else { continue } // already visible - the user has it; move on
-            if entry.isCurrent { continue }
-            if entry.balanceSompi > 0 { continue }
-            // Recycle only on a CONFIRMED-unused probe; nil (probe failed) skips the index -
-            // extending the chain below is always safe, recycling an unknown one is not.
-            let usedState = await ChatService.shared.spendingAddressUsedState(entry.address)
-            if usedState == false {
-                return entry.index
-            }
-        }
-        return maxSpendingAddressIndex + 1
     }
 
     /// Which index the Receive QR is currently handing out. Persisted per wallet, and entirely
@@ -807,14 +767,6 @@ extension WalletManager {
             }
         }
         return result
-    }
-
-    /// True if `address` is one of this wallet's own revealed spending-chain addresses
-    /// (0...maxSpendingAddressIndex) - used to reject a received pool that tries to feed our own
-    /// addresses back to us. One seed decrypt + one derivation per revealed index; call off the
-    /// hot path.
-    func isOwnSpendingAddress(_ address: String) -> Bool {
-        allSpendingAddresses().contains(address)
     }
 
     /// Every revealed spending-chain address (0...maxSpendingAddressIndex), derived with a

@@ -77,7 +77,7 @@ struct ZeroBalanceFundingCardView: View {
                 qrImage = nil
                 return
             }
-            qrImage = Self.makeAddressQRCode(from: address)
+            qrImage = await Self.addressQRCode(from: address)
         }
     }
 
@@ -92,16 +92,36 @@ struct ZeroBalanceFundingCardView: View {
             .shadow(color: Color.black.opacity(0.12), radius: 10, x: 0, y: 5)
     }
 
-    /// Plain string payload, so any wallet/scanner reads the address directly.
-    static func makeAddressQRCode(from string: String) -> UIImage? {
+    /// Plain string payload, so any wallet/scanner reads the address directly. Cached per string,
+    /// drawn with one shared CIContext (making one per QR is the slow part).
+    nonisolated static func makeAddressQRCode(from string: String) -> UIImage? {
+        if let cached = qrCache.object(forKey: string as NSString) { return cached }
         let filter = CIFilter.qrCodeGenerator()
         filter.setValue(Data(string.utf8), forKey: "inputMessage")
         guard let output = filter.outputImage else { return nil }
         let scaled = output.transformed(by: CGAffineTransform(scaleX: 10, y: 10))
-        let context = CIContext()
-        guard let cgImage = context.createCGImage(scaled, from: scaled.extent) else { return nil }
-        return UIImage(cgImage: cgImage)
+        guard let cgImage = qrContext.createCGImage(scaled, from: scaled.extent) else { return nil }
+        let image = UIImage(cgImage: cgImage)
+        qrCache.setObject(image, forKey: string as NSString)
+        return image
     }
+
+    /// `makeAddressQRCode` off the main thread: a cached QR comes back at once, a new one is drawn
+    /// in the background so opening Receive never stalls a frame.
+    static func addressQRCode(from string: String) async -> UIImage? {
+        if let cached = qrCache.object(forKey: string as NSString) { return cached }
+        return await Task.detached(priority: .userInitiated) {
+            makeAddressQRCode(from: string)
+        }.value
+    }
+
+    /// CIContext and NSCache are both safe to use from any thread.
+    nonisolated(unsafe) private static let qrContext = CIContext(options: [.useSoftwareRenderer: false])
+    nonisolated(unsafe) private static let qrCache: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.countLimit = 32
+        return cache
+    }()
 }
 
 /// Sheet host for the funding card: the "not enough funds" popup of a .kachat profile save.

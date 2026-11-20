@@ -191,7 +191,7 @@ struct NFCCardBackupView: View {
 
     private func show(_ error: Error) {
         if case NFCCardError.cancelled = error { return }
-        errorMessage = error.localizedDescription
+        errorMessage = UserFacingError.message(for: error)
     }
 
     @MainActor

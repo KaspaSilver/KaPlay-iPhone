@@ -70,11 +70,6 @@ final class ChatService: ObservableObject {
     @Published var reactionsByTxId: [String: [MessageStore.ReactionSnapshot]] = [:]
     /// The newest edit per message txId, for the open conversation - see `MessageEditCodec`.
     @Published var editsByTxId: [String: MessageEditSnapshot] = [:]
-    /// Newest reaction per contact, across every message in that conversation - not scoped to
-    /// whichever single conversation is currently open (unlike `reactionsByTxId`), since the chat
-    /// list needs this for every row at once. Refreshed by `refreshLatestReactionPreviews()`; see
-    /// `ChatListView`'s `ConversationRow` for where it's compared against `lastMessage.timestamp`.
-    @Published var latestReactionByContact: [String: MessageStore.LatestReactionPreview] = [:]
     var settingsViewModel: SettingsViewModel?
     var cachedSettings = SettingsViewModel.loadSettings()
     @Published var activeConversationAddress: String?
@@ -120,17 +115,6 @@ final class ChatService: ObservableObject {
 
     var chatFetchCounts: [String: Int] = [:]
     var chatFetchFailed: Set<String> = []
-
-    /// Pending navigation from notification tap (used when app launches from terminated state)
-    @Published var pendingChatNavigation: String?
-    /// A tapped profile link: the chat list opens User Info for this address
-    /// (`KaChatLinkRouter.openProfile`).
-    @Published var pendingProfileAddress: String?
-
-    /// Images handed over from the Share Extension, keyed by contact address. Staged here until
-    /// that contact's chat opens, then attached to the composer as a pending photo
-    /// (see `ChatDetailView.attachPendingShareImageIfAvailable`). Session-only by design.
-    var pendingShareImages: [String: Data] = [:]
 
     // Connection status properties
     @Published var isRpcSubscribed = false
@@ -232,12 +216,6 @@ final class ChatService: ObservableObject {
     // alone isn't enough: a static member of an `@MainActor` type is still actor-isolated by
     // default unless explicitly marked `nonisolated` too.
     nonisolated static let inMemoryConversationWindowSize = 160
-
-    /// The background load of the open chat's whole history (see `loadFullHistory`).
-    var fullHistoryLoadTask: Task<Void, Never>?
-    /// The chat most recently left, trimmed back to the in-memory window once the chat list is
-    /// showing again (`trimLeftConversationIfNeeded`).
-    var lastLeftConversationAddress: String?
 
     /// Whether the app posts its OWN banners for the messages, group traffic, public chats and
     /// KaPosts activity it discovers itself - through the UTXO subscription, the sweep, the
@@ -395,11 +373,6 @@ final class ChatService: ObservableObject {
     /// `GroupChatService.performCatchUpSync()` at most once per this interval as the group
     /// equivalent of the 1:1 contact sweep.
     var lastForegroundGroupCatchUpAt: Date?
-    /// Every three minutes while group traffic is arriving live (the indexer poll, or the
-    /// block stream; the catch-up then only covers gaps), every minute while it is not.
-    var foregroundGroupCatchUpInterval: TimeInterval {
-        60.0
-    }
     /// The one-shot 4-phase initial sync started by `startPolling`. Tracked so wallet transitions
     /// (import/switch/logout) can cancel it - otherwise the previous wallet's historical sync keeps
     /// running past the switch and writes its messages into the *new* wallet's store, leaking one
@@ -473,9 +446,6 @@ final class ChatService: ObservableObject {
     /// Prevents redundant heavy re-sync on Mac Catalyst window reopen.
     var hasCompletedInitialSync = false
     var contactsCancellable: AnyCancellable?
-    /// `observeChattingBalanceForNotices`: payment notices waiting for the chatting address.
-    var unsentNoticesCancellable: AnyCancellable?
-    var sendingUnsentNotices = false
     var settingsCancellable: AnyCancellable?
     var pingLatencyCancellable: AnyCancellable?
     var nodePoolSubscriptionStateCancellable: AnyCancellable?
@@ -578,9 +548,6 @@ final class ChatService: ObservableObject {
     var conversationIds: [String: String] = [:]
     // Drafts keyed by contact address
     var messageDrafts: [String: String] = [:]
-    // Debounces the drafts' disk write so typing doesn't JSON-encode + write UserDefaults on the
-    // main thread on every keystroke (see setDraft / flushPendingDraftSave).
-    var draftSaveTask: Task<Void, Never>?
     // Pending self-stash jobs that couldn't be sent due to missing UTXOs
     var pendingSelfStash: [PendingSelfStash] = []
     /// Contacts this wallet has a `saved_handshake` note for - read back by
@@ -632,7 +599,6 @@ final class ChatService: ObservableObject {
         loadPushReliabilityState()
         loadHiddenPaymentTxIds()
         observeContacts()
-        observeChattingBalanceForNotices()
         observeSettings()
         observeRpcReconnection()
         observePingLatency()
@@ -733,7 +699,6 @@ final class ChatService: ObservableObject {
 
     /// Observe RPC reconnection to sync after connection is restored
     var rpcReconnectedObserver: NSObjectProtocol?
-    let chatHistoryArchiveVersion = 1
 
     private func observeRpcReconnection() {
         // Listen for subscription restoration (fetch missed messages)
@@ -742,8 +707,10 @@ final class ChatService: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            AppLog.log("[ChatService] RPC subscriptions restored - syncing to catch any missed messages")
             Task { @MainActor in
+                // KaPlay has no chats to catch up on (`syncsChats`)
+                guard ChatService.syncsChats else { return }
+                AppLog.log("[ChatService] RPC subscriptions restored - syncing to catch any missed messages")
                 // the dead window may have held a payment too: the UTXO notification for it
                 // never came and is not replayed
                 self?.requestPaymentCatchUp(lookBackMs: 15 * 60 * 1000)

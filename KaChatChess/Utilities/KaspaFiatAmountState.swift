@@ -52,6 +52,20 @@ final class KaspaFiatAmountState: ObservableObject {
         return kasText
     }
 
+    /// `setMaxKas` from exact sompi: the KAS text is built from the integer (`KaspaUnit.plain`), so
+    /// a large Max never picks up a Double's rounding. Only the currency figure is converted.
+    @discardableResult
+    func setMaxSompi(_ sompi: UInt64, priceInCurrency: Double?) -> String {
+        let exact = KaspaUnit.plain(sompi)
+        if isFiatMode, let priceInCurrency, priceInCurrency > 0 {
+            displayText = String(format: "%.2f", Double(sompi) / 100_000_000.0 * priceInCurrency)
+        } else {
+            displayText = exact
+        }
+        kasText = exact
+        return kasText
+    }
+
     /// Flips units, carrying today's typed number over converted into the other one rather than
     /// clearing the field. No-ops if there's no live price yet to convert with. Back in KAS it
     /// shows the exact amount the caller holds (`kasText`), not one worked back from the rounded

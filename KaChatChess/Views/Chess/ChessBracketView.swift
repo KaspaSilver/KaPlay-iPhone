@@ -10,19 +10,20 @@ struct ChessBracketView: View {
     let now: Int64
     let onOpenGame: (String) -> Void
 
-    private static let cardWidth: CGFloat = 164
-    private static let cardHeight: CGFloat = 66
+    // Scaled with the text size: fixed heights clipped the names at large Dynamic Type sizes.
+    @ScaledMetric(relativeTo: .caption) private var cardWidth: CGFloat = 164
+    @ScaledMetric(relativeTo: .caption) private var cardHeight: CGFloat = 66
+    @ScaledMetric(relativeTo: .caption) private var labelHeight: CGFloat = 26
     private static let rowGap: CGFloat = 14
     private static let columnGap: CGFloat = 40
-    private static let labelHeight: CGFloat = 26
 
-    private var columnX: [CGFloat] { (0..<4).map { CGFloat($0) * (Self.cardWidth + Self.columnGap) } }
-    private var round1Y: [CGFloat] { (0..<4).map { CGFloat($0) * (Self.cardHeight + Self.rowGap) } }
+    private var columnX: [CGFloat] { (0..<4).map { CGFloat($0) * (cardWidth + Self.columnGap) } }
+    private var round1Y: [CGFloat] { (0..<4).map { CGFloat($0) * (cardHeight + Self.rowGap) } }
     private var semiY: [CGFloat] { [midpoint(round1Y[0], round1Y[1]), midpoint(round1Y[2], round1Y[3])] }
     private var finalY: CGFloat { midpoint(semiY[0], semiY[1]) }
     private func midpoint(_ a: CGFloat, _ b: CGFloat) -> CGFloat { (a + b) / 2 }
-    private var contentHeight: CGFloat { round1Y[3] + Self.cardHeight }
-    private var contentWidth: CGFloat { columnX[3] + Self.cardWidth }
+    private var contentHeight: CGFloat { round1Y[3] + cardHeight }
+    private var contentWidth: CGFloat { columnX[3] + cardWidth }
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -33,11 +34,11 @@ struct ChessBracketView: View {
                             .font(.caption.weight(.bold))
                             .foregroundColor(.secondary)
                             .textCase(.uppercase)
-                            .frame(width: Self.cardWidth, alignment: .leading)
+                            .frame(width: cardWidth, alignment: .leading)
                         if index < 3 { Spacer().frame(width: Self.columnGap) }
                     }
                 }
-                .frame(height: Self.labelHeight)
+                .frame(height: labelHeight)
                 ZStack(alignment: .topLeading) {
                     connectors
                     ForEach(0..<4, id: \.self) { index in
@@ -66,7 +67,7 @@ struct ChessBracketView: View {
 
     private var connectors: some View {
         Path { path in
-            let w = Self.cardWidth, h = Self.cardHeight / 2, gap = Self.columnGap / 2
+            let w = cardWidth, h = cardHeight / 2, gap = Self.columnGap / 2
             func join(fromX: CGFloat, fromYs: [CGFloat], toX: CGFloat, toY: CGFloat) {
                 for y in fromYs {
                     path.move(to: CGPoint(x: fromX + w, y: y + h))
@@ -103,7 +104,7 @@ struct ChessBracketView: View {
                     placeholderRow(placeholder.1)
                 }
             }
-            .frame(width: Self.cardWidth, height: Self.cardHeight)
+            .frame(width: cardWidth, height: cardHeight)
             .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
             .overlay(
                 RoundedRectangle(cornerRadius: 12)
@@ -117,10 +118,13 @@ struct ChessBracketView: View {
         .disabled(game == nil)
     }
 
+    /// Decided at `now`, as the other screens judge it: a game lost on time with no claim on
+    /// chain yet already has its winner, and nobody to move.
     private func playerRow(address: String, game: ChessTournamentGame) -> some View {
-        let isWinner = game.winner == address
-        let isLoser = game.isOver && game.winner != nil && !isWinner
-        let toMove = !game.isOver && game.address(of: game.sideToMove) == address
+        let winner = game.decidedWinner(at: now)
+        let isWinner = winner == address
+        let isLoser = winner != nil && !isWinner
+        let toMove = !game.isDecided(at: now) && game.address(of: game.sideToMove) == address
         return HStack(spacing: 6) {
             KNSAvatarView(
                 avatarURLString: KNSService.shared.profileCache[address]?.avatarURL,
@@ -140,7 +144,7 @@ struct ChessBracketView: View {
             }
         }
         .padding(.horizontal, 8)
-        .frame(height: Self.cardHeight / 2 - 0.5)
+        .frame(height: cardHeight / 2 - 0.5)
         .opacity(isLoser ? 0.55 : 1)
     }
 
@@ -156,15 +160,17 @@ struct ChessBracketView: View {
             Spacer(minLength: 2)
         }
         .padding(.horizontal, 8)
-        .frame(height: Self.cardHeight / 2 - 0.5)
+        .frame(height: cardHeight / 2 - 0.5)
     }
 
     @ViewBuilder
     private func statusPill(_ game: ChessTournamentGame) -> some View {
-        if !game.isOver {
+        // Not once the clock has decided it: that read "LIVE 0:00" with no winner forever.
+        if !game.isDecided(at: now) {
             HStack(spacing: 4) {
                 Circle().fill(Color.red).frame(width: 5, height: 5)
-                Text(verbatim: ChessText.format("LIVE %@", ChessText.clock(game.remainingMs(game.sideToMove, at: now))))
+                // The running clock alone observes the arena's clock (`ChessLiveClockText`).
+                ChessLiveClockText(game: game, format: { ChessText.format("LIVE %@", $0) })
                     .font(.scaled(size: 9, weight: .bold).monospacedDigit())
             }
             .foregroundColor(.white)
@@ -186,9 +192,10 @@ struct ChessBracketView: View {
                     contactAddress: champion
                 )
                 VStack(alignment: .leading, spacing: 2) {
+                    // Orange: yellow text can't be read on the light card.
                     Label("Champion", systemImage: "trophy.fill")
                         .font(.scaled(size: 9, weight: .bold))
-                        .foregroundColor(.yellow)
+                        .foregroundColor(.orange)
                     Text(ContactsManager.shared.displayName(for: champion))
                         .font(.caption.weight(.bold))
                         .lineLimit(1)
@@ -196,7 +203,7 @@ struct ChessBracketView: View {
             } else {
                 Image(systemName: "trophy")
                     .font(.title3)
-                    .foregroundColor(.yellow.opacity(0.7))
+                    .foregroundColor(.orange.opacity(0.7))
                 Text("To be decided")
                     .font(.caption)
                     .foregroundColor(.secondary)
@@ -204,7 +211,7 @@ struct ChessBracketView: View {
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 10)
-        .frame(width: Self.cardWidth, height: Self.cardHeight)
+        .frame(width: cardWidth, height: cardHeight)
         .background(RoundedRectangle(cornerRadius: 12).fill(Color.yellow.opacity(champion == nil ? 0.06 : 0.14)))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.yellow.opacity(0.5), lineWidth: 1))
     }

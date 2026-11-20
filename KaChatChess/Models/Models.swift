@@ -676,11 +676,6 @@ struct PaymentResponse: Codable {
     }
 }
 
-/// `GET /metrics`, used only as a liveness probe (`ping`): any JSON object counts. Its fields
-/// (the indexer's `IndexerMetricsSnapshot`) aren't read, so none are declared - the old ones
-/// named nothing the server sends (XP-011).
-struct IndexerMetrics: Codable {}
-
 struct SelfStashResponse: Codable {
     let txId: String
     let owner: String
@@ -698,56 +693,6 @@ struct SelfStashResponse: Codable {
         case acceptingBlock = "accepting_block"
         case acceptingDaaScore = "accepting_daa_score"
         case stashedData = "stashed_data"
-    }
-}
-
-struct GroupMessageResponse: Codable {
-    let txId: String
-    let sender: String?
-    let blindedGroupId: String
-    let blockTime: UInt64
-    /// Opaque lossless pagination cursor - `block_time` alone can collide across items, so
-    /// catch-up sync should persist and resume from this instead. Optional for source
-    /// compatibility with an older indexer that doesn't send it yet. See docs/GROUP_CHAT_API.md.
-    let cursor: String?
-    let acceptingBlock: String?
-    let acceptingDaaScore: UInt64?
-    let messagePayload: String
-
-    enum CodingKeys: String, CodingKey {
-        case txId = "tx_id"
-        case sender
-        case blindedGroupId = "blinded_group_id"
-        case blockTime = "block_time"
-        case cursor
-        case acceptingBlock = "accepting_block"
-        case acceptingDaaScore = "accepting_daa_score"
-        case messagePayload = "message_payload"
-    }
-}
-
-struct GroupControlResponse: Codable {
-    let txId: String
-    let sender: String
-    /// Present for recipient-addressed controls (`GET /group-control/by-recipient`); nil for
-    /// legacy unaddressed ones. See docs/GROUP_CHAT_API.md.
-    let recipient: String?
-    let blockTime: UInt64
-    /// Opaque lossless pagination cursor - see [GroupMessageResponse.cursor].
-    let cursor: String?
-    let acceptingBlock: String?
-    let acceptingDaaScore: UInt64?
-    let messagePayload: String
-
-    enum CodingKeys: String, CodingKey {
-        case txId = "tx_id"
-        case sender
-        case recipient
-        case blockTime = "block_time"
-        case cursor
-        case acceptingBlock = "accepting_block"
-        case acceptingDaaScore = "accepting_daa_score"
-        case messagePayload = "message_payload"
     }
 }
 
@@ -1623,32 +1568,6 @@ enum VoiceMessageSniff {
     }
 }
 
-// MARK: - Diagnostics Models
-
-struct ConnectionStatus: Equatable {
-    var isConnected: Bool
-    var pingMs: Int?
-    var nodeAddress: String?
-    var indexerAddress: String?
-    var lastChecked: Date?
-    var networkType: NetworkType
-    var blockHeight: UInt64?
-    var error: String?
-
-    static var disconnected: ConnectionStatus {
-        ConnectionStatus(
-            isConnected: false,
-            pingMs: nil,
-            nodeAddress: nil,
-            indexerAddress: nil,
-            lastChecked: nil,
-            networkType: .mainnet,
-            blockHeight: nil,
-            error: nil
-        )
-    }
-}
-
 enum NetworkType: String, Codable, CaseIterable {
     case mainnet
     case testnet
@@ -2331,18 +2250,10 @@ enum NotificationMode: String, Codable, CaseIterable {
 struct AppSettings: Codable {
     var messageRetention: MessageRetention
     var networkType: NetworkType
-    var autoAddContacts: Bool
     var notificationMode: NotificationMode
     var notificationPermissionRequested: Bool
     var incomingNotificationSoundEnabled: Bool
     var incomingNotificationVibrationEnabled: Bool
-    /// Settings > Notifications > "Address Activity" (default ON): local notifications when
-    /// any of the wallet's own NON-chatting addresses - spending-chain (Manage Addresses) or
-    /// watch-only cold storage - receives Kaspa from an external source. Gates both the live
-    /// UTXO-subscription path and the foreground catch-up diff (see AddressActivityNotifier).
-    /// Deliberately not gated by Simple Mode - these are wallet notifications, and Portfolio /
-    /// Cold Storage remain available there.
-    var addressActivityNotificationsEnabled: Bool
     /// Settings > Notifications > KaPosts: per-event-type gates for KaPosts notification
     /// pings (all default ON). Mapped from the K notifications API's `contentType` /
     /// `voteType` fields via `shouldNotifyKaPostsAction` - a disabled type is silently
@@ -2356,21 +2267,7 @@ struct AppSettings: Codable {
     /// It is - but a busy account can be mentioned constantly, and "always about you" is a
     /// reason to make the choice available, not a reason to make it for them.
     var kaPostsNotifyMentions: Bool
-    var messagePollInterval: TimeInterval
     var liveUpdatesEnabled: Bool
-    var requirePhotoApprovalForNewContacts: Bool
-    /// Chats > Higher quality photos: on-chain photos use the largest size one transaction
-    /// carries (`ImagePrep.highQualityChatTargetBytes`) instead of the default, for a higher fee.
-    var higherQualityPhotos: Bool
-    var showFeeEstimate: Bool
-    /// KaPosts > Settings: the tip a tap on "Tip" sends at once, in sompi. nil = ask every time.
-    var kaPostsDefaultTipSompi: UInt64?
-    /// Optional (unlike most fields here) - this struct has no custom `init(from:)`, so a newly
-    /// added *required* field would fail this whole struct's decode for anyone with a
-    /// pre-existing settings blob saved before it existed, silently resetting every other setting
-    /// back to `.default` (see `AppSettings.load()`'s `try?`). Nil/wrong-count means "never
-    /// customized" - read via `effectiveQuickReactionEmojis`, never this raw property directly.
-    var quickReactionEmojis: [String]?
 
     // Customization
     var appearance: AppAppearance
@@ -2419,9 +2316,6 @@ struct AppSettings: Codable {
     /// the seed-phrase toggle.
     var biometricSpendingKeyEnabled: Bool
 
-    // Swap (ChangeNOW)
-    var swapDisclaimerAgreed: Bool
-
     // Diagnostics
     /// Settings > Diagnostics > "Verbose API Logging" (default OFF): restores the per-request
     /// [KasiaAPI] success log lines (full URL, connection kind, IP, timing breakdown). While
@@ -2433,16 +2327,10 @@ struct AppSettings: Codable {
 
     // Connection settings
     var indexerURL: String
-    /// K social-network indexer powering KaPosts (reusing the already-running public K indexer).
-    var kaPostIndexerURL: String
     /// KaChat-owned public chat indexer (tracks #kaspa and #kachat-bugs history) - served from
     /// the same box/domain as the KaPosts indexer.
     var publicChatIndexerURL: String
     var pushIndexerURL: String
-    /// Server-side KaPost translation (see `TRANSLATION_SERVICE.md`). Its own field rather than
-    /// riding on `kaPostIndexerURL`, so someone running their own translator does not have to run
-    /// their own KaPosts indexer as well - and the reverse.
-    var translationServiceURL: String
     /// The Kaspa Name Service endpoint. Fixed to the current network's default, never stored and
     /// never user-editable.
     ///
@@ -2476,7 +2364,6 @@ struct AppSettings: Codable {
 
     // gRPC endpoint pool settings
     var grpcEndpointPool: [GrpcEndpoint]
-    var discoverNewPeers: Bool           // Enable peer discovery from hot pool nodes
     var grpcPoolNetworkType: NetworkType?
     var lastPoolPersistDate: Date?       // Track when pool was last saved
 
@@ -2491,8 +2378,6 @@ struct AppSettings: Codable {
     /// Our own push service (chat/group push + the public chat/KaPosts extensions - see
     /// PUSH_EXTENSIONS.md).
     static let defaultPushIndexerURL = "https://indexer.kachat.app"
-    /// Server-side KaPost translation - same box as the KaPosts indexer by default.
-    static let defaultTranslationServiceURL = "https://indexer.kachat.app"
     static let defaultKNSMainnetURL = "https://api.knsdomains.org/mainnet/api/v1"
     static let defaultKNSTestnetURL = "https://api.knsdomains.org/tn10/api/v1"
     static let defaultKaspaMainnetURL = "https://api.kaspa.org"
@@ -2510,28 +2395,12 @@ struct AppSettings: Codable {
     /// instead) - TLS-secured, hence the `grpcs://` scheme (see Endpoint.secure/Endpoint(url:)).
     static let defaultTrustedNodeAddress = "grpcs://toccata.kaspium.io"
 
-    /// Fixed tapback-style default set - matches Android's `QUICK_REACTION_EMOJIS`'s default.
-    static let defaultQuickReactionEmojis = ["👍", "❤️", "😂", "😮", "😢", "🙏"]
-
-    /// What the double-tap quick-reaction bar should actually show - falls back to the default
-    /// set if never customized, or if a customization somehow ended up with the wrong count
-    /// (the settings UI only ever writes exactly 6, but this stays defensive against any other
-    /// path that might not).
-    var effectiveQuickReactionEmojis: [String] {
-        guard let quickReactionEmojis, quickReactionEmojis.count == 6 else {
-            return AppSettings.defaultQuickReactionEmojis
-        }
-        return quickReactionEmojis
-    }
-
     /// The active network's connection settings, as one value.
     var currentConnectionProfile: ConnectionProfile {
         ConnectionProfile(
             indexerURL: indexerURL,
-            kaPostIndexerURL: kaPostIndexerURL,
             publicChatIndexerURL: publicChatIndexerURL,
             pushIndexerURL: pushIndexerURL,
-            translationServiceURL: translationServiceURL,
             kaspaRestAPIURL: kaspaRestAPIURL,
             trustedNodeAddress: trustedNodeAddress,
             savedNodeAddresses: savedNodeAddresses
@@ -2547,10 +2416,8 @@ struct AppSettings: Codable {
         connectionProfiles[networkType.rawValue] = currentConnectionProfile
         let next = connectionProfiles[network.rawValue] ?? .defaults(for: network)
         indexerURL = next.indexerURL
-        kaPostIndexerURL = next.kaPostIndexerURL
         publicChatIndexerURL = next.publicChatIndexerURL
         pushIndexerURL = next.pushIndexerURL
-        translationServiceURL = next.translationServiceURL
         kaspaRestAPIURL = next.kaspaRestAPIURL
         trustedNodeAddress = next.trustedNodeAddress
         savedNodeAddresses = next.savedNodeAddresses
@@ -2569,24 +2436,17 @@ struct AppSettings: Codable {
         AppSettings(
             messageRetention: .forever,
             networkType: .mainnet,
-            autoAddContacts: true,
             notificationMode: .remotePush,
             notificationPermissionRequested: false,
             incomingNotificationSoundEnabled: true,
             incomingNotificationVibrationEnabled: true,
-            addressActivityNotificationsEnabled: true,
             kaPostsNotifyLikes: true,
             kaPostsNotifyReposts: true,
             kaPostsNotifyFollows: true,
             kaPostsNotifyDislikes: true,
             kaPostsNotifyComments: true,
             kaPostsNotifyMentions: true,
-            messagePollInterval: 10.0,
             liveUpdatesEnabled: false,
-            requirePhotoApprovalForNewContacts: true,
-            showFeeEstimate: true,
-            kaPostsDefaultTipSompi: nil,
-            quickReactionEmojis: defaultQuickReactionEmojis,
             appearance: .system,
             language: .system,
             currency: .usDollar,
@@ -2616,18 +2476,14 @@ struct AppSettings: Codable {
             // keys and sends still need the phone's lock.
             biometricAccountLoginEnabled: false,
             biometricSpendingKeyEnabled: true,
-            swapDisclaimerAgreed: false,
             indexerURL: defaultIndexerURL,
-            kaPostIndexerURL: defaultKaPostIndexerURL,
             publicChatIndexerURL: defaultPublicChatIndexerURL,
             pushIndexerURL: defaultPushIndexerURL,
-            translationServiceURL: defaultTranslationServiceURL,
             kaspaRestAPIURL: defaultKaspaMainnetURL,
             kaspaExplorer: .default,
             trustedNodeAddress: defaultTrustedNodeAddress,
             savedNodeAddresses: [],
             grpcEndpointPool: [],
-            discoverNewPeers: true,
             grpcPoolNetworkType: nil,
             lastPoolPersistDate: nil
         )
@@ -2636,25 +2492,17 @@ struct AppSettings: Codable {
     enum CodingKeys: String, CodingKey {
         case messageRetention
         case networkType
-        case autoAddContacts
         case notificationMode
         case notificationPermissionRequested
         case incomingNotificationSoundEnabled
         case incomingNotificationVibrationEnabled
-        case addressActivityNotificationsEnabled
         case kaPostsNotifyLikes
         case kaPostsNotifyReposts
         case kaPostsNotifyFollows
         case kaPostsNotifyDislikes
         case kaPostsNotifyComments
         case kaPostsNotifyMentions
-        case messagePollInterval
         case liveUpdatesEnabled
-        case requirePhotoApprovalForNewContacts
-        case higherQualityPhotos
-        case showFeeEstimate
-        case kaPostsDefaultTipSompi
-        case quickReactionEmojis
         case appearance
         case language
         case currency
@@ -2674,27 +2522,24 @@ struct AppSettings: Codable {
         case biometricSeedPhraseEnabled
         case biometricAccountLoginEnabled
         case biometricSpendingKeyEnabled
-        case swapDisclaimerAgreed
         case verboseAPILogging
         case indexerURL
-        case kaPostIndexerURL
         case publicChatIndexerURL = "broadcastIndexerURL"
         case pushIndexerURL
-        case translationServiceURL
         case kaspaRestAPIURL
         case kaspaExplorer
         case trustedNodeAddress
         case savedNodeAddresses
         case connectionProfiles
         case grpcEndpointPool
-        case discoverNewPeers
         case grpcPoolNetworkType
         case lastPoolPersistDate
-        // Legacy keys for migration
+        // Legacy keys for migration. Fields since removed (autoAddContacts, messagePollInterval,
+        // kaPostIndexerURL, translationServiceURL, discoverNewPeers and others no code read)
+        // have no case: their keys in older saved settings are simply ignored.
         case customIndexerURL
         case wrpcEndpointPool  // Legacy, ignored on load
         case autoRefreshWrpcPool  // Legacy, ignored on load
-        case autoRefreshGrpcPool  // Legacy, migrate to discoverNewPeers
         case preferGrpc  // Legacy, ignored on load
         case notificationsEnabled  // Legacy, migrate to notificationMode
         case backgroundFetchEnabled  // Legacy, migrate to notificationMode
@@ -2704,25 +2549,17 @@ struct AppSettings: Codable {
     init(
         messageRetention: MessageRetention,
         networkType: NetworkType,
-        autoAddContacts: Bool,
         notificationMode: NotificationMode,
         notificationPermissionRequested: Bool = false,
         incomingNotificationSoundEnabled: Bool = true,
         incomingNotificationVibrationEnabled: Bool = true,
-        addressActivityNotificationsEnabled: Bool = true,
         kaPostsNotifyLikes: Bool = true,
         kaPostsNotifyReposts: Bool = true,
         kaPostsNotifyFollows: Bool = true,
         kaPostsNotifyDislikes: Bool = true,
         kaPostsNotifyComments: Bool = true,
         kaPostsNotifyMentions: Bool = true,
-        messagePollInterval: TimeInterval,
         liveUpdatesEnabled: Bool,
-        requirePhotoApprovalForNewContacts: Bool = true,
-        higherQualityPhotos: Bool = false,
-        showFeeEstimate: Bool = true,
-        kaPostsDefaultTipSompi: UInt64? = nil,
-        quickReactionEmojis: [String]? = nil,
         appearance: AppAppearance = .system,
         language: AppLanguage = .system,
         currency: AppCurrency = .usDollar,
@@ -2742,44 +2579,31 @@ struct AppSettings: Codable {
         biometricSeedPhraseEnabled: Bool = true,
         biometricAccountLoginEnabled: Bool = false,
         biometricSpendingKeyEnabled: Bool = true,
-        swapDisclaimerAgreed: Bool = false,
         verboseAPILogging: Bool = false,
         indexerURL: String,
-        kaPostIndexerURL: String = AppSettings.defaultKaPostIndexerURL,
         publicChatIndexerURL: String = AppSettings.defaultPublicChatIndexerURL,
         pushIndexerURL: String,
-        translationServiceURL: String = AppSettings.defaultTranslationServiceURL,
         kaspaRestAPIURL: String,
         kaspaExplorer: KaspaExplorer = .default,
         trustedNodeAddress: String = AppSettings.defaultTrustedNodeAddress,
         savedNodeAddresses: [SavedNodeAddress] = [],
         grpcEndpointPool: [GrpcEndpoint] = [],
-        discoverNewPeers: Bool = true,
         grpcPoolNetworkType: NetworkType? = nil,
         lastPoolPersistDate: Date? = nil
     ) {
         self.messageRetention = messageRetention
         self.networkType = networkType
-        // Auto-add contacts is always enabled.
-        self.autoAddContacts = true
         self.notificationMode = notificationMode
         self.notificationPermissionRequested = notificationPermissionRequested
         self.incomingNotificationSoundEnabled = incomingNotificationSoundEnabled
         self.incomingNotificationVibrationEnabled = incomingNotificationVibrationEnabled
-        self.addressActivityNotificationsEnabled = addressActivityNotificationsEnabled
         self.kaPostsNotifyLikes = kaPostsNotifyLikes
         self.kaPostsNotifyReposts = kaPostsNotifyReposts
         self.kaPostsNotifyFollows = kaPostsNotifyFollows
         self.kaPostsNotifyDislikes = kaPostsNotifyDislikes
         self.kaPostsNotifyComments = kaPostsNotifyComments
         self.kaPostsNotifyMentions = kaPostsNotifyMentions
-        self.messagePollInterval = messagePollInterval
         self.liveUpdatesEnabled = liveUpdatesEnabled
-        self.requirePhotoApprovalForNewContacts = requirePhotoApprovalForNewContacts
-        self.higherQualityPhotos = higherQualityPhotos
-        self.showFeeEstimate = showFeeEstimate
-        self.kaPostsDefaultTipSompi = kaPostsDefaultTipSompi
-        self.quickReactionEmojis = quickReactionEmojis
         self.appearance = appearance
         self.language = language
         self.currency = currency
@@ -2799,19 +2623,15 @@ struct AppSettings: Codable {
         self.biometricSeedPhraseEnabled = biometricSeedPhraseEnabled
         self.biometricAccountLoginEnabled = biometricAccountLoginEnabled
         self.biometricSpendingKeyEnabled = biometricSpendingKeyEnabled
-        self.swapDisclaimerAgreed = swapDisclaimerAgreed
         self.verboseAPILogging = verboseAPILogging
         self.indexerURL = indexerURL
-        self.kaPostIndexerURL = kaPostIndexerURL
         self.publicChatIndexerURL = publicChatIndexerURL
         self.pushIndexerURL = pushIndexerURL
-        self.translationServiceURL = translationServiceURL
         self.kaspaRestAPIURL = kaspaRestAPIURL
         self.kaspaExplorer = kaspaExplorer
         self.trustedNodeAddress = trustedNodeAddress
         self.savedNodeAddresses = savedNodeAddresses
         self.grpcEndpointPool = grpcEndpointPool
-        self.discoverNewPeers = discoverNewPeers
         self.grpcPoolNetworkType = grpcPoolNetworkType
         self.lastPoolPersistDate = lastPoolPersistDate
     }
@@ -2822,8 +2642,6 @@ struct AppSettings: Codable {
         // Settings > Connection Settings > Testnet (5.2) makes testnet selectable again; it had
         // been forced to mainnet since August 2026.
         networkType = try container.decodeIfPresent(NetworkType.self, forKey: .networkType) ?? .mainnet
-        // Ignore persisted value and keep this feature always enabled.
-        autoAddContacts = true
         if let storedModeRaw = try container.decodeIfPresent(String.self, forKey: .notificationMode) {
             switch storedModeRaw {
             case NotificationMode.disabled.rawValue:
@@ -2849,7 +2667,6 @@ struct AppSettings: Codable {
         notificationPermissionRequested = try container.decodeIfPresent(Bool.self, forKey: .notificationPermissionRequested) ?? false
         incomingNotificationSoundEnabled = try container.decodeIfPresent(Bool.self, forKey: .incomingNotificationSoundEnabled) ?? true
         incomingNotificationVibrationEnabled = try container.decodeIfPresent(Bool.self, forKey: .incomingNotificationVibrationEnabled) ?? true
-        addressActivityNotificationsEnabled = try container.decodeIfPresent(Bool.self, forKey: .addressActivityNotificationsEnabled) ?? true
         kaPostsNotifyLikes = try container.decodeIfPresent(Bool.self, forKey: .kaPostsNotifyLikes) ?? true
         kaPostsNotifyReposts = try container.decodeIfPresent(Bool.self, forKey: .kaPostsNotifyReposts) ?? true
         kaPostsNotifyFollows = try container.decodeIfPresent(Bool.self, forKey: .kaPostsNotifyFollows) ?? true
@@ -2858,13 +2675,7 @@ struct AppSettings: Codable {
         // Defaults ON, and an older settings file with no such key decodes as ON - a switch
         // appearing for the first time must not silently mute anything.
         kaPostsNotifyMentions = try container.decodeIfPresent(Bool.self, forKey: .kaPostsNotifyMentions) ?? true
-        messagePollInterval = try container.decodeIfPresent(TimeInterval.self, forKey: .messagePollInterval) ?? 10.0
         liveUpdatesEnabled = try container.decodeIfPresent(Bool.self, forKey: .liveUpdatesEnabled) ?? false
-        requirePhotoApprovalForNewContacts = try container.decodeIfPresent(Bool.self, forKey: .requirePhotoApprovalForNewContacts) ?? true
-        higherQualityPhotos = try container.decodeIfPresent(Bool.self, forKey: .higherQualityPhotos) ?? false
-        showFeeEstimate = try container.decodeIfPresent(Bool.self, forKey: .showFeeEstimate) ?? true
-        kaPostsDefaultTipSompi = try container.decodeIfPresent(UInt64.self, forKey: .kaPostsDefaultTipSompi)
-        quickReactionEmojis = try container.decodeIfPresent([String].self, forKey: .quickReactionEmojis)
         appearance = try container.decodeIfPresent(AppAppearance.self, forKey: .appearance) ?? .system
         language = try container.decodeIfPresent(AppLanguage.self, forKey: .language) ?? .system
         currency = try container.decodeIfPresent(AppCurrency.self, forKey: .currency) ?? .usDollar
@@ -2894,7 +2705,6 @@ struct AppSettings: Codable {
         biometricSeedPhraseEnabled = try container.decodeIfPresent(Bool.self, forKey: .biometricSeedPhraseEnabled) ?? true
         biometricAccountLoginEnabled = try container.decodeIfPresent(Bool.self, forKey: .biometricAccountLoginEnabled) ?? false
         biometricSpendingKeyEnabled = try container.decodeIfPresent(Bool.self, forKey: .biometricSpendingKeyEnabled) ?? true
-        swapDisclaimerAgreed = try container.decodeIfPresent(Bool.self, forKey: .swapDisclaimerAgreed) ?? false
         verboseAPILogging = try container.decodeIfPresent(Bool.self, forKey: .verboseAPILogging) ?? false
 
         // Handle migration from old settings
@@ -2903,14 +2713,9 @@ struct AppSettings: Codable {
         } else {
             indexerURL = try container.decodeIfPresent(String.self, forKey: .indexerURL) ?? AppSettings.defaultIndexerURL
         }
-        kaPostIndexerURL = try container.decodeIfPresent(String.self, forKey: .kaPostIndexerURL) ?? AppSettings.defaultKaPostIndexerURL
         let storedPublicChatIndexer = try container.decodeIfPresent(String.self, forKey: .publicChatIndexerURL) ?? ""
         publicChatIndexerURL = storedPublicChatIndexer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? AppSettings.defaultPublicChatIndexerURL : storedPublicChatIndexer
-
-        let storedTranslation = try container.decodeIfPresent(String.self, forKey: .translationServiceURL) ?? ""
-        translationServiceURL = storedTranslation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? AppSettings.defaultTranslationServiceURL : storedTranslation
 
         if let customPushIndexer = try container.decodeIfPresent(String.self, forKey: .pushIndexerURL),
            !customPushIndexer.isEmpty {
@@ -2938,10 +2743,8 @@ struct AppSettings: Codable {
                 try container.decodeIfPresent(String.self, forKey: key) ?? AppSettings.defaultTestnetIndexerURL
             }
             indexerURL = try testnetIndexer(.indexerURL)
-            kaPostIndexerURL = try testnetIndexer(.kaPostIndexerURL)
             publicChatIndexerURL = try testnetIndexer(.publicChatIndexerURL)
             pushIndexerURL = try testnetIndexer(.pushIndexerURL)
-            translationServiceURL = try container.decodeIfPresent(String.self, forKey: .translationServiceURL) ?? ""
         }
         kaspaExplorer = try container.decodeIfPresent(KaspaExplorer.self, forKey: .kaspaExplorer) ?? .default
         trustedNodeAddress = try container.decodeIfPresent(String.self, forKey: .trustedNodeAddress) ?? AppSettings.defaultTrustedNodeAddress
@@ -2951,41 +2754,23 @@ struct AppSettings: Codable {
         grpcEndpointPool = try container.decodeIfPresent([GrpcEndpoint].self, forKey: .grpcEndpointPool) ?? []
         grpcPoolNetworkType = try container.decodeIfPresent(NetworkType.self, forKey: .grpcPoolNetworkType)
         lastPoolPersistDate = try container.decodeIfPresent(Date.self, forKey: .lastPoolPersistDate)
-
-        // Migrate from legacy autoRefreshGrpcPool to discoverNewPeers
-        if let newValue = try container.decodeIfPresent(Bool.self, forKey: .discoverNewPeers) {
-            discoverNewPeers = newValue
-        } else if let legacyValue = try container.decodeIfPresent(Bool.self, forKey: .autoRefreshGrpcPool) {
-            discoverNewPeers = legacyValue
-        } else {
-            discoverNewPeers = true
-        }
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(messageRetention, forKey: .messageRetention)
         try container.encode(networkType, forKey: .networkType)
-        // Persist as enabled for forward/backward compatibility.
-        try container.encode(true, forKey: .autoAddContacts)
         try container.encode(notificationMode, forKey: .notificationMode)
         try container.encode(notificationPermissionRequested, forKey: .notificationPermissionRequested)
         try container.encode(incomingNotificationSoundEnabled, forKey: .incomingNotificationSoundEnabled)
         try container.encode(incomingNotificationVibrationEnabled, forKey: .incomingNotificationVibrationEnabled)
-        try container.encode(addressActivityNotificationsEnabled, forKey: .addressActivityNotificationsEnabled)
         try container.encode(kaPostsNotifyLikes, forKey: .kaPostsNotifyLikes)
         try container.encode(kaPostsNotifyReposts, forKey: .kaPostsNotifyReposts)
         try container.encode(kaPostsNotifyFollows, forKey: .kaPostsNotifyFollows)
         try container.encode(kaPostsNotifyDislikes, forKey: .kaPostsNotifyDislikes)
         try container.encode(kaPostsNotifyComments, forKey: .kaPostsNotifyComments)
         try container.encode(kaPostsNotifyMentions, forKey: .kaPostsNotifyMentions)
-        try container.encode(messagePollInterval, forKey: .messagePollInterval)
         try container.encode(liveUpdatesEnabled, forKey: .liveUpdatesEnabled)
-        try container.encode(requirePhotoApprovalForNewContacts, forKey: .requirePhotoApprovalForNewContacts)
-        try container.encode(higherQualityPhotos, forKey: .higherQualityPhotos)
-        try container.encode(showFeeEstimate, forKey: .showFeeEstimate)
-        try container.encodeIfPresent(kaPostsDefaultTipSompi, forKey: .kaPostsDefaultTipSompi)
-        try container.encodeIfPresent(quickReactionEmojis, forKey: .quickReactionEmojis)
         try container.encode(appearance, forKey: .appearance)
         try container.encode(language, forKey: .language)
         try container.encode(currency, forKey: .currency)
@@ -3005,10 +2790,8 @@ struct AppSettings: Codable {
         try container.encode(biometricSeedPhraseEnabled, forKey: .biometricSeedPhraseEnabled)
         try container.encode(biometricAccountLoginEnabled, forKey: .biometricAccountLoginEnabled)
         try container.encode(biometricSpendingKeyEnabled, forKey: .biometricSpendingKeyEnabled)
-        try container.encode(swapDisclaimerAgreed, forKey: .swapDisclaimerAgreed)
         try container.encode(verboseAPILogging, forKey: .verboseAPILogging)
         try container.encode(indexerURL, forKey: .indexerURL)
-        try container.encode(kaPostIndexerURL, forKey: .kaPostIndexerURL)
         try container.encode(publicChatIndexerURL, forKey: .publicChatIndexerURL)
         try container.encode(pushIndexerURL, forKey: .pushIndexerURL)
         try container.encode(kaspaRestAPIURL, forKey: .kaspaRestAPIURL)
@@ -3017,7 +2800,6 @@ struct AppSettings: Codable {
         try container.encode(savedNodeAddresses, forKey: .savedNodeAddresses)
         try container.encode(connectionProfiles, forKey: .connectionProfiles)
         try container.encode(grpcEndpointPool, forKey: .grpcEndpointPool)
-        try container.encode(discoverNewPeers, forKey: .discoverNewPeers)
         try container.encodeIfPresent(grpcPoolNetworkType, forKey: .grpcPoolNetworkType)
         try container.encodeIfPresent(lastPoolPersistDate, forKey: .lastPoolPersistDate)
     }
@@ -3145,7 +2927,9 @@ enum UserFacingError {
         if let kasia = error as? KasiaError {
             switch kasia {
             case .networkError(let text), .apiError(let text), .keychainError(let text), .encryptionError(let text):
-                return text.isEmpty ? kasia.localizedDescription : text
+                // through `message(_:)`: the raw text is often a node-pool or builder line with no
+                // translation of its own
+                return text.isEmpty ? message(kasia.localizedDescription) : message(text)
             default:
                 return kasia.localizedDescription
             }
@@ -3186,7 +2970,52 @@ enum UserFacingError {
         for prefix in ["Network error: ", "API error: ", "Keychain error: ", "Encryption error: "] {
             if cleaned.hasPrefix(prefix) { cleaned = String(cleaned.dropFirst(prefix.count)) }
         }
-        return cleaned.isEmpty ? AppLocalization.string("Something went wrong. Please try again.") : AppLocalization.string(cleaned)
+        guard !cleaned.isEmpty else { return AppLocalization.string("Something went wrong. Please try again.") }
+        // A sentence with its own key is shown translated.
+        let missing = "\u{1}missing"
+        let translated = AppLocalization.bundle.localizedString(forKey: cleaned, value: missing, table: nil)
+        if translated != missing { return translated }
+        // Lines written for the log (node pool, HTTP clients, transaction builder) get the
+        // translated sentence for what they mean. The errors themselves keep their text: other
+        // code matches on it ("Not connected to", "Circuit breaker open").
+        if let key = genericKey(for: cleaned) { return AppLocalization.string(key) }
+        return cleaned
+    }
+
+    private static func genericKey(for text: String) -> String? {
+        func starts(_ prefixes: [String]) -> Bool { prefixes.contains { text.hasPrefix($0) } }
+        // no node answered, or none could be reached
+        if starts(["All endpoints failed", "No suitable endpoints", "Not connected to ", "Circuit breaker open",
+                   "Connection in progress", "Connection closed", "No capable nodes", "All capable nodes",
+                   "All hedged requests failed", "RPC connection timeout", "Subscription manager not initialized"])
+            || (text.hasPrefix("All ") && text.hasSuffix("capable nodes already tried")) {
+            return "Couldn't reach a Kaspa node. Check your connection and try again."
+        }
+        // a node answered with something else than asked
+        if starts(["Unexpected response", "Invalid UTXO data"]) {
+            return "The Kaspa node returned an error. The app will try another node; try again in a moment."
+        }
+        if starts(["Request timed out"]) {
+            return "The connection timed out. Check your connection and try again."
+        }
+        if starts(["Invalid URL", "Unsupported URL scheme", "Invalid Kaspa REST API URL", "Invalid KNS ", "No HTTP response from"]) {
+            return "Couldn't reach the server. Check the address in Settings and your connection."
+        }
+        if starts(["Invalid response", "Invalid HTTP response", "Unexpected Content-Type", "Empty response from",
+                   "Failed to decode response", "KNS domain check response is empty", "KNS upload response missing"]) {
+            return "The server sent something the app couldn't read. Try again; if it keeps happening, update the app."
+        }
+        if starts(["HTTP ", "Server error", "Bad request", "Resource not found", "Kaspa REST API returned an error"]) {
+            return "A network error occurred. Check your connection and try again."
+        }
+        // transaction builder
+        if starts(["This send needs more than", "Too many inputs selected"]) {
+            return "Your balance is spread over too many small coins for one transaction. Compound UTXOs, then try again."
+        }
+        if starts(["Insufficient funds", "Insufficient commit amount"]) {
+            return "Insufficient funds for payment"
+        }
+        return nil
     }
 }
 
@@ -3238,10 +3067,8 @@ enum EndpointOrigin: Int, Codable {
 /// One network's connection settings - see `AppSettings.connectionProfiles`.
 struct ConnectionProfile: Codable, Equatable {
     var indexerURL: String
-    var kaPostIndexerURL: String
     var publicChatIndexerURL: String
     var pushIndexerURL: String
-    var translationServiceURL: String
     var kaspaRestAPIURL: String
     var trustedNodeAddress: String
     var savedNodeAddresses: [SavedNodeAddress]
@@ -3253,10 +3080,8 @@ struct ConnectionProfile: Codable, Equatable {
         case .mainnet:
             return ConnectionProfile(
                 indexerURL: AppSettings.defaultIndexerURL,
-                kaPostIndexerURL: AppSettings.defaultKaPostIndexerURL,
                 publicChatIndexerURL: AppSettings.defaultPublicChatIndexerURL,
                 pushIndexerURL: AppSettings.defaultPushIndexerURL,
-                translationServiceURL: AppSettings.defaultTranslationServiceURL,
                 kaspaRestAPIURL: AppSettings.defaultKaspaMainnetURL,
                 trustedNodeAddress: AppSettings.defaultTrustedNodeAddress,
                 savedNodeAddresses: []
@@ -3264,10 +3089,8 @@ struct ConnectionProfile: Codable, Equatable {
         case .testnet:
             return ConnectionProfile(
                 indexerURL: AppSettings.defaultTestnetIndexerURL,
-                kaPostIndexerURL: AppSettings.defaultTestnetIndexerURL,
                 publicChatIndexerURL: AppSettings.defaultTestnetIndexerURL,
                 pushIndexerURL: AppSettings.defaultTestnetIndexerURL,
-                translationServiceURL: AppSettings.defaultTranslationServiceURL,
                 kaspaRestAPIURL: AppSettings.defaultKaspaTestnetURL,
                 trustedNodeAddress: "",
                 savedNodeAddresses: []

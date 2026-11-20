@@ -209,12 +209,21 @@ final class NFCCardConnection {
         _ = try await command(0xD2, data: Data(SHA256.hash(data: backup)))
     }
 
-    func readBackup() async throws -> Data {
+    /// The most `readBackup` takes from a card: a backup is a few hundred bytes, so a card that
+    /// keeps answering past this is not holding one of ours.
+    static let backupReadCap = 4 * 1024
+
+    /// Reads until the card sends an empty chunk. `maxBytes` is the card's own limit
+    /// (`NFCCardStatus.maxBackup`) when known; past it, or past `backupReadCap`, the backup is
+    /// unreadable rather than read forever.
+    func readBackup(maxBytes: Int? = nil) async throws -> Data {
+        let limit = min(maxBytes.flatMap { $0 > 0 ? $0 : nil } ?? Self.backupReadCap, Self.backupReadCap)
         var backup = Data()
         while true {
             let chunk = try await command(0xB0, p1p2: backup.count, responseLength: 256)
             if chunk.isEmpty { return backup }
             backup.append(chunk)
+            if backup.count > limit { throw NFCCardError.unreadableBackup }
         }
     }
 

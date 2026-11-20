@@ -1323,8 +1323,10 @@ extension ChatService {
             // The live lookup gave up on it: the full sync fetches payments this time, or a
             // payment from an unknown address showed only after the next launch.
             requestPaymentCatchUp(lookBackMs: 10 * 60 * 1000)
-            Task { @MainActor in
-                await fetchNewMessages()
+            if Self.syncsChats {
+                Task { @MainActor in
+                    await fetchNewMessages()
+                }
             }
             selfStashRetryCounts.removeValue(forKey: txId)
             selfStashFirstAttemptAt.removeValue(forKey: txId)

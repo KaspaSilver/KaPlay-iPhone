@@ -105,7 +105,11 @@ private struct WalletBalanceCard: View {
 /// Chatting Address squares, then Your Domains, Contacts and Help, with the bell top right. Every
 /// send has the From step: only moves, joins, claims and bot stamps always sign from the chatting
 /// address.
-struct ChessWalletView: View {
+///
+/// No longer shown (owner's call, 2026-11-19): KaPlay's Wallet tab is the chatting address only,
+/// `ChessWalletView` (ChessWalletView.swift). Kept, unreferenced, with the screens only it opens
+/// (Your Domains, Manage Addresses, Request), in case the full wallet comes back.
+struct FullWalletView: View {
     @EnvironmentObject var walletManager: WalletManager
     // Deliberately NOT observing ChatService here: this screen only *calls* it in an action, it
     // never reads its @Published state in the body. Observing it made the whole scroll recompute
@@ -145,7 +149,6 @@ struct ChessWalletView: View {
     @ObservedObject private var hotWallet = HotWalletBalance.shared
     /// The pending coalesced refresh - see `scheduleBalanceRefresh`.
     @State private var balanceRefreshTask: Task<Void, Never>?
-    @State private var showKachatSetupGuide = false
     @ObservedObject private var backupStatus = AccountBackupStatus.shared
     @State private var showBackupHygiene = false
     @State private var settingPrimaryDomainId: String?
@@ -194,7 +197,6 @@ struct ChessWalletView: View {
                         }
                         addressSquares(wallet)
                         yourDomainsSection
-                        helpSection
                     } else {
                         Text("No active account")
                             .foregroundColor(.secondary)
@@ -402,9 +404,6 @@ struct ChessWalletView: View {
                     })
                 }
             }
-            .fullScreenCover(isPresented: $showKachatSetupGuide) {
-                KachatSetupGuideView { showKachatSetupGuide = false }
-            }
             .onAppear {
                 if let wallet = walletManager.currentWallet {
                     editedAlias = wallet.alias
@@ -564,28 +563,6 @@ struct ChessWalletView: View {
     }
 
 
-    /// Entry to the Help screen: every guide in one place.
-    private var helpSection: some View {
-        NavigationLink {
-            ProfileHelpView(
-                onKNSSetupGuide: { showKachatSetupGuide = true }
-            )
-        } label: {
-            HStack {
-                Label("Help", systemImage: "questionmark.circle")
-                    .foregroundColor(.primary)
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-            .padding(16)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .background(glassBackground(cornerRadius: 18))
-    }
-
     private func setPrimaryDomain(_ domain: KNSDomain) async {
         guard settingPrimaryDomainId == nil else { return }
         guard let walletAddress = walletManager.currentWallet?.publicAddress else {
@@ -726,7 +703,9 @@ struct ChessWalletView: View {
                     ChattingAddressQRView(
                         address: address,
                         balanceSompi: balanceSompi,
-                        subtitle: "A fresh address, never used before. Kaspa sent here lands in this account and shows in your spending total. Use it for everything except .kachat names."
+                        subtitle: "A fresh address, never used before. Kaspa sent here lands in this account and shows in your spending total. Use it for everything except .kachat names.",
+                        title: "Fresh Address",
+                        privacyNote: nil
                     )
                 } else if resolving {
                     ProgressView("Preparing a fresh address")
@@ -1715,8 +1694,8 @@ private struct KNSProfileEditorSheet: View {
 
     var body: some View {
         NavigationStack {
-            // No setup guide here since 5.2: the guide is .kachat's, in Edit KaChat Profile
-            // (`KachatSetupGuideView`). A .kas profile is edited field by field below.
+            // No setup guide: claiming .kachat names happens in KaPay (owner's call, 2026-11-18).
+            // A .kas profile is edited field by field below.
             Form {
 
                 Section("Avatar") {
@@ -2969,19 +2948,27 @@ struct KNSDomainSendView: View {
     }
 }
 
-/// Transaction history for the chatting (identity) address, reached from its dropdown in
-/// Profile. Same pattern as ManageAddressesView's SpendingAddressTransactionHistoryView: tapping
-/// a transaction opens it directly on whichever block explorer is selected in Settings >
-/// Connection > Kaspa Explorer, rather than showing an in-app detail screen.
-/// Full-featured detail screen for the wallet's own chatting (identity) address — field-for-field
-/// the same screen as ManageAddressesView's SpendingAddressTransactionHistoryView (balance,
-/// Transaction History/UTXOs tabs, Compound UTXOs, Export private key, Explorer, Receive/Send),
-/// just address-based instead of index-based. Reached from the Profile screen's Chatting Address
-/// section's "Manage Address" row.
-struct ChattingAddressManageView: View {
+/// The wallet's own chatting (identity) address: its History (each transaction opens the explorer)
+/// with Receive and Send at the bottom. Three ways to show it:
+/// - full (Manage Addresses, in the unshown full wallet): the balance, History/UTXOs/Domains tabs,
+///   Compound UTXOs and Address Actions (keys, explorer);
+/// - chatting-only (`chattingOnly`, a bell "Received" row): the Wallet tab's view without its
+///   header - the balance, History, Receive and Send; no UTXOs, Domains or keys;
+/// - the Wallet tab (`walletHeader`, `ChessWalletView`, since 2026-11-19): the tab's header at the
+///   top of the history in place of the small balance, and no title of its own.
+///
+/// `Header` is a plain view value, not an `AnyView` built by the tab: this screen's inputs then
+/// compare equal across the tab's redraws, so the history list isn't rebuilt each time the balance
+/// or anything else on the tab changes. It reads `ChatService.shared` and doesn't observe it; the
+/// parts that follow the live balance (`ChattingAddressBalanceLine`, `ChattingAddressActionBar`)
+/// observe the wallet themselves.
+struct ChattingAddressManageView<Header: View>: View {
     let address: String
+    private let walletHeader: Header?
+    /// No UTXOs or Domains tabs, no Address Actions: the Wallet tab and the bell's row.
+    private let chattingOnly: Bool
+    private var isWalletTab: Bool { walletHeader != nil }
 
-    @EnvironmentObject var chatService: ChatService
     @EnvironmentObject var settingsViewModel: SettingsViewModel
 
     private enum Tab: String, CaseIterable {
@@ -2999,10 +2986,11 @@ struct ChattingAddressManageView: View {
     @State private var isLoading = false
     @State private var utxos: [UTXO] = []
     @State private var isLoadingUtxos = false
+    /// A UTXO read has landed for this address: until then the balance, Send and Receive follow
+    /// the wallet's live balance instead (an unread list is not an empty address).
+    @State private var utxosLoaded = false
     /// See `CoinControlView.loadError`.
     @State private var utxoLoadError: String?
-    @State private var showReceiveSheet = false
-    @State private var showSendSheet = false
     @State private var showCompoundSheet = false
     @State private var showPrivateKeySheet = false
     /// The "Address Actions" half sheet, and the public-key screen it can open.
@@ -3016,8 +3004,29 @@ struct ChattingAddressManageView: View {
     @State private var renamingUtxo: UTXO?
     @State private var renameUtxoText = ""
 
+    // Reloading: on screen it follows this address's UTXO activity (debounced); off screen
+    // (another tab, a pushed screen) activity only marks it dirty, read on the next appear.
+    @State private var isVisible = false
+    /// Something changed (or a read failed or was cut short) since the last full read.
+    @State private var isDirty = false
+    /// When the history last read whole: an appear within `appearReloadInterval` reads nothing
+    /// unless dirty.
+    @State private var lastLoadedAt: Date?
+    @State private var activityReload: Task<Void, Never>?
+    /// Only the newest read of each kind lands: an older answer can't overwrite a newer one.
+    @State private var historyGeneration = 0
+    @State private var utxoGeneration = 0
+
+    private static var appearReloadInterval: TimeInterval { 30 }
+    private static var activityDebounceNanoseconds: UInt64 { 1_500_000_000 }
+
     private var balanceSompi: UInt64 {
         utxos.reduce(UInt64(0)) { $0 + $1.amount }
+    }
+
+    /// The UTXO balance once read; nil before, so the live balance is used meanwhile.
+    private var loadedBalanceSompi: UInt64? {
+        utxosLoaded ? balanceSompi : nil
     }
 
     private func outpointKey(_ utxo: UTXO) -> String {
@@ -3030,39 +3039,48 @@ struct ChattingAddressManageView: View {
     }
 
     var body: some View {
+        if isWalletTab {
+            content
+        } else if chattingOnly {
+            content
+                .navigationTitle("Chatting Address")
+                .navigationBarTitleDisplayMode(.inline)
+        } else {
+            content
+                .navigationTitle("Chatting Address")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        AddressOptionsButton { showAddressActions = true }
+                    }
+                }
+        }
+    }
+
+    private var content: some View {
         VStack(spacing: 0) {
-            VStack(spacing: 2) {
-                Text("Balance")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Text(verbatim: "\(formatKasExact(balanceSompi)) \(KaspaUnit.symbol)")
-                    .font(.title3.weight(.semibold))
+            if !isWalletTab {
+                ChattingAddressBalanceLine(address: address, loadedBalanceSompi: loadedBalanceSompi)
+                    .padding(.top, 12)
+
+                Color.clear.frame(height: 8)
+
+                if !chattingOnly {
+                    // Right above what it switches.
+                    UnderlineTabBar(
+                        tabs: Tab.allCases.map { (tab: $0, title: tabLabel($0)) },
+                        selection: $selectedTab
+                    )
+                }
             }
-            .padding(.top, 12)
 
-
-            Color.clear.frame(height: 8)
-
-            // Right above what it switches.
-            UnderlineTabBar(
-                tabs: Tab.allCases.map { (tab: $0, title: tabLabel($0)) },
-                selection: $selectedTab
-            )
-
-            switch selectedTab {
+            switch chattingOnly ? Tab.transactions : selectedTab {
             case .transactions:
                 transactionsList
             case .utxos:
                 utxosList
             case .kachatDomains:
                 AddressDomainsTab(address: address)
-            }
-        }
-        .navigationTitle("Chatting Address")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .navigationBarTrailing) {
-                AddressOptionsButton { showAddressActions = true }
             }
         }
         .sheet(isPresented: $showAddressActions, onDismiss: presentAddressActionChoice) {
@@ -3089,59 +3107,13 @@ struct ChattingAddressManageView: View {
             AddressPublicKeyView(address: address, note: "This is the public half of your chatting address. It identifies you and cannot spend anything.")
         }
         .safeAreaInset(edge: .bottom) {
-            HStack(spacing: 12) {
-                Button {
-                    showReceiveSheet = true
-                } label: {
-                    Label("Receive", systemImage: "qrcode")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 16)
-                        .foregroundColor(.black)
-                        .background(Capsule().fill(Color.accentColor))
-                }
-                Button {
-                    showSendSheet = true
-                } label: {
-                    Label("Send", systemImage: "arrow.up.circle.fill")
-                        .font(.subheadline.weight(.bold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 16)
-                        .foregroundColor(.black)
-                        .background(Capsule().fill(Color.accentColor))
-                }
-                .disabled(balanceSompi == 0)
-                .opacity(balanceSompi == 0 ? 0.5 : 1)
+            ChattingAddressActionBar(address: address, loadedBalanceSompi: loadedBalanceSompi) {
+                Task { await reloadAll() }
             }
-            .padding(.horizontal)
-            .padding(.bottom, 16)
-        }
-        .sheet(isPresented: $showReceiveSheet) {
-            NavigationStack {
-                ChattingAddressQRView(address: address, balanceSompi: balanceSompi)
-                    .toolbar {
-                        ToolbarItem(placement: .navigationBarLeading) {
-                            Button("Close") { showReceiveSheet = false }
-                        }
-                    }
-            }
-        }
-        .sheet(isPresented: $showSendSheet) {
-            WithdrawKaspaView(fromAddress: address, availableBalanceSompi: balanceSompi,
-                              lockedSource: .chatting) {
-                Task {
-                    await loadTransactions()
-                    await loadUtxos()
-                }
-            }
-            .sendKaspaSheetSizing()
         }
         .sheet(isPresented: $showCompoundSheet) {
-            WithdrawKaspaView(fromAddress: address, availableBalanceSompi: balanceSompi, isCompoundMode: true) {
-                Task {
-                    await loadTransactions()
-                    await loadUtxos()
-                }
+            WithdrawKaspaView(fromAddress: address, availableBalanceSompi: loadedBalanceSompi, isCompoundMode: true) {
+                Task { await reloadAll() }
             }
             .sendKaspaSheetSizing()
         }
@@ -3167,11 +3139,50 @@ struct ChattingAddressManageView: View {
                 renamingUtxo = nil
             }
         }
+        // the address's coins arrived or left: balance and history follow, once things settle
+        .onReceive(NotificationCenter.default.publisher(for: .ownAddressUtxoActivity)) { note in
+            guard concernsThisAddress(note) else { return }
+            isDirty = true
+            // off screen it waits for the next appear
+            guard isVisible else { return }
+            activityReload?.cancel()
+            activityReload = Task { @MainActor in
+                // a move is several UTXO changes in a row: one read for all of them
+                try? await Task.sleep(nanoseconds: Self.activityDebounceNanoseconds)
+                guard !Task.isCancelled, isVisible else { return }
+                await reloadAll()
+            }
+        }
+        .onAppear { isVisible = true }
+        .onDisappear {
+            isVisible = false
+            // a pending read is dropped; `isDirty` keeps it for the next appear
+            activityReload?.cancel()
+            activityReload = nil
+        }
         .task {
             utxoLabels = WalletManager.shared.loadSpendingUtxoLabels(address: address)
-            await loadTransactions()
-            await loadUtxos()
+            // switching back to the tab doesn't read again unless something changed or it's been a while
+            if !isDirty, let lastLoadedAt, Date().timeIntervalSince(lastLoadedAt) < Self.appearReloadInterval {
+                return
+            }
+            await reloadAll()
         }
+    }
+
+    /// Whether a `.ownAddressUtxoActivity` post is about this address (its userInfo lists the
+    /// involved own addresses, lower-cased). A post without the list counts, to be safe.
+    private func concernsThisAddress(_ note: Notification) -> Bool {
+        guard let involved = note.userInfo?[WalletReceiptNotifier.utxoActivityAddressesKey] as? [String] else { return true }
+        let target = address.lowercased()
+        return involved.contains { $0.lowercased() == target }
+    }
+
+    /// History and coins together; clears `isDirty`, which a read that fails or is cut short sets again.
+    private func reloadAll() async {
+        isDirty = false
+        await loadTransactions()
+        await loadUtxos()
     }
 
     /// Opens what was picked in Address Actions, now that it has closed.
@@ -3198,6 +3209,20 @@ struct ChattingAddressManageView: View {
 
     private var transactionsList: some View {
         List {
+            if let walletHeader {
+                Section {
+                    walletHeader
+                        .listRowInsets(EdgeInsets())
+                        .listRowBackground(Color.clear)
+                }
+            }
+            // The History-only views have no UTXOs tab to show this on: a failed coin read would
+            // otherwise only show as a balance that never arrives.
+            if chattingOnly, let utxoLoadError {
+                UtxoLoadFailureRow(detail: utxoLoadError) {
+                    Task { await loadUtxos() }
+                }
+            }
             if isLoading && transactions.isEmpty {
                 HStack {
                     Spacer()
@@ -3242,13 +3267,19 @@ struct ChattingAddressManageView: View {
         .listStyle(.insetGrouped)
         .refreshable {
             await loadTransactions()
+            if chattingOnly {
+                await loadUtxos()
+            }
+            if isWalletTab {
+                _ = try? await WalletManager.shared.refreshBalance(force: true)
+            }
         }
     }
 
     private var utxosList: some View {
         List {
             // only coins a send could spend: not mining rewards, unconfirmed or just spent
-            if chatService.withdrawalSpendable(utxos).count > 1 {
+            if ChatService.shared.withdrawalSpendable(utxos).count > 1 {
                 Section {
                     Button {
                         showCompoundSheet = true
@@ -3334,15 +3365,37 @@ struct ChattingAddressManageView: View {
     }
 
     private func loadUtxos() async {
+        utxoGeneration += 1
+        let generation = utxoGeneration
         isLoadingUtxos = true
+        let result: Result<[UTXO], Error>
         do {
-            utxos = try await NodePoolService.shared.getUtxosByAddresses([address])
-            utxoLoadError = nil
+            result = .success(try await NodePoolService.shared.getUtxosByAddresses([address]))
         } catch {
+            result = .failure(error)
+        }
+        // a newer read decides (and owns the spinner)
+        guard generation == utxoGeneration else { return }
+        isLoadingUtxos = false
+        // cut short by leaving the screen: what's shown stays, read again on the next appear
+        guard !Task.isCancelled else {
+            isDirty = true
+            return
+        }
+        switch result {
+        case .success(let fresh):
+            utxos = fresh
+            utxosLoaded = true
+            utxoLoadError = nil
+        case .failure(let error):
+            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                isDirty = true
+                return
+            }
             // The list keeps what it had; an outage is not an empty address.
             utxoLoadError = AppLocalization.string(UserFacingError.message(for: error))
+            isDirty = true
         }
-        isLoadingUtxos = false
     }
 
     private func transactionRow(_ tx: KaspaFullTransactionResponse) -> some View {
@@ -3363,7 +3416,7 @@ struct ChattingAddressManageView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 if let blockTime = tx.blockTime {
-                    Text(Date(timeIntervalSince1970: Double(blockTime) / 1000).formatted(Self.blockTimeFormat))
+                    Text(Date(timeIntervalSince1970: Double(blockTime) / 1000).formatted(chattingHistoryBlockTimeFormat))
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
@@ -3390,28 +3443,164 @@ struct ChattingAddressManageView: View {
         .padding(.vertical, 4)
     }
 
-    /// Built once: `Date.formatted(date:time:)` resolves a fresh style per call, and this runs
-    /// for every transaction row on every render of the list.
-    private static let blockTimeFormat = Date.FormatStyle(date: .abbreviated, time: .shortened)
-
     private func formatKasExact(_ sompi: UInt64) -> String {
-        String(format: "%.8f", Double(sompi) / 100_000_000.0)
+        chattingAddressExactKas(sompi)
     }
 
     private func loadTransactions() async {
+        historyGeneration += 1
+        let generation = historyGeneration
         isLoading = true
         // Confirmed live against api.kaspa.org that limit=500 works fine in a single call
         // (~0.7s) - cuts this from up to 4 sequential round trips down to 1.
-        let result = await chatService.fetchFullTransactionsResult(for: address, pageSize: 200, maxTransactions: 200)
-        // block rewards the chain never accepted paid nothing: not history
-        transactions = result.transactions.filter(\.belongsInHistory)
-        historyIncomplete = !result.complete
+        let result = await ChatService.shared.fetchFullTransactionsResult(for: address, pageSize: 200, maxTransactions: 200)
+        // a newer read decides (and owns the spinner)
+        guard generation == historyGeneration else { return }
         isLoading = false
+        // cut short by leaving the screen: the rows shown stay, read again on the next appear
+        guard !Task.isCancelled else {
+            isDirty = true
+            return
+        }
+        // block rewards the chain never accepted paid nothing: not history
+        let fresh = result.transactions.filter(\.belongsInHistory)
+        if fresh.isEmpty && !result.complete && !transactions.isEmpty {
+            // a read that got nothing doesn't wipe what's there; it says some couldn't load
+            historyIncomplete = true
+            isDirty = true
+            return
+        }
+        transactions = fresh
+        historyIncomplete = !result.complete
+        if result.complete {
+            lastLoadedAt = Date()
+        } else {
+            isDirty = true
+        }
     }
 
     private func openInExplorer(_ tx: KaspaFullTransactionResponse) {
         guard let url = settingsViewModel.settings.kaspaExplorer.txURL(for: tx.transactionId) else { return }
         UIApplication.shared.open(url)
+    }
+}
+
+extension ChattingAddressManageView {
+    /// The Wallet tab: `walletHeader` at the top of the history, chatting-only.
+    init(address: String, walletHeader: Header) {
+        self.address = address
+        self.walletHeader = walletHeader
+        self.chattingOnly = true
+    }
+}
+
+extension ChattingAddressManageView where Header == EmptyView {
+    /// Full (Manage Addresses), or `chattingOnly` (a bell row): History, Receive and Send only.
+    init(address: String, chattingOnly: Bool = false) {
+        self.address = address
+        self.walletHeader = nil
+        self.chattingOnly = chattingOnly
+    }
+}
+
+/// Built once: `Date.formatted(date:time:)` resolves a fresh style per call, and this runs for
+/// every transaction row on every render of the list. (A file-level constant: a generic view
+/// can't hold a static stored property.)
+private let chattingHistoryBlockTimeFormat = Date.FormatStyle(date: .abbreviated, time: .shortened)
+
+private func chattingAddressExactKas(_ sompi: UInt64) -> String {
+    String(format: "%.8f", Double(sompi) / 100_000_000.0)
+}
+
+/// Whether `address` is the signed-in wallet's chatting address, and its live balance if so.
+@MainActor
+private func liveChattingBalance(_ walletManager: WalletManager, address: String) -> UInt64? {
+    guard let wallet = walletManager.currentWallet,
+          wallet.publicAddress.lowercased() == address.lowercased() else { return nil }
+    return wallet.balanceSompi
+}
+
+/// The small "Balance" over the chatting address's history (not on the Wallet tab, whose header
+/// has the big card): the UTXO read once it has landed, the wallet's live balance until then.
+/// Its own view so the live balance redraws only this line.
+private struct ChattingAddressBalanceLine: View {
+    let address: String
+    let loadedBalanceSompi: UInt64?
+    @ObservedObject private var walletManager = WalletManager.shared
+
+    var body: some View {
+        VStack(spacing: 2) {
+            Text("Balance")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text(verbatim: (loadedBalanceSompi ?? liveChattingBalance(walletManager, address: address))
+                .map { "\(chattingAddressExactKas($0)) \(KaspaUnit.symbol)" } ?? "--")
+                .font(.title3.weight(.semibold))
+        }
+    }
+}
+
+/// Receive and Send under the chatting address's history, and the sheets they open. Until the
+/// screen's UTXO read lands (`loadedBalanceSompi` nil: still loading, or it failed) the balance is
+/// the wallet's live one, so Send isn't greyed out and Receive doesn't say 0 KAS meanwhile; with
+/// neither known Send stays on (its own screen reads the balance and blocks an overspend).
+private struct ChattingAddressActionBar: View {
+    let address: String
+    let loadedBalanceSompi: UInt64?
+    let onSent: () -> Void
+    @ObservedObject private var walletManager = WalletManager.shared
+    @State private var showReceiveSheet = false
+    @State private var showSendSheet = false
+
+    private var balanceSompi: UInt64? {
+        loadedBalanceSompi ?? liveChattingBalance(walletManager, address: address)
+    }
+
+    private var sendDisabled: Bool { balanceSompi == 0 }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Button {
+                showReceiveSheet = true
+            } label: {
+                Label("Receive", systemImage: "qrcode")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 16)
+                    .foregroundColor(.black)
+                    .background(Capsule().fill(Color.accentColor))
+            }
+            Button {
+                showSendSheet = true
+            } label: {
+                Label("Send", systemImage: "arrow.up.circle.fill")
+                    .font(.subheadline.weight(.bold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 16)
+                    .foregroundColor(.black)
+                    .background(Capsule().fill(Color.accentColor))
+            }
+            .disabled(sendDisabled)
+            .opacity(sendDisabled ? 0.5 : 1)
+        }
+        .padding(.horizontal)
+        .padding(.bottom, 16)
+        .sheet(isPresented: $showReceiveSheet) {
+            NavigationStack {
+                ChattingAddressQRView(address: address, balanceSompi: balanceSompi)
+                    .toolbar {
+                        ToolbarItem(placement: .navigationBarLeading) {
+                            Button("Close") { showReceiveSheet = false }
+                        }
+                    }
+            }
+        }
+        .sheet(isPresented: $showSendSheet) {
+            // the balance as known now (nil when it isn't): the send screen reads what's spendable itself
+            WithdrawKaspaView(fromAddress: address, availableBalanceSompi: balanceSompi,
+                              lockedSource: .chatting, onComplete: onSent)
+            .sendKaspaSheetSizing()
+        }
     }
 }
 
@@ -3624,130 +3813,31 @@ struct AddressPublicKeyView: View {
     }
 }
 
-/// Dedicated white-background QR display, matching Android's "Accept Kaspa"/"Chatting Address"
-/// QR screen — deliberately uses literal black/white colors rather than adaptive .primary/
-/// .secondary, since forcing a white content area regardless of system dark/light mode would
-/// otherwise leave semantic text colors resolved for dark mode (and invisible on the white
-/// background) unless the whole screen's color scheme were overridden too.
+/// An address's receive page on KaPay's shared receive screen (`AddressReceiveView`): its QR, the
+/// tap-anywhere copy, the orange note that the chatting address shows your .kachat name, what can
+/// be sent to it and what it's for. `privacyNote` is nil for a fresh address (the unshown full
+/// wallet's Receive).
 struct ChattingAddressQRView: View {
     let address: String
     let balanceSompi: UInt64?
     var subtitle: String = "Every online move you play is a Kaspa transaction from this address, about 0.0017 KAS each: 1 KAS covers about 500 moves."
-
-    @State private var qrImage: UIImage?
-    @State private var toastMessage: String?
-    @State private var toastToken = UUID()
+    var title: String = "Chatting Address"
+    var privacyNote: ReceiveNote? = ReceiveNotes.chattingAddress
 
     var body: some View {
-        Color.white
-            .ignoresSafeArea()
-            .overlay(
-                VStack(spacing: 28) {
-                    Spacer()
-                    Group {
-                        if let qrImage {
-                            Image(uiImage: qrImage)
-                                .interpolation(.none)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(width: 240, height: 240)
-                        } else {
-                            ProgressView()
-                                .frame(width: 240, height: 240)
-                        }
-                    }
-                    .padding(20)
-                    .background(Color.white)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 20, style: .continuous)
-                            .stroke(Color.accentColor, lineWidth: 3)
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-
-                    Text(address)
-                        .font(.footnote.monospaced())
-                        .foregroundColor(.black)
-                        .multilineTextAlignment(.center)
-                        // Show the whole address, always. A Kaspa address is ~60-66 chars with no
-                        // spaces; capping at 2 lines truncated it on narrower screens. Let it wrap
-                        // to as many lines as needed and take the vertical space it requires.
-                        .lineLimit(nil)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.horizontal, 28)
-
-                    // Looked up, not shown verbatim - it read English in every language.
-                    Text(LocalizedStringKey(subtitle))
-                        .font(.subheadline)
-                        .foregroundColor(Color.black.opacity(0.6))
-                        .multilineTextAlignment(.center)
-                        // Its full height always: in a sheet that is still growing (the Chats
-                        // New sheet) it otherwise truncated, then re-wrapped and jumped.
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.horizontal, 40)
-
-                    Text("Tap anywhere to copy")
-                        .font(.footnote)
-                        .foregroundColor(Color.black.opacity(0.4))
-
-                    Spacer()
-                    Spacer()
-                }
-            )
-            .contentShape(Rectangle())
-            .onTapGesture { copyAddress() }
-            .toast(message: toastMessage)
-            .toolbar {
-                ToolbarItem(placement: .principal) {
-                    // Black in dark mode too: this screen is always white.
-                    VStack(spacing: 0) {
-                        Text("Receive")
-                            .font(.headline)
-                        Text(verbatim: balanceSompi.map { "\(formatKaspaExact($0)) \(KaspaUnit.symbol)" } ?? "—")
-                            .font(.caption)
-                            .fontWeight(.bold)
-                            .monospacedDigit()
-                    }
-                    .foregroundColor(.black)
-                }
-            }
-            .navigationBarTitleDisplayMode(.inline)
-            // The page is always white, so everything on it reads as light mode: the toast's
-            // material and text, the bar's buttons and the status bar, which in dark mode were
-            // white on white.
-            .environment(\.colorScheme, .light)
-            .preferredColorScheme(.light)
-            .onAppear {
-                qrImage = ProfileQRCodeCache.cachedImage(for: address)
-                ProfileQRCodeCache.preload(address: address) { image in
-                    qrImage = image
-                }
-            }
-    }
-
-    private func copyAddress() {
-        UIPasteboard.general.string = address
-        Haptics.success()
-        showToast(address.addressCopiedToastText)
-    }
-
-    private func showToast(_ message: String) {
-        let token = UUID()
-        toastToken = token
-        withAnimation(.easeOut(duration: 0.2)) {
-            toastMessage = message
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
-            if toastToken == token {
-                withAnimation(.easeIn(duration: 0.2)) {
-                    toastMessage = nil
-                }
-            }
-        }
-    }
-
-    private func formatKaspaExact(_ sompi: UInt64) -> String {
-        let kas = Double(sompi) / 100_000_000.0
-        return String(format: "%.8f", kas)
+        AddressReceiveView(
+            title: AppLocalization.string(title),
+            address: address,
+            balanceLine: balanceSompi.map(KaspaUnit.groupedAmount),
+            privacyNote: privacyNote,
+            notes: [
+                ReceiveNotes.kaspaAndKusdt,
+                // Looked up, not shown verbatim - it read English in every language.
+                ReceiveNote(kind: .info, text: AppLocalization.string(subtitle)),
+            ],
+            icon: { KaspaLogoIcon() }
+        )
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
@@ -4170,6 +4260,9 @@ struct WithdrawKaspaView: View {
                             usedMax = false
                             maxCapped = false
                             errorMessage = nil
+                            // a Max still being worked out must not replace what's typed now
+                            maxRequest = UUID()
+                            isEstimatingMax = false
                         }
                     )
                 }
@@ -4504,7 +4597,19 @@ struct WithdrawKaspaView: View {
         isValidAddress = KaspaAddress.isValidOnActiveNetwork(request.address)
         // the exact amount is what's sent; the field shows it in whichever unit it is in
         amountInput = request.amountText
-        _ = fiatAmountState.setMaxKas(Double(request.amountSompi) / 100_000_000.0, priceInCurrency: priceStore.networkPriceUsd)
+        _ = showExactKas(request.amountSompi)
+    }
+
+    /// Puts an exact sompi amount in the field: in KAS the digits come straight from the integer
+    /// (`KaspaUnit.plain`), never through a Double; in a currency only the shown figure is converted.
+    /// Returns the KAS text to send.
+    private func showExactKas(_ sompi: UInt64) -> String {
+        let kasText = KaspaUnit.plain(sompi)
+        guard fiatAmountState.isFiatMode else {
+            return fiatAmountState.onDisplayTextChange(kasText, priceInCurrency: priceStore.networkPriceUsd)
+        }
+        _ = fiatAmountState.setMaxSompi(sompi, priceInCurrency: priceStore.networkPriceUsd)
+        return kasText
     }
 
     /// Use one service's answer (the priority one, or a pick from "Other domains").
@@ -4584,18 +4689,21 @@ struct WithdrawKaspaView: View {
                     result = try await chatService.estimateMaxWithdrawalAmount(toAddress: recipient, manualUtxos: manualUtxos, extraFeeSompi: fixedExtra, feeMultiplier: multiplier)
                 }
                 await MainActor.run {
-                    // a newer Max (another speed tapped meanwhile) decides the amount
+                    // a newer Max (another speed tapped meanwhile) decides the amount, and an amount
+                    // typed or filled in since (`usedMax` cleared) stays
                     guard maxRequest == request else { return }
-                    amountInput = fiatAmountState.setMaxKas(Double(result.amountSompi) / 100_000_000.0, priceInCurrency: priceStore.networkPriceUsd)
-                    maxCapped = result.cappedAtInputLimit
                     isEstimatingMax = false
+                    guard usedMax else { return }
+                    amountInput = showExactKas(result.amountSompi)
+                    maxCapped = result.cappedAtInputLimit
                 }
             } catch {
                 await MainActor.run {
                     guard maxRequest == request else { return }
+                    isEstimatingMax = false
+                    guard usedMax else { return }
                     errorMessage = AppLocalization.string(UserFacingError.message(for: error))
                     maxCapped = false
-                    isEstimatingMax = false
                 }
             }
         }
@@ -4902,62 +5010,6 @@ struct CoinControlView: View {
     }
 }
 
-// MARK: - Profile Help screen
-
-/// The app's guides, reached from Wallet > Help: the .kachat names guide.
-struct ProfileHelpView: View {
-    let onKNSSetupGuide: () -> Void
-
-
-    var body: some View {
-        List {
-            Section {
-                helpRow(
-                    icon: "person.text.rectangle",
-                    title: ".kachat Names Guide",
-                    subtitle: "Claim a .kachat name, make it your name, and keep it."
-                ) {
-                    onKNSSetupGuide()
-                }
-            }
-        }
-        .navigationTitle("Help")
-        .navigationBarTitleDisplayMode(.large)
-    }
-
-    private func helpRow(
-        icon: String,
-        title: String,
-        subtitle: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            HStack(spacing: 14) {
-                Image(systemName: icon)
-                    .font(.scaled(size: 20, weight: .semibold))
-                    .foregroundColor(.accentColor)
-                    .frame(width: 30)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(LocalizedStringKey(title))
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundColor(.primary)
-                    Text(LocalizedStringKey(subtitle))
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-            .padding(.vertical, 6)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-
 // MARK: - Claim Testnet Kaspa (Profile, testnet only)
 
 /// "Claim Testnet Kaspa", above the addresses card on testnet. The official TN10 faucet sits
@@ -5092,6 +5144,9 @@ struct InAppBrowserScreen: View {
     let onClose: () -> Void
 
     @State private var isLoading = true
+    /// The page's own host as it navigates (the faucet can send you elsewhere); nil until the web
+    /// view reports one, so the first URL's host shows meanwhile.
+    @State private var currentHost: String?
 
     private func powerDownForBrowsing() {
         Task { @MainActor in
@@ -5127,7 +5182,7 @@ struct InAppBrowserScreen: View {
                 }
                 .buttonStyle(.plain)
                 Spacer()
-                Text(url.host ?? "")
+                Text(verbatim: currentHost ?? url.host ?? "")
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
                 Spacer()
@@ -5155,7 +5210,7 @@ struct InAppBrowserScreen: View {
                 .background(Color.accentColor.opacity(0.15))
             }
             Divider()
-            InAppWebView(url: url, isLoading: $isLoading)
+            InAppWebView(url: url, isLoading: $isLoading, currentHost: $currentHost)
                 .ignoresSafeArea(edges: .bottom)
         }
         .background(Color(uiColor: .systemBackground))
@@ -5167,6 +5222,9 @@ struct InAppBrowserScreen: View {
 private struct InAppWebView: UIViewRepresentable {
     let url: URL
     @Binding var isLoading: Bool
+    /// The host of the page now shown (`webView.url`, watched by KVO: it changes on redirects and
+    /// same-page navigations the delegate never reports).
+    @Binding var currentHost: String?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -5176,17 +5234,34 @@ private struct InAppWebView: UIViewRepresentable {
         let webView = WKWebView()
         webView.navigationDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
+        context.coordinator.observeURL(of: webView)
         webView.load(URLRequest(url: url))
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {}
 
+    static func dismantleUIView(_ webView: WKWebView, coordinator: Coordinator) {
+        coordinator.urlObservation = nil
+    }
+
     final class Coordinator: NSObject, WKNavigationDelegate {
         private let parent: InAppWebView
+        fileprivate var urlObservation: NSKeyValueObservation?
 
         init(_ parent: InAppWebView) {
             self.parent = parent
+        }
+
+        @MainActor
+        fileprivate func observeURL(of webView: WKWebView) {
+            urlObservation = webView.observe(\.url, options: [.initial, .new]) { [weak self] _, change in
+                guard let host = (change.newValue ?? nil)?.host, !host.isEmpty else { return }
+                Task { @MainActor [weak self] in
+                    guard let self, self.parent.currentHost != host else { return }
+                    self.parent.currentHost = host
+                }
+            }
         }
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
@@ -5207,7 +5282,7 @@ private struct InAppWebView: UIViewRepresentable {
     }
 }
 
-/// One .kas domain opened for profile editing - see `ChessWalletView.openDomainProfileEditor`.
+/// One .kas domain opened for profile editing - see `FullWalletView.openDomainProfileEditor`.
 private struct DomainProfileEditTarget: Identifiable {
     let info: KNSAddressProfileInfo
     var id: String { info.assetId ?? info.address }

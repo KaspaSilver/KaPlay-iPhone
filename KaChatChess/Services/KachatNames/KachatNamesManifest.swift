@@ -94,10 +94,6 @@ extension KachatNames {
         /// final once the network's past median time passes its lock time, which is at least this.
         func renewOpens(expiresAt: Int64) -> Int64 { KachatNames.clampedSum(expiresAt, -renewWindowMs) }
 
-        /// How close to expiry a name counts as "expires soon" (a buyer would have to renew it):
-        /// 30 days on a yearly clock, the renewal window on a short one (testnet's 2 hours),
-        /// where 30 days would cover every name.
-        var expiresSoonMs: Int64 { max(renewWindowMs, min(30 * 86_400_000, periodMs / 12)) }
     }
 
     /// Registry v5's `params.migration` (kachat-domains docs/REGISTRY_V5.md section 4): the old

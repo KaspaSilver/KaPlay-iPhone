@@ -383,18 +383,6 @@ final class MessageStore {
         }
     }
 
-    struct MessagePageCursor: Equatable {
-        let blockTime: Int64
-        let timestamp: Date
-        let txId: String
-    }
-
-    struct MessagePage {
-        let messages: [ChatMessage]
-        let oldestCursor: MessagePageCursor?
-        let hasMore: Bool
-    }
-
     /// When the oldest stored message of a conversation was sent (current wallet scope), or nil
     /// when there is none. Background context, like `countMessages`.
     func earliestMessageDate(contactAddress: String) async -> Date? {
@@ -948,61 +936,6 @@ final class MessageStore {
     }
 
     // MARK: - Read Marker Migration
-
-    private static let readMarkerMigrationKey = "MessageStore.didMigrateToReadMarkers"
-
-    /// Migrate existing CDConversation.lastReadBlockTime to CDReadMarker for this device.
-    /// One-time migration on first launch after upgrade.
-    /// - Parameter deviceId: Current device identifier from KeychainService
-    func migrateToReadMarkersIfNeeded(deviceId: String) {
-        // Check if already migrated
-        guard !UserDefaults.standard.bool(forKey: Self.readMarkerMigrationKey) else { return }
-        guard ensureStoreLoaded() else { return }
-        guard let walletAddress = currentWalletAddress else { return }
-
-        self.logInfo("[MessageStore] Starting read marker migration for device %@", String(deviceId.prefix(8)))
-
-        let context = container.newBackgroundContext()
-        context.mergePolicy = NSMergeByPropertyStoreTrumpMergePolicy
-
-        context.performAndWait {
-            // Fetch all conversations with read status
-            let request = NSFetchRequest<CDConversation>(entityName: CDConversation.entityName)
-            request.predicate = NSPredicate(
-                format: "(walletAddress == %@ OR walletAddress == nil) AND lastReadBlockTime > 0",
-                walletAddress
-            )
-
-            do {
-                let conversations = try context.fetch(request)
-
-                guard !conversations.isEmpty else {
-                    self.logInfo("[MessageStore] No conversations to migrate")
-                    UserDefaults.standard.set(true, forKey: Self.readMarkerMigrationKey)
-                    return
-                }
-
-                // Create a CDReadMarker for each conversation with read status
-                for conversation in conversations {
-                    let marker = CDReadMarker(context: context)
-                    marker.walletAddress = walletAddress
-                    marker.conversationId = conversation.contactAddress
-                    marker.deviceId = deviceId
-                    marker.lastReadTxId = conversation.lastReadTxId
-                    marker.lastReadBlockTime = conversation.lastReadBlockTime
-                    marker.updatedAt = conversation.lastReadAt ?? Date()
-                }
-
-                try context.save()
-                self.logInfo("[MessageStore] Migrated %d conversations to read markers", conversations.count)
-
-                // Mark migration complete
-                UserDefaults.standard.set(true, forKey: Self.readMarkerMigrationKey)
-            } catch {
-                self.logInfo("[MessageStore] Read marker migration failed: \(error)")
-            }
-        }
-    }
 
     /// `refile`: write it whatever is stored - a payment first shown in the self-chat and then
     /// claimed by its `payment_notice` moves to that chat, with the notice's wording.
@@ -1642,18 +1575,6 @@ final class MessageStore {
         }
     }
 
-    /// One conversation's most recent reaction across all its messages, with enough context to
-    /// render a chat-list preview ("Reacted to your message" etc.) without a second round trip.
-    struct LatestReactionPreview: Equatable {
-        let emoji: String
-        let reactorAddress: String
-        let blockTime: Int64
-        /// Whether the message *being reacted to* (not the reaction itself) was sent by this
-        /// wallet - nil if the target message couldn't be found (e.g. pruned by message
-        /// retention settings while the reaction itself was kept).
-        let targetMessageIsOutgoing: Bool?
-    }
-
     private static func makeModel() -> NSManagedObjectModel {
         let model = NSManagedObjectModel()
 
@@ -1853,14 +1774,6 @@ final class MessageStore {
     private let dedupeThresholdRatio: Double = 1.2
     private let dedupeMinTotalMessages = 1000
     private let dedupeBatchLimit = 2000
-
-    struct StoreDiagnostics {
-        let totalMessages: Int
-        let distinctTxIds: Int
-        let placeholderCount: Int
-        let outgoingCount: Int
-        let incomingCount: Int
-    }
 
     private func fetchMessageCounts(in context: NSManagedObjectContext, walletAddr: String?) -> (total: Int, distinct: Int) {
         let totalFetch = NSFetchRequest<NSFetchRequestResult>(entityName: CDMessage.entityName)

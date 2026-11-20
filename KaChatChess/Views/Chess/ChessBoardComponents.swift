@@ -13,6 +13,20 @@ struct ChessServerDownNote: View {
     }
 }
 
+/// The side to move's clock as "m:ss" (a list row, the bracket's LIVE pill). The one part of
+/// those screens redrawn every second: it alone observes the arena's clock (`ChessClock`).
+/// `format` turns the time into the shown text ("LIVE %@").
+struct ChessLiveClockText: View {
+    let game: ChessTournamentGame
+    var format: ((String) -> String)? = nil
+    @ObservedObject private var clock = ChessClock.shared
+
+    var body: some View {
+        let time = ChessText.clock(game.remainingMs(game.sideToMove, at: clock.now))
+        Text(verbatim: format.map { $0(time) } ?? time)
+    }
+}
+
 // Board pieces shared with KaChat's 1:1 chat chess, which KaChat Chess does not have: the
 // glyphs and the small board (from MessageBubbleView.swift) and the waiting overlay (from
 // ChessGameView.swift).

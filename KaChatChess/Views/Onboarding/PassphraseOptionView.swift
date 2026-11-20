@@ -467,7 +467,7 @@ struct PassphraseOptionView: View {
                 try await onProceed(chosen)
                 // Success: the router replaces onboarding with the main app; nothing more to do.
             } catch {
-                self.error = error.localizedDescription
+                self.error = UserFacingError.message(for: error)
                 isBusy = false
             }
         }

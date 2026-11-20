@@ -2,6 +2,17 @@ import Foundation
 import Combine
 import UIKit
 
+/// The arena's once-a-second clock, for the views that draw time: clock chips, countdowns,
+/// LIVE pills. Kept apart from `ChessTournamentService` so a tick re-renders those views
+/// alone, not every chess screen (and the 64-square board) with them. `now` is the same
+/// value as `ChessTournamentService.now`, set by the service's tick.
+@MainActor
+final class ChessClock: ObservableObject {
+    static let shared = ChessClock()
+    @Published fileprivate(set) var now: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    private init() {}
+}
+
 /// Chess tournaments (ONLINE_CHESS.md): the `#chess-arena` room read through
 /// `PublicChatService`, reduced by `ChessTournamentEngine` into the bracket every phone agrees
 /// on, and the actions a player can take - each one a public chat transaction.
@@ -18,7 +29,16 @@ final class ChessTournamentService: ObservableObject {
         period == .month ? monthlyLeaderboard : leaderboard
     }
     /// Chain time as this phone estimates it: wall clock, for running clocks between blocks.
-    @Published private(set) var now: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    /// Not published: a view that draws time observes `ChessClock.shared`. Whatever the time
+    /// decides that a screen shows - a game lost on the clock, a seat that ran out, the player's
+    /// own clock at zero - republishes this service the moment it flips (`timeState`), so a
+    /// view reading `now` here is current whenever its content can have changed.
+    private(set) var now: Int64 = Int64(Date().timeIntervalSince1970 * 1000) {
+        didSet { if ChessClock.shared.now != now { ChessClock.shared.now = now } }
+    }
+    /// Bumped when something the clock decides has changed (see `TimeState`), so the screens
+    /// re-render then, and only then.
+    @Published private(set) var timeRevision = 0
     /// The error toast every chess screen shows. Cleared by itself `errorShownNanos` after it
     /// was set; a newer error restarts that, and the clear never wipes an error newer than the
     /// one it was for (`errorToken`).
@@ -139,6 +159,18 @@ final class ChessTournamentService: ObservableObject {
                 if wasDown, !down { self.refreshIndexerLeaderboards(force: true) }
             }
             .store(in: &cancellables)
+        // Back from the background: the clock and the fast poll were paused there (they only
+        // run while the app is up), so catch up at once rather than on the next tick.
+        NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.resumeAfterBackground() }
+            .store(in: &cancellables)
+    }
+
+    private func resumeAfterBackground() {
+        guard refCount > 0 else { return }
+        tick()
+        Task { [weak self] in await self?.fastPollOnce() }
     }
 
     private func accountChanged(to address: String?) {
@@ -155,6 +187,8 @@ final class ChessTournamentService: ObservableObject {
         nextChainRead = 0
         lastGapRepageAt = 0
         lastError = nil
+        // The lists are this player's ("my" rooms, busy or not).
+        refreshTimeState(force: true)
     }
 
     var myAddress: String? { WalletManager.shared.currentWallet?.publicAddress }
@@ -188,22 +222,19 @@ final class ChessTournamentService: ObservableObject {
             }
             self?.historyReady = true
         }
+        refreshTimeState(force: true)
         clockTask?.cancel()
-        // Once a second: every chess screen re-renders on this. The board's clock chip draws
-        // its own tenths in the last ten seconds from a local timeline (see `clockChip`).
+        // Once a second: the clock views (`ChessClock`) re-render on this; the rest of a chess
+        // screen only when something the time decides has changed (`refreshTimeState`). The
+        // board's clock chip draws its own tenths in the last ten seconds from a local timeline.
+        // Paused in the background: nothing is on screen, and the claims, drops and pending
+        // moves are caught up the moment the app is back (`resumeAfterBackground`).
         clockTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard let self else { return }
-                self.now = Int64(Date().timeIntervalSince1970 * 1000)
-                self.expirePendingMoves()
-                self.dropUnconfirmedRowsIfDue()
-                self.claimTimeoutsIfDue()
-                // The 1st of the month (UTC) came while a chess screen was up: a new month board.
-                if self.boardsMonthStart != 0, ChessTournamentEngine.utcMonthStartMs(self.now) != self.boardsMonthStart {
-                    self.recomputeLocalBoards()
-                    self.refreshIndexerLeaderboards(force: true)
-                }
+                guard let self, !Task.isCancelled else { return }
+                guard UIApplication.shared.applicationState != .background else { continue }
+                self.tick()
             }
         }
         fastPollTask?.cancel()
@@ -211,19 +242,41 @@ final class ChessTournamentService: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: Self.fastPollIntervalNanos)
                 guard let self, !Task.isCancelled else { return }
-                PublicChatService.shared.resyncArenaIndexerIfUnset()
-                // With the indexer down the room's own poll checks when it's back; this phone's
-                // games are read by their players' addresses.
-                if PublicChatService.shared.arenaIndexerDown {
-                    await self.readMyGamesFromChainIfDue()
-                    continue
-                }
-                // Only while it matters: a seat held, a game on, or a flag waiting to be
-                // claimed. Idle in the lobby, the room's own poll is plenty.
-                guard self.isBusyOnline else { continue }
-                await PublicChatService.shared.refreshFromIndexerNow(channel: ChessTournamentCodec.arenaChannel)
+                // Only while the app is up, like the room's own 8 s poll.
+                guard UIApplication.shared.applicationState == .active else { continue }
+                await self.fastPollOnce()
             }
         }
+    }
+
+    /// One second of the arena: the clock, then everything that runs on it.
+    private func tick() {
+        now = Int64(Date().timeIntervalSince1970 * 1000)
+        refreshTimeState()
+        expirePendingMoves()
+        dropUnconfirmedRowsIfDue()
+        claimTimeoutsIfDue()
+        // The 1st of the month (UTC) came while a chess screen was up: a new month board.
+        if boardsMonthStart != 0, ChessTournamentEngine.utcMonthStartMs(now) != boardsMonthStart {
+            recomputeLocalBoards()
+            refreshIndexerLeaderboards(force: true)
+        }
+    }
+
+    /// The fast poll's one pass (every 2 s while the app is active, and once on coming back).
+    private func fastPollOnce() async {
+        guard refCount > 0 else { return }
+        PublicChatService.shared.resyncArenaIndexerIfUnset()
+        // With the indexer down the room's own poll checks when it's back; this phone's
+        // games are read by their players' addresses.
+        if PublicChatService.shared.arenaIndexerDown {
+            await readMyGamesFromChainIfDue()
+            return
+        }
+        // Only while it matters: a seat held, a game on, or a flag waiting to be
+        // claimed. Idle in the lobby, the room's own poll is plenty.
+        guard isBusyOnline else { return }
+        await PublicChatService.shared.refreshFromIndexerNow(channel: ChessTournamentCodec.arenaChannel)
     }
 
     func release() {
@@ -339,6 +392,8 @@ final class ChessTournamentService: ObservableObject {
 
     private func apply(_ reduced: [String: ChessTournament], locallyStampedJoins: Set<String>) {
         tournaments = reduced
+        unsettledIds = reduced.values.filter { $0.status == .open || $0.status == .live }.map(\.id)
+        refreshTimeState(force: true)
         recomputeLocalBoards()
         resolveNames(for: Set(reduced.values.flatMap(\.players)))
         // The queued room is still waiting, but this player's seat in it has run out (or a join
@@ -519,7 +574,13 @@ final class ChessTournamentService: ObservableObject {
     /// True once the arena's history has come back from the indexer (or, without one, once the
     /// first rows arrived / a few seconds passed). A join before that would pick a room from an
     /// empty view - room 1 - which everyone else finished long ago.
-    @Published private(set) var historyReady = false
+    @Published private(set) var historyReady = false {
+        didSet {
+            guard historyReady != oldValue else { return }
+            let busy = computeIsBusyOnline(active: myActiveTournament)
+            if busy != isBusyOnline { isBusyOnline = busy }
+        }
+    }
 
     /// Bumped when a screen deep in the flow (the result screen's Done) wants the whole
     /// stack popped to the 1v1 / Tournaments screen; that screen watches it and clears its
@@ -536,21 +597,84 @@ final class ChessTournamentService: ObservableObject {
         openBracketRequest = BracketRequest(id: id, serial: (openBracketRequest?.serial ?? 0) + 1)
     }
 
-    /// Private 1v1s this player is in, still open or in play.
-    var myPrivateDuels: [ChessTournament] {
-        guard let me = myAddress else { return [] }
-        return tournaments.values
-            .filter { !$0.isPublic && $0.isDuel && ($0.status == .open || $0.isInPlay(at: now) || hasUnclaimedWin($0)) && $0.players.contains(me) }
-            .sorted { $0.createdAt > $1.createdAt }
+    // MARK: - Lists and the clock
+
+    /// What the time decides on the screens, at one instant: which undecided games have run out
+    /// of clock, who is still seated in each waiting room, which of this player's games have
+    /// their clock at zero, and which of their flags are recent enough to keep them busy. The
+    /// lists below and every chess screen are worked out again when this changes (or the arena
+    /// does) - never on a tick that changed none of it.
+    private struct TimeState: Equatable {
+        var decided: Set<String> = []
+        var seated: [String: [String]] = [:]
+        var myClockOut: Set<String> = []
+        var recentFlags: Set<String> = []
+    }
+    private var timeState = TimeState()
+    /// The rooms the time can still change (waiting or live), so a tick looks at those alone.
+    private var unsettledIds: [String] = []
+
+    private func computeTimeState() -> TimeState {
+        var state = TimeState()
+        let me = myAddress
+        for id in unsettledIds {
+            guard let tournament = tournaments[id] else { continue }
+            switch tournament.status {
+            case .open:
+                state.seated[id] = tournament.seatedPlayers(at: now)
+            case .live:
+                for game in tournament.games.values where !game.isOver {
+                    let key = "\(id)|\(game.id)"
+                    if game.isDecided(at: now) { state.decided.insert(key) }
+                    guard let me, let mine = game.color(of: me) else { continue }
+                    if game.remainingMs(mine, at: now) == 0 { state.myClockOut.insert(key) }
+                    if let flagAt = game.flagAt, now - flagAt < Self.autoClaimWindowMs { state.recentFlags.insert(key) }
+                }
+            case .finished, .cancelled:
+                break
+            }
+        }
+        return state
     }
 
-    /// Private tournaments this player is in, still open or in play.
-    var myPrivateTournaments: [ChessTournament] {
-        guard let me = myAddress else { return [] }
-        return tournaments.values
-            .filter { !$0.isPublic && !$0.isDuel && ($0.status == .open || $0.isInPlay(at: now) || hasUnclaimedWin($0)) && $0.players.contains(me) }
-            .sorted { $0.createdAt > $1.createdAt }
+    /// Works the lists out again when the arena changed (`force`) or the time has changed what
+    /// they hold; in the second case the screens are told too (`timeRevision`).
+    private func refreshTimeState(force: Bool = false) {
+        let state = computeTimeState()
+        let changed = state != timeState
+        guard force || changed else { return }
+        timeState = state
+        recomputeLists()
+        if changed, !force { timeRevision &+= 1 }
     }
+
+    private func recomputeLists() {
+        let all = Array(tournaments.values)
+        let me = myAddress
+        liveTournaments = all.filter { $0.isInPlay(at: now) }.sorted { ($0.startedAt ?? 0) > ($1.startedAt ?? 0) }
+        finishedTournaments = all
+            .filter { $0.status == .finished || ($0.status == .live && !$0.isInPlay(at: now)) }
+            .sorted { ($0.startedAt ?? 0) > ($1.startedAt ?? 0) }
+        if let me {
+            let mine = all.filter { !$0.isPublic && $0.players.contains(me) && ($0.status == .open || $0.isInPlay(at: now) || hasUnclaimedWin($0)) }
+                .sorted { $0.createdAt > $1.createdAt }
+            myPrivateDuels = mine.filter(\.isDuel)
+            myPrivateTournaments = mine.filter { !$0.isDuel }
+        } else {
+            myPrivateDuels = []
+            myPrivateTournaments = []
+        }
+        let active = computeMyActiveTournament()
+        if active != myActiveTournament { myActiveTournament = active }
+        let busy = computeIsBusyOnline(active: active)
+        if busy != isBusyOnline { isBusyOnline = busy }
+    }
+
+    /// Private 1v1s this player is in, still open or in play.
+    @Published private(set) var myPrivateDuels: [ChessTournament] = []
+
+    /// Private tournaments this player is in, still open or in play.
+    @Published private(set) var myPrivateTournaments: [ChessTournament] = []
 
     /// A game here this player has won on the clock, with no claim on chain. Finished lists
     /// public games only, so this keeps a private one reachable, for its Claim win.
@@ -564,19 +688,17 @@ final class ChessTournamentService: ObservableObject {
     }
     /// Rooms with a game still being played. A live room whose clocks have all run out with
     /// no claim posted is not one of them (see `ChessTournamentGame.flaggedSide`).
-    var liveTournaments: [ChessTournament] {
-        tournaments.values.filter { $0.isInPlay(at: now) }.sorted { ($0.startedAt ?? 0) > ($1.startedAt ?? 0) }
-    }
+    @Published private(set) var liveTournaments: [ChessTournament] = []
     /// Finished on the chain, or finished on the clock with the claim still to come.
-    var finishedTournaments: [ChessTournament] {
-        tournaments.values
-            .filter { $0.status == .finished || ($0.status == .live && !$0.isInPlay(at: now)) }
-            .sorted { ($0.startedAt ?? 0) > ($1.startedAt ?? 0) }
-    }
+    @Published private(set) var finishedTournaments: [ChessTournament] = []
 
     /// The tournament this player is in that is not over, if any. A waiting seat that has
-    /// expired does not count: the player is free to join elsewhere.
-    var myActiveTournament: ChessTournament? {
+    /// expired does not count: the player is free to join elsewhere. Worked out when the arena
+    /// or the time changes it (`refreshTimeState`); the actions below ask afresh
+    /// (`computeMyActiveTournament`), to the millisecond.
+    @Published private(set) var myActiveTournament: ChessTournament?
+
+    private func computeMyActiveTournament() -> ChessTournament? {
         guard let me = myAddress else { return nil }
         return tournaments.values
             .filter { $0.isStillPlaying(me, at: now) || ($0.status == .open && $0.isSeated(me, at: now)) }
@@ -588,9 +710,11 @@ final class ChessTournamentService: ObservableObject {
     /// (a game in play may not be known yet), the player is seated or playing, or they won a
     /// game on the clock lately with the claim not on chain yet - they're still on the board to
     /// claim it. A game they lost on time keeps nobody busy: there's nothing left for them there.
-    var isBusyOnline: Bool {
+    @Published private(set) var isBusyOnline = true
+
+    private func computeIsBusyOnline(active: ChessTournament?) -> Bool {
         guard historyReady else { return true }
-        if myActiveTournament != nil { return true }
+        if active != nil { return true }
         guard let me = myAddress else { return false }
         return tournaments.values.contains { tournament in
             tournament.status == .live && tournament.games.values.contains { game in
@@ -724,6 +848,13 @@ final class ChessTournamentService: ObservableObject {
         }
     }
 
+    /// Pull to refresh: both boards from the indexer now, past the 20 s throttle, returning
+    /// once they have landed (or failed), so the spinner stays up for as long as the fetch.
+    func refreshIndexerLeaderboardsNow() async {
+        refreshIndexerLeaderboards(force: true)
+        await indexerLeaderboardTask?.value
+    }
+
     // MARK: - Names
 
     /// Addresses whose KNS profile was asked for this session.
@@ -801,7 +932,7 @@ final class ChessTournamentService: ObservableObject {
             lastError = Self.roomFilledMessage
             return
         }
-        if let busy = myActiveTournament {
+        if let busy = computeMyActiveTournament() {
             lastError = Self.busyMessage(busy)
             return
         }
@@ -906,7 +1037,7 @@ final class ChessTournamentService: ObservableObject {
     func join(_ tournament: ChessTournament) async -> Bool {
         guard let me = myAddress, tournament.status == .open else { return false }
         if tournament.isSeated(me, at: now) { return true }
-        if let busy = myActiveTournament, busy.id != tournament.id {
+        if let busy = computeMyActiveTournament(), busy.id != tournament.id {
             lastError = Self.busyMessage(busy)
             return false
         }
